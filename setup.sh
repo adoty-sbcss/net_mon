@@ -268,7 +268,31 @@ echo ""
 
 default_device="$(hostname)"
 prompt APPMON_DEVICE_NAME       "Device name (used in upload filenames)" "$default_device"
+
+echo ""
+echo "  Tip: enter the hostname only (e.g. sftp.example.com or, for Azure Blob:"
+echo "       <account>.blob.core.windows.net). The username goes on the next line."
+echo ""
 prompt APPMON_SFTP_HOST         "SFTP server hostname or IP"             ""
+
+# Guard: if the user pasted user@host into the host field, offer to split.
+host_value="$(current_value APPMON_SFTP_HOST)"
+if [[ "$host_value" == *"@"* ]]; then
+    suggested_user="${host_value%@*}"
+    suggested_host="${host_value#*@}"
+    echo ""
+    warn "The host you entered contains '@':"
+    warn "    $host_value"
+    warn "That's a combined user@host string, not a hostname — DNS can't resolve it."
+    read -r -p "Split it into user='$suggested_user' and host='$suggested_host'? [Y/n]: " do_split || do_split=""
+    do_split="${do_split:-Y}"
+    if [[ "$do_split" =~ ^[Yy]$ ]]; then
+        set_value APPMON_SFTP_HOST "$suggested_host"
+        set_value APPMON_SFTP_USER "$suggested_user"
+        ok "split: host=$suggested_host, user=$suggested_user"
+    fi
+fi
+
 prompt APPMON_SFTP_PORT         "SFTP port"                              "22"
 prompt APPMON_SFTP_USER         "SFTP username"                          ""
 prompt_secret APPMON_SFTP_PASSWORD "SFTP password"
