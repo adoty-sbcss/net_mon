@@ -1,0 +1,40 @@
+# Optional SNMP configuration. Only used when APPMON_SNMP_ENABLED=true.
+# Copy to snmp.yaml and edit. The .gitignore should keep snmp.yaml out of source control.
+
+# Read-only community strings, keyed by CIDR. First match wins.
+networks:
+  - cidr: 10.0.0.0/8
+    community: "public"
+    version: "2c"
+  - cidr: 192.168.0.0/16
+    community: "public"
+    version: "2c"
+
+# Optional: explicit poll targets. If empty, the collector polls every
+# discovered device whose IP falls inside one of the CIDRs above.
+targets: []
+# Example:
+#   - ip: 192.168.1.1
+#     community: "secret-ro"
+#     version: "2c"
+
+# OIDs to walk on each device. The defaults cover inventory + L2 forwarding.
+oids:
+  - name: sysDescr
+    oid: 1.3.6.1.2.1.1.1.0
+  - name: sysName
+    oid: 1.3.6.1.2.1.1.5.0
+  - name: sysObjectID
+    oid: 1.3.6.1.2.1.1.2.0
+  - name: ifTable
+    oid: 1.3.6.1.2.1.2.2
+    walk: true
+  - name: ipNetToMediaTable
+    oid: 1.3.6.1.2.1.4.22
+    walk: true
+  - name: dot1dTpFdbTable
+    oid: 1.3.6.1.2.1.17.4.3
+    walk: true
+  - name: dot1dStpPortTable
+    oid: 1.3.6.1.2.1.17.2.15
+    walk: true

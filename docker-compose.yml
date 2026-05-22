@@ -1,0 +1,59 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: appmon-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-appmon}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-appmon}
+      POSTGRES_DB: ${POSTGRES_DB:-appmon}
+    ports:
+      # Bind to loopback only — the collector reaches it via host networking
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appmon} -d ${POSTGRES_DB:-appmon}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  collector:
+    build: ./collector
+    image: appmon/collector:latest
+    container_name: appmon-collector
+    restart: unless-stopped
+    # Host networking so we can see real interfaces, LLDP frames, broadcast traffic.
+    network_mode: host
+    # We need raw sockets, packet capture, and the ability to send ARP probes.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_PTRACE
+    # Privileged is the simplest path on Ubuntu; if you'd rather, drop privileged
+    # and rely on the cap_add list above plus AppArmor=unconfined.
+    privileged: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:-appmon}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-appmon}
+      POSTGRES_DB: ${POSTGRES_DB:-appmon}
+      APPMON_MODE: ${APPMON_MODE:-field}
+      APPMON_CAPTURE_SECONDS: ${APPMON_CAPTURE_SECONDS:-60}
+      APPMON_POLL_INTERVAL: ${APPMON_POLL_INTERVAL:-30}
+      APPMON_COOLDOWN_SECONDS: ${APPMON_COOLDOWN_SECONDS:-300}
+      APPMON_EXCLUDE_IFACES: ${APPMON_EXCLUDE_IFACES:-lo,docker0,br-,veth,virbr,tun,tap}
+      APPMON_SNMP_ENABLED: ${APPMON_SNMP_ENABLED:-false}
+      APPMON_SNMP_CONFIG: /etc/appmon/snmp.yaml
+    volumes:
+      - ./bundles:/var/lib/appmon/bundles
+      - ./config:/etc/appmon:ro
+    command: ["run"]
+
+volumes:
+  postgres-data:

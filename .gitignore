@@ -1,0 +1,9 @@
+.env
+bundles/
+config/snmp.yaml
+**/__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
+.claude/
