@@ -112,6 +112,25 @@ def recent_network_scan(network_id: str, within_seconds: int) -> dict[str, Any] 
             return cur.fetchone()
 
 
+def list_scan_runs_in_window(start, end) -> list[dict[str, Any]]:
+    """Scans whose completed_at falls in [start, end). Times must be tz-aware."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, started_at, completed_at, interface, interface_cidr,
+                       gateway_ip, mode, duration_sec, error, trigger_reason
+                  FROM scan_runs
+                 WHERE completed_at IS NOT NULL
+                   AND completed_at >= %s
+                   AND completed_at <  %s
+                 ORDER BY started_at ASC
+                """,
+                (start, end),
+            )
+            return list(cur.fetchall())
+
+
 def list_scan_runs(limit: int = 50) -> list[dict[str, Any]]:
     with connect() as conn:
         with conn.cursor() as cur:

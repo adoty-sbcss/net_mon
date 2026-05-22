@@ -12,6 +12,7 @@ from .config import get_settings
 from .db import fetch_scan, list_scan_runs, wait_for_db
 from .poller import run_poller
 from .scan import run_scan
+from . import uploader as uploader_mod
 
 
 def _configure_logging() -> None:
@@ -45,10 +46,15 @@ def cli() -> None:
 
 @cli.command("run")
 def cmd_run() -> None:
-    """Run the interface poller. Triggers scans on link-up events."""
+    """Run the interface poller and the hourly SFTP uploader."""
     settings = get_settings()
-    log.info("collector starting", mode=settings.mode, poll_interval=settings.poll_interval)
+    log.info("collector starting",
+             mode=settings.mode,
+             poll_interval=settings.poll_interval,
+             sftp_enabled=settings.sftp_enabled,
+             device=uploader_mod.device_name())
     wait_for_db()
+    uploader_mod.start_in_background()
     run_poller()
 
 
@@ -99,6 +105,36 @@ def cmd_bundle(scan_id: int, output: str | None) -> None:
         sys.exit(2)
     path = build_bundle(scan_id, output_path=output)
     click.echo(str(path))
+
+
+@cli.command("upload-test")
+def cmd_upload_test() -> None:
+    """Test the SFTP connection: connect, authenticate, list the remote path."""
+    ok, msg = uploader_mod.test_connection()
+    click.echo(("OK   " if ok else "FAIL ") + msg)
+    sys.exit(0 if ok else 2)
+
+
+@cli.command("upload-now")
+def cmd_upload_now() -> None:
+    """Build and upload the previous hour's bundle right now, without waiting."""
+    wait_for_db()
+    now = uploader_mod._local_now()
+    # The most recent top-of-hour that has already passed — closes the
+    # just-completed hour. If it's 14:23 now, this is 14:00, and the
+    # bundle covers 13:00 → 14:00.
+    window_end = now.replace(minute=0, second=0, microsecond=0)
+    result = uploader_mod.build_and_upload_hour(window_end)
+    click.echo(f"status:        {result['status']}")
+    click.echo(f"window:        {result['window_start']}  →  {result['window_end']}")
+    click.echo(f"scans in hour: {result['scans']}")
+    if result.get("local_path"):
+        click.echo(f"local bundle:  {result['local_path']}")
+    if result.get("remote_path"):
+        click.echo(f"remote path:   {result['remote_path']}")
+    if result.get("message"):
+        click.echo(f"detail:        {result['message']}")
+    sys.exit(0 if result["status"] in ("uploaded", "saved_only", "skipped") else 2)
 
 
 if __name__ == "__main__":

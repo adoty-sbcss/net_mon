@@ -13,14 +13,88 @@ import structlog
 
 from .config import get_settings
 from .db import fetch_scan, fetch_table_for_scan
-from .prompts import get_bundle_readme
+from .prompts import get_bundle_readme, get_bundle_readme_hourly
 
 log = structlog.get_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Single-scan bundle (manual `bundle <id>` command)
+# ---------------------------------------------------------------------------
+
+
 def build_bundle(scan_id: int, output_path: str | None = None) -> Path:
-    """Build an evidence bundle ZIP for the given scan id. Returns its path."""
+    """Build an evidence bundle ZIP for one scan id. Returns its path."""
     settings = get_settings()
+    scan = fetch_scan(scan_id)
+    if scan is None:
+        raise ValueError(f"scan id {scan_id} not found")
+
+    payload = _scan_payload(scan_id)
+
+    if output_path is None:
+        settings.bundle_dir.mkdir(parents=True, exist_ok=True)
+        ts = _stamp(scan.get("started_at"))
+        host = socket.gethostname()
+        output_path = settings.bundle_dir / f"network-scan-{host}-{ts}.zip"
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("README.md", get_bundle_readme())
+        for name, content in payload.items():
+            z.writestr(name, content)
+
+    log.info("bundle written", path=str(out), size_bytes=out.stat().st_size)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Hourly multi-scan bundle (uploader)
+# ---------------------------------------------------------------------------
+
+
+def build_hourly_bundle(
+    scan_ids: list[int],
+    output_path: Path,
+    *,
+    device_name: str,
+    window_start: datetime,
+    window_end: datetime,
+) -> Path:
+    """Build a single ZIP rolling up every scan that completed in the hour."""
+    if not scan_ids:
+        raise ValueError("build_hourly_bundle called with no scan_ids")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    summary = _build_hourly_summary(
+        scan_ids=scan_ids,
+        device_name=device_name,
+        window_start=window_start,
+        window_end=window_end,
+    )
+
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("README.md", get_bundle_readme_hourly())
+        z.writestr("HOURLY_SUMMARY.md", summary)
+        for sid in scan_ids:
+            payload = _scan_payload(sid)
+            for name, content in payload.items():
+                z.writestr(f"scans/scan_{sid}/{name}", content)
+
+    log.info("hourly bundle written", path=str(output_path),
+             scans=len(scan_ids), size_bytes=output_path.stat().st_size)
+    return output_path
+
+
+# ---------------------------------------------------------------------------
+# Per-scan payload — shared between single and hourly bundles
+# ---------------------------------------------------------------------------
+
+
+def _scan_payload(scan_id: int) -> dict[str, str]:
+    """All files for one scan, keyed by relative path inside the bundle."""
     scan = fetch_scan(scan_id)
     if scan is None:
         raise ValueError(f"scan id {scan_id} not found")
@@ -34,37 +108,29 @@ def build_bundle(scan_id: int, output_path: str | None = None) -> Path:
     snmp = fetch_table_for_scan("snmp_polls", scan_id)
     findings = fetch_table_for_scan("findings", scan_id)
 
-    if output_path is None:
-        settings.bundle_dir.mkdir(parents=True, exist_ok=True)
-        ts = _stamp(scan.get("started_at"))
-        host = socket.gethostname()
-        output_path = settings.bundle_dir / f"network-scan-{host}-{ts}.zip"
-    out = Path(output_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
+    return {
+        "summary.md": _build_summary_md(scan, devices, neighbors, arp, dhcp, stp, traffic, snmp, findings),
+        "findings.json": _jsonify(findings),
+        "topology.json": json.dumps(_build_topology(scan, devices, neighbors, arp),
+                                    indent=2, default=_default),
+        "devices.csv": _devices_csv(devices),
+        "metrics.json": json.dumps(_build_metrics(traffic, dhcp, stp),
+                                   indent=2, default=_default),
+        "timeline.json": json.dumps(_build_timeline(dhcp, stp),
+                                    indent=2, default=_default),
+        "raw/scan.json": _jsonify(scan),
+        "raw/lldp-neighbors.json": _jsonify(neighbors),
+        "raw/arp-table.json": _jsonify(arp),
+        "raw/dhcp-observed.json": _jsonify(dhcp),
+        "raw/stp-events.json": _jsonify(stp),
+        "raw/snmp-polls.json": _jsonify(snmp),
+        "raw/traffic-stats.json": _jsonify(traffic),
+    }
 
-    summary_md = _build_summary_md(scan, devices, neighbors, arp, dhcp, stp, traffic, snmp, findings)
-    topology = _build_topology(scan, devices, neighbors, arp)
-    metrics = _build_metrics(traffic, dhcp, stp)
-    timeline = _build_timeline(dhcp, stp)
 
-    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr("README.md", get_bundle_readme())
-        z.writestr("summary.md", summary_md)
-        z.writestr("findings.json", _jsonify(findings))
-        z.writestr("topology.json", json.dumps(topology, indent=2, default=_default))
-        z.writestr("devices.csv", _devices_csv(devices))
-        z.writestr("metrics.json", json.dumps(metrics, indent=2, default=_default))
-        z.writestr("timeline.json", json.dumps(timeline, indent=2, default=_default))
-        z.writestr("raw/scan.json", _jsonify(scan))
-        z.writestr("raw/lldp-neighbors.json", _jsonify(neighbors))
-        z.writestr("raw/arp-table.json", _jsonify(arp))
-        z.writestr("raw/dhcp-observed.json", _jsonify(dhcp))
-        z.writestr("raw/stp-events.json", _jsonify(stp))
-        z.writestr("raw/snmp-polls.json", _jsonify(snmp))
-        z.writestr("raw/traffic-stats.json", _jsonify(traffic))
-
-    log.info("bundle written", path=str(out), size_bytes=out.stat().st_size)
-    return out
+# ---------------------------------------------------------------------------
+# Summaries
+# ---------------------------------------------------------------------------
 
 
 def _build_summary_md(
@@ -131,11 +197,11 @@ def _build_summary_md(
         lines.append("")
 
     if dhcp:
-        servers = {}
+        servers: dict[tuple[Any, Any], int] = {}
         for d in dhcp:
             if d.get("server_ip"):
-                servers.setdefault((d["server_ip"], d.get("server_mac")), 0)
-                servers[(d["server_ip"], d.get("server_mac"))] += 1
+                key = (d["server_ip"], d.get("server_mac"))
+                servers[key] = servers.get(key, 0) + 1
         if servers:
             lines.append("## DHCP servers seen")
             lines.append("")
@@ -150,11 +216,46 @@ def _build_summary_md(
             lines.append(f"- **[{f.get('severity')}] {f.get('title')}** — {f.get('detail')}")
         lines.append("")
 
-    lines.append("---")
+    return "\n".join(lines)
+
+
+def _build_hourly_summary(
+    *,
+    scan_ids: list[int],
+    device_name: str,
+    window_start: datetime,
+    window_end: datetime,
+) -> str:
+    lines = []
+    lines.append(f"# App_Mon hourly rollup — {device_name}")
     lines.append("")
-    lines.append("Open `README.md` in this bundle for the Claude prompt to use.")
+    lines.append(f"- **Window:** {window_start.isoformat()} → {window_end.isoformat()}")
+    lines.append(f"- **Device:** {device_name}")
+    lines.append(f"- **Scans in this hour:** {len(scan_ids)}")
+    lines.append("")
+    lines.append("## Scans")
+    lines.append("")
+    lines.append("| ID | Interface | CIDR | Gateway | Trigger | Duration |")
+    lines.append("|---:|-----------|------|---------|---------|---------:|")
+    for sid in scan_ids:
+        scan = fetch_scan(sid) or {}
+        lines.append(
+            f"| {sid} "
+            f"| {scan.get('interface') or '-'} "
+            f"| {scan.get('interface_cidr') or '-'} "
+            f"| {scan.get('gateway_ip') or '-'} "
+            f"| {scan.get('trigger_reason') or '-'} "
+            f"| {scan.get('duration_sec') or '-'}s |"
+        )
+    lines.append("")
+    lines.append("Open each `scans/scan_<id>/summary.md` for per-scan detail.")
     lines.append("")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Topology / metrics / timeline helpers
+# ---------------------------------------------------------------------------
 
 
 def _build_topology(

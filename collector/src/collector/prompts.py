@@ -70,5 +70,65 @@ files into a Claude conversation, then send the prompt below.
 """
 
 
+CLAUDE_BUNDLE_README_HOURLY = """\
+# App_Mon Hourly Evidence Bundle
+
+This ZIP rolls up every network scan that completed during one hour on a
+single Ubuntu collector box. It was generated automatically and uploaded
+to the configured SFTP server at the top of the hour.
+
+## What's in here
+
+- **HOURLY_SUMMARY.md** — Read first. Lists every scan in the window,
+  plus aggregate counts and notable changes between scans.
+- **README.md** — This file. Use the prompt below.
+- **scans/scan_<id>/** — Per-scan data. Each folder contains:
+  - `summary.md`, `findings.json`, `topology.json`, `devices.csv`,
+    `metrics.json`, `timeline.json`
+  - `raw/` — underlying tool outputs (LLDP, ARP, DHCP, STP, SNMP,
+    nmap, interface state)
+
+## Prompt — paste this into Claude
+
+> I'm uploading an hourly rollup of network scans from an App_Mon
+> collector. The box does a 60-second passive + light-active capture
+> per scan, triggered by link-up or run manually. This ZIP contains
+> every scan that completed in one hour on one box.
+>
+> Please:
+>
+> 1. Read `HOURLY_SUMMARY.md` first to understand what's in the bundle.
+> 2. For each scan, summarize the network identity (subnet, gateway,
+>    vendor mix, apparent device roles).
+> 3. Compare scans across the hour. Flag anything that changed:
+>    - Devices appearing or disappearing
+>    - MAC/IP bindings shifting
+>    - DHCP server changing or multiple servers seen
+>    - STP root changing, topology change flag flapping
+>    - Broadcast / multicast rate spikes
+> 4. Across the hour, look for and call out evidence of:
+>    - **Layer-2 loops** (root churn, frequent topology changes, MAC
+>      flapping, TTL anomalies)
+>    - **Broadcast/multicast storms** (rates relative to total packets,
+>      anomalous senders)
+>    - **Duplicate IPs** (same IP claimed by different MACs)
+>    - **Rogue DHCP** (offers from unexpected MAC or IP)
+>    - **VLAN issues** (tagged frames on access ports, mismatched
+>      native VLAN)
+>    - **Unusual hosts** (vendor OUI mismatches, unexpected devices)
+>    - **Interface health** (high error/drop counts, asymmetric flow)
+> 5. Rank findings by severity and confidence (definite vs.
+>    suggestive). Cite the scan id and file that supports each finding.
+> 6. End with a short list of follow-up checks (SNMP polls, switch
+>    CLI, longer captures, specific MACs to track).
+>
+> If a scan is missing data or looks truncated, say so.
+"""
+
+
 def get_bundle_readme() -> str:
     return CLAUDE_BUNDLE_README
+
+
+def get_bundle_readme_hourly() -> str:
+    return CLAUDE_BUNDLE_README_HOURLY

@@ -28,6 +28,14 @@ class Settings(BaseSettings):
     snmp_enabled: bool = Field(default=False, alias="APPMON_SNMP_ENABLED")
     snmp_config: Path = Field(default=Path("/etc/appmon/snmp.yaml"), alias="APPMON_SNMP_CONFIG")
 
+    sftp_enabled: bool = Field(default=False, alias="APPMON_SFTP_ENABLED")
+    sftp_host: str = Field(default="", alias="APPMON_SFTP_HOST")
+    sftp_port: int = Field(default=22, alias="APPMON_SFTP_PORT")
+    sftp_user: str = Field(default="", alias="APPMON_SFTP_USER")
+    sftp_password: str = Field(default="", alias="APPMON_SFTP_PASSWORD")
+    sftp_remote_path: str = Field(default="/", alias="APPMON_SFTP_REMOTE_PATH")
+    device_name: str = Field(default="", alias="APPMON_DEVICE_NAME")
+
     bundle_dir: Path = Field(default=Path("/var/lib/appmon/bundles"), alias="APPMON_BUNDLE_DIR")
 
     @property
