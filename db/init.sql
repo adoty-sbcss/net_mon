@@ -8,7 +8,9 @@ CREATE TABLE IF NOT EXISTS scan_runs (
     completed_at    TIMESTAMPTZ,
     trigger_reason  TEXT NOT NULL,
     interface       TEXT NOT NULL,
-    interface_cidr  CIDR,
+    -- INET, not CIDR: stores an address-plus-netmask like 10.6.0.12/22.
+    -- CIDR rejects values with host bits set ("must be a network address").
+    interface_cidr  INET,
     gateway_ip      INET,
     gateway_mac     MACADDR,
     network_id      TEXT,
