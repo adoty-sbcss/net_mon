@@ -6,30 +6,16 @@ Plug an Ubuntu box into a network, collect everything about it, ship the data to
 
 ## 1. One-time setup on a fresh Ubuntu box
 
-Copy and paste this whole block into a terminal. It installs Docker, downloads App_Mon, runs the interactive setup, and starts everything.
+Copy-paste this. `setup.sh` does all the heavy lifting — installs Docker, installs the Compose plugin, resolves any package conflicts, adds you to the docker group, builds and starts the containers, then asks for SFTP details.
 
 ```bash
-# Install Docker + Compose plugin + git (works on every Ubuntu version)
-sudo apt-get update
-sudo apt-get install -y git openssl ca-certificates curl
-curl -fsSL https://get.docker.com | sudo sh
-sudo usermod -aG docker $USER
-newgrp docker
-
-# Quick sanity check — both lines should print versions, not errors
-docker --version
-docker compose version
-
-# Get App_Mon
+sudo apt-get update && sudo apt-get install -y git
 git clone https://github.com/adoty-sbcss/net_mon.git App_Mon
 cd App_Mon
-
-# Make directories the containers need
-mkdir -p bundles config
-
-# Interactive setup — asks for SFTP URL, user, password
 ./setup.sh
 ```
+
+That's it. `setup.sh` is **safe to re-run** any time — it skips steps that are already done, so it's also how you change settings later.
 
 `setup.sh` asks you:
 
@@ -40,7 +26,7 @@ mkdir -p bundles config
 - **SFTP password** (typed silently)
 - **Remote directory** (default `/`)
 
-At the end it offers to start the containers and test the SFTP connection. Say yes.
+After the SFTP prompts, it builds the containers, starts them, and offers to test the SFTP connection. Say yes when prompted.
 
 > **Updating later?** `cd ~/App_Mon && git pull && docker compose build && docker compose up -d`
 
@@ -128,16 +114,10 @@ To disable hourly uploads without removing the config, set `APPMON_SFTP_ENABLED=
 ## 7. Troubleshooting
 
 **"docker: permission denied" after install**
-Log out and back in (or run `newgrp docker`), then try again.
+`setup.sh` added you to the docker group, but the current shell hasn't picked it up yet. Log out and back in (or run `newgrp docker`), then try again. While you're in the current shell, you can also just prefix commands with `sudo`.
 
-**`unknown shorthand flag: 'd' in -d` when setup.sh tries to start containers**
-The Docker Compose v2 plugin isn't installed — `docker compose` doesn't exist on this box. Fix it:
-```bash
-sudo apt-get install -y docker-compose-v2
-# or, if that package can't be found:
-curl -fsSL https://get.docker.com | sudo sh
-```
-Then continue: `cd ~/App_Mon && docker compose up -d && docker compose exec collector python -m collector upload-test`
+**Install fails partway through and apt-get complains about conflicts**
+Re-run `./setup.sh` — it's idempotent and will detect what's already installed, skip those steps, and resolve common conflicts (e.g. removing a stray `docker-ce` if `docker.io` is also present).
 
 **`upload-test` says "connection failed"**
 Check the SFTP server is reachable from this box: `nc -zv <sftp-host> 22`. If that works, your credentials or remote path are wrong — re-run `./setup.sh`.
