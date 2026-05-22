@@ -313,17 +313,28 @@ fi
 echo ""
 ok "Setup complete."
 echo ""
+# Decide which prefix the user should use, based on whether they're already
+# in the docker group in this shell. Until they re-login, sudo is required.
+if [[ ${NEEDS_REGROUP:-0} -eq 1 ]]; then
+    DC_CMD="sudo docker compose"
+else
+    DC_CMD="docker compose"
+fi
+
 echo "Next steps:"
 echo "  1. Plug a network cable into the box (auto-scan triggers on link-up)"
-echo "  2. Watch activity:    dc logs -f collector"
-[[ ${NEEDS_REGROUP:-0} -eq 1 ]] \
-    && echo "                        (use 'sudo docker compose logs -f collector' until next login)"
-echo "  3. Force an upload now (no wait):"
-[[ ${NEEDS_REGROUP:-0} -eq 1 ]] \
-    && echo "       sudo docker compose exec collector python -m collector upload-now" \
-    || echo "       docker compose exec collector python -m collector upload-now"
+echo ""
+echo "  2. Watch the collector activity:"
+echo "       $DC_CMD logs -f collector"
+echo ""
+echo "  3. List scans collected so far:"
+echo "       $DC_CMD exec collector python -m collector list"
+echo ""
+echo "  4. Force an upload now (bundles + ships the most recent hour):"
+echo "       $DC_CMD exec collector python -m collector upload-now"
+echo ""
+
 [[ ${NEEDS_REGROUP:-0} -eq 1 ]] && {
-    echo ""
     warn "You were added to the docker group. Log out and back in (or run"
-    warn "'newgrp docker') so you can run 'docker compose' without sudo."
+    warn "'newgrp docker') so you can run 'docker compose' without 'sudo'."
 }

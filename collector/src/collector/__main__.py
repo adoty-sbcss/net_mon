@@ -117,13 +117,31 @@ def cmd_upload_test() -> None:
 
 @cli.command("upload-now")
 def cmd_upload_now() -> None:
-    """Build and upload the previous hour's bundle right now, without waiting."""
+    """Build and upload the most recent hour that has scans. No waiting."""
     wait_for_db()
-    now = uploader_mod._local_now()
-    # The most recent top-of-hour that has already passed — closes the
-    # just-completed hour. If it's 14:23 now, this is 14:00, and the
-    # bundle covers 13:00 → 14:00.
-    window_end = now.replace(minute=0, second=0, microsecond=0)
+    from datetime import timedelta
+
+    # Find the most recent completed scan in the database and bundle the
+    # one-hour window containing it. This makes upload-now do what users
+    # expect after a manual `scan`: ship that scan's hour right now,
+    # regardless of whether we're mid-hour or at a clean boundary.
+    recent = list_scan_runs(limit=10)
+    recent_completed = next((s for s in recent if s.get("completed_at")), None)
+    if recent_completed is None:
+        click.echo("no completed scans in the database yet.")
+        click.echo("Plug a network cable in (auto-scan), or run:")
+        click.echo("    docker compose exec collector python -m collector scan <iface>")
+        sys.exit(2)
+
+    completed_at = recent_completed["completed_at"]
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.astimezone()  # treat naive as local
+    window_start = completed_at.replace(minute=0, second=0, microsecond=0)
+    window_end = window_start + timedelta(hours=1)
+
+    click.echo(f"most recent completed scan: id={recent_completed['id']}  "
+               f"completed_at={completed_at.isoformat()}")
+    click.echo(f"bundling hour:              {window_start.isoformat()}  →  {window_end.isoformat()}")
     result = uploader_mod.build_and_upload_hour(window_end)
     click.echo(f"status:        {result['status']}")
     click.echo(f"window:        {result['window_start']}  →  {result['window_end']}")
