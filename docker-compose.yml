@@ -61,6 +61,10 @@ services:
     volumes:
       - ./bundles:/var/lib/appmon/bundles
       - ./config:/etc/appmon:ro
+      # Schema migrations applied by the collector on startup. Mounted (not
+      # baked into the image) so an auto-update can ship new migration files
+      # via `git pull` without requiring an image rebuild.
+      - ./db/migrations:/app/migrations:ro
       # Match the container's clock and zone to the host so hourly uploads fire
       # at local-time minute 0 and filenames use the box's wall clock.
       - /etc/localtime:/etc/localtime:ro

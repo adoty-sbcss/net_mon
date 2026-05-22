@@ -1,0 +1,20 @@
+# Template — install-auto-update.sh substitutes ${USER} and ${REPO_DIR} before
+# installing to /etc/systemd/system/appmon-update.service. Edit there, not here.
+[Unit]
+Description=App_Mon auto-update (one-shot)
+Documentation=https://github.com/adoty-sbcss/net_mon
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=${USER}
+Group=${USER}
+WorkingDirectory=${REPO_DIR}
+ExecStart=${REPO_DIR}/scripts/auto-update.sh
+# Don't kill the script if it takes a while (image rebuilds can be slow).
+TimeoutStartSec=30min
+# Catch all output in journal.
+StandardOutput=journal
+StandardError=journal

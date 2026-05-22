@@ -12,6 +12,7 @@ from .config import get_settings
 from .db import fetch_scan, list_scan_runs, wait_for_db
 from .poller import run_poller
 from .scan import run_scan
+from . import migrations as migrations_mod
 from . import uploader as uploader_mod
 
 
@@ -54,6 +55,10 @@ def cmd_run() -> None:
              sftp_enabled=settings.sftp_enabled,
              device=uploader_mod.device_name())
     wait_for_db()
+    # Apply any pending schema migrations BEFORE we start collecting. If a
+    # migration fails, refuse to start — better than running with a half-
+    # applied schema and corrupting data.
+    migrations_mod.apply_pending()
     uploader_mod.start_in_background()
     run_poller()
 

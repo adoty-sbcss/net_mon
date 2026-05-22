@@ -1,0 +1,18 @@
+[Unit]
+Description=Nightly App_Mon auto-update
+Documentation=https://github.com/adoty-sbcss/net_mon
+
+[Timer]
+# Fire every day at 03:00 local time, with up to 30 minutes of randomized
+# delay so a fleet of boxes doesn't all hit GitHub at exactly the same second.
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=1800
+
+# If the box was off when the timer was supposed to fire, run once it boots.
+Persistent=true
+
+# Wait until the network has come up before running.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

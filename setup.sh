@@ -364,6 +364,40 @@ if [[ "$do_test" =~ ^[Yy]$ ]]; then
     fi
 fi
 
+# --- 11. Optional: install nightly auto-update timer ---------------------
+
+echo ""
+echo "${C_INFO}=== Optional: nightly auto-update ===${C_OFF}"
+echo "Install a systemd timer that runs 'git pull' + rebuild + restart every"
+echo "night around 03:00 (with ~30min jitter). Schema migrations apply"
+echo "automatically. You can uninstall any time with:"
+echo "    ./scripts/install-auto-update.sh --uninstall"
+echo ""
+
+already_installed=0
+if systemctl list-unit-files appmon-update.timer 2>/dev/null | grep -q appmon-update; then
+    already_installed=1
+fi
+
+default_au="Y"
+if [[ $already_installed -eq 1 ]]; then
+    ok "auto-update timer already installed"
+    echo "Re-install (to pick up any updated paths/user)? [y/N]: "
+    default_au="N"
+    read -r enable_au || enable_au=""
+else
+    read -r -p "Install the nightly auto-update timer? [Y/n]: " enable_au || enable_au=""
+fi
+enable_au="${enable_au:-$default_au}"
+
+if [[ "$enable_au" =~ ^[Yy]$ ]]; then
+    if [[ -x ./scripts/install-auto-update.sh ]]; then
+        ./scripts/install-auto-update.sh
+    else
+        warn "scripts/install-auto-update.sh missing or not executable. Skipping."
+    fi
+fi
+
 echo ""
 ok "Setup complete."
 echo ""
