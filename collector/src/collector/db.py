@@ -169,6 +169,65 @@ def fetch_table_for_scan(table: str, scan_id: int) -> list[dict[str, Any]]:
             return list(cur.fetchall())
 
 
+def get_snmp_credential(device_ip: str) -> dict[str, Any] | None:
+    """Return cached (community, version, failure_count, last_attempt_at) for a device.
+
+    Returns None if we've never tried this device before.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT device_ip, community, version, last_succeeded_at,
+                       last_attempt_at, failure_count
+                  FROM snmp_credentials
+                 WHERE device_ip = %s
+                """,
+                (device_ip,),
+            )
+            return cur.fetchone()
+
+
+def record_snmp_success(device_ip: str, community: str, version: str = "2c") -> None:
+    """Record a working community for a device. Resets failure counter."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO snmp_credentials
+                    (device_ip, community, version, last_succeeded_at,
+                     last_attempt_at, failure_count)
+                VALUES (%s, %s, %s, NOW(), NOW(), 0)
+                ON CONFLICT (device_ip) DO UPDATE
+                    SET community = EXCLUDED.community,
+                        version   = EXCLUDED.version,
+                        last_succeeded_at = NOW(),
+                        last_attempt_at   = NOW(),
+                        failure_count     = 0
+                """,
+                (device_ip, community, version),
+            )
+
+
+def record_snmp_failure(device_ip: str) -> None:
+    """Mark a failed attempt. Increments failure_count and clears the cached
+    community (so the next scan re-trials)."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO snmp_credentials
+                    (device_ip, community, version, last_attempt_at, failure_count)
+                VALUES (%s, NULL, '2c', NOW(), 1)
+                ON CONFLICT (device_ip) DO UPDATE
+                    SET community = NULL,
+                        last_attempt_at = NOW(),
+                        failure_count   = snmp_credentials.failure_count + 1
+                """,
+                (device_ip,),
+            )
+
+
 def insert_many(table: str, rows: list[dict[str, Any]]) -> None:
     """Insert a batch of rows by column-name dict. Table name is whitelisted."""
     if not rows:

@@ -107,7 +107,11 @@ CREATE TABLE IF NOT EXISTS traffic_stats (
     tx_packets          BIGINT,
     tx_bytes            BIGINT,
     broadcast_packets   BIGINT,
-    multicast_packets   BIGINT
+    multicast_packets   BIGINT,
+    -- Total packets tshark observed (post-filter). This is the right
+    -- denominator for broadcast/multicast percentages — rx_packets above
+    -- counts only kernel-accepted frames and isn't comparable.
+    tshark_total_packets BIGINT
 );
 CREATE INDEX IF NOT EXISTS idx_traffic_scan ON traffic_stats(scan_run_id);
 
@@ -121,6 +125,21 @@ CREATE TABLE IF NOT EXISTS snmp_polls (
     polled_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_snmp_scan ON snmp_polls(scan_run_id);
+
+-- SNMP credential cache.
+-- The collector tries each configured community string (APPMON_SNMP_COMMUNITIES)
+-- against each candidate device. Once one succeeds we remember it here so
+-- subsequent scans go straight to the known-working community and don't waste
+-- time on misses. NULL community means "we tried everything and nothing worked"
+-- (used together with failure_count for backoff).
+CREATE TABLE IF NOT EXISTS snmp_credentials (
+    device_ip         INET PRIMARY KEY,
+    community         TEXT,
+    version           TEXT NOT NULL DEFAULT '2c',
+    last_succeeded_at TIMESTAMPTZ,
+    last_attempt_at   TIMESTAMPTZ,
+    failure_count     INTEGER NOT NULL DEFAULT 0
+);
 
 CREATE TABLE IF NOT EXISTS findings (
     id          SERIAL PRIMARY KEY,

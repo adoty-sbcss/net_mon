@@ -301,6 +301,36 @@ prompt APPMON_SFTP_REMOTE_PATH  "Remote directory for uploads"           "/"
 # Enable upload by default once the user has filled in details.
 set_value APPMON_SFTP_ENABLED "true"
 
+# --- 8b. Optional: SNMP community strings --------------------------------
+
+echo ""
+echo "${C_INFO}=== Optional: SNMP polling ===${C_OFF}"
+echo "If you have read community strings for switches/routers on the network,"
+echo "App_Mon can poll them for richer topology data (MAC tables, interface"
+echo "counters, etc.). Polling targets the gateway and LLDP-discovered switches"
+echo "only — not random hosts."
+echo ""
+
+current_snmp_enabled="$(current_value APPMON_SNMP_ENABLED)"
+default_snmp_enabled="N"
+[[ "$current_snmp_enabled" == "true" ]] && default_snmp_enabled="Y"
+
+read -r -p "Enable SNMP polling? [y/N]: " enable_snmp || enable_snmp=""
+enable_snmp="${enable_snmp:-$default_snmp_enabled}"
+
+if [[ "$enable_snmp" =~ ^[Yy]$ ]]; then
+    set_value APPMON_SNMP_ENABLED "true"
+    echo ""
+    echo "Enter one or more read communities to try, comma-separated."
+    echo "The collector probes each device with each string and remembers"
+    echo "which one works per-device, so subsequent scans skip the trial."
+    echo "Example:  public, ourreadonly, special-string"
+    echo ""
+    prompt APPMON_SNMP_COMMUNITIES "SNMP communities to try" "public"
+else
+    set_value APPMON_SNMP_ENABLED "false"
+fi
+
 # --- 9. Lock down the env file -------------------------------------------
 
 chmod 600 "$ENV_FILE"

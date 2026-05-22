@@ -105,7 +105,9 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool) -> int | None:
         snmp_results: list[dict[str, Any]] = []
         if settings.snmp_enabled:
             try:
-                candidates = _snmp_candidates(arp_results, nmap_results, lldp_neighbors)
+                candidates = _snmp_candidates(state.gateway_ip, lldp_neighbors,
+                                              arp_results, nmap_results)
+                log.info("snmp candidate set", count=len(candidates), ips=candidates)
                 snmp_results = snmp_mod.poll(candidates)
                 ctx.raw_outputs["snmp"] = snmp_results
             except Exception as exc:  # pragma: no cover — defensive
@@ -134,22 +136,57 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool) -> int | None:
     return scan_id
 
 
+_NETWORK_VENDOR_HINTS = (
+    "cisco", "aruba", "hp inc.", "hewlett", "juniper", "extreme", "arista",
+    "fortinet", "palo alto", "ubiquiti", "mikrotik", "ruckus", "meraki",
+    "brocade", "huawei", "netgear", "tp-link", "tplink", "dlink", "d-link",
+    "watchguard", "sonicwall", "checkpoint", "f5",
+)
+
+
 def _snmp_candidates(
+    gateway_ip: str | None,
+    lldp_neighbors: list[dict[str, Any]],
     arp_results: list[dict[str, Any]],
     nmap_results: list[dict[str, Any]],
-    lldp_neighbors: list[dict[str, Any]],
 ) -> list[str]:
-    ips: set[str] = set()
-    for r in arp_results:
-        if r.get("ip"):
-            ips.add(r["ip"])
-    for r in nmap_results:
-        if r.get("ip"):
-            ips.add(r["ip"])
+    """Narrow set of IPs likely to actually speak SNMP.
+
+    Includes:
+      * The default gateway (almost always a router with SNMP).
+      * Any LLDP/CDP-discovered management IPs (switches, APs).
+      * Any ARP/nmap entry whose vendor OUI looks like a network vendor.
+
+    Deliberately excludes random hosts (laptops, phones, printers, IoT).
+    A trial with N communities × T timeout against 50 hosts can easily eat
+    minutes; narrowing the set keeps scans fast.
+    """
+    ips: list[str] = []
+    seen: set[str] = set()
+
+    def add(ip: str | None) -> None:
+        if ip and ip not in seen:
+            seen.add(ip)
+            ips.append(ip)
+
+    if gateway_ip:
+        add(gateway_ip)
     for n in lldp_neighbors:
-        if n.get("mgmt_ip"):
-            ips.add(n["mgmt_ip"])
-    return sorted(ips)
+        add(n.get("mgmt_ip"))
+
+    def looks_like_network_gear(vendor: str | None) -> bool:
+        if not vendor:
+            return False
+        v = vendor.lower()
+        return any(hint in v for hint in _NETWORK_VENDOR_HINTS)
+
+    for r in arp_results:
+        if looks_like_network_gear(r.get("vendor")):
+            add(r.get("ip"))
+    for r in nmap_results:
+        if looks_like_network_gear(r.get("vendor")):
+            add(r.get("ip"))
+    return ips
 
 
 def _persist(
@@ -250,6 +287,7 @@ def _persist(
         "tx_bytes": post_counters.get("tx_bytes", 0) - pre_counters.get("tx_bytes", 0),
         "broadcast_packets": cap_results.broadcast_packets,
         "multicast_packets": cap_results.multicast_packets,
+        "tshark_total_packets": cap_results.total_packets,
     }
     insert_many("traffic_stats", [bucket])
 

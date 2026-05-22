@@ -11,15 +11,23 @@ log = structlog.get_logger(__name__)
 
 def host_discovery(cidr: str, timeout: int = 120) -> list[dict[str, Any]]:
     """Ping/ARP sweep with no port scanning. Returns up hosts only."""
+    # DNS is on by default — gives us hostnames where reverse PTR records
+    # exist (gateways, switches, servers). Set APPMON_NMAP_NO_DNS=true to
+    # disable when running on an isolated network with no resolver.
+    import os as _os
+    no_dns = _os.environ.get("APPMON_NMAP_NO_DNS", "").lower() in ("1", "true", "yes")
     cmd = [
         "nmap",
-        "-sn",       # no port scan
-        "-PE",       # ICMP echo
-        "-PR",       # ARP ping (no-op for off-LAN)
-        "-n",        # no DNS
-        "-oX", "-",  # XML to stdout
-        cidr,
+        "-sn",            # no port scan
+        "-PE",            # ICMP echo
+        "-PR",            # ARP ping (no-op for off-LAN)
+        "-oX", "-",       # XML to stdout
     ]
+    if no_dns:
+        cmd.append("-n")
+    else:
+        cmd += ["--system-dns"]   # use container's resolver (inherits from host)
+    cmd.append(cidr)
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     except FileNotFoundError:

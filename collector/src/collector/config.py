@@ -27,6 +27,9 @@ class Settings(BaseSettings):
 
     snmp_enabled: bool = Field(default=False, alias="APPMON_SNMP_ENABLED")
     snmp_config: Path = Field(default=Path("/etc/appmon/snmp.yaml"), alias="APPMON_SNMP_CONFIG")
+    # Comma-separated list of v2c communities to try, in order. The first one
+    # to get a response for a given device gets cached in snmp_credentials.
+    snmp_communities: str = Field(default="", alias="APPMON_SNMP_COMMUNITIES")
 
     sftp_enabled: bool = Field(default=False, alias="APPMON_SFTP_ENABLED")
     sftp_host: str = Field(default="", alias="APPMON_SFTP_HOST")
@@ -49,6 +52,10 @@ class Settings(BaseSettings):
     @property
     def exclude_prefixes(self) -> tuple[str, ...]:
         return tuple(s.strip() for s in self.exclude_ifaces.split(",") if s.strip())
+
+    @property
+    def snmp_community_list(self) -> tuple[str, ...]:
+        return tuple(s.strip() for s in self.snmp_communities.split(",") if s.strip())
 
 
 _settings: Settings | None = None

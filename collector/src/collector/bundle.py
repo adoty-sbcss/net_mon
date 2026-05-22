@@ -186,13 +186,20 @@ def _build_summary_md(
         rxp = t.get("rx_packets") or 0
         bp = t.get("broadcast_packets") or 0
         mp = t.get("multicast_packets") or 0
-        bp_pct = (100 * bp / rxp) if rxp else 0.0
-        mp_pct = (100 * mp / rxp) if rxp else 0.0
+        total = t.get("tshark_total_packets") or 0
+        bp_pct = (100 * bp / total) if total else 0.0
+        mp_pct = (100 * mp / total) if total else 0.0
+        window = 0.0
+        if t.get("bucket_start") and t.get("bucket_end"):
+            window = (t["bucket_end"] - t["bucket_start"]).total_seconds()
+        bpps = (bp / window) if window > 0 else 0.0
+        mpps = (mp / window) if window > 0 else 0.0
         lines.append("## Traffic during capture")
         lines.append("")
-        lines.append(f"- RX packets: {rxp:,} ({t.get('rx_bytes', 0):,} bytes)")
-        lines.append(f"- Broadcast: {bp:,} ({bp_pct:.2f}%)")
-        lines.append(f"- Multicast: {mp:,} ({mp_pct:.2f}%)")
+        lines.append(f"- Total packets seen by capture: {total:,}")
+        lines.append(f"- Broadcast: {bp:,} ({bp_pct:.2f}% of capture, {bpps:.2f} pps)")
+        lines.append(f"- Multicast: {mp:,} ({mp_pct:.2f}% of capture, {mpps:.2f} pps)")
+        lines.append(f"- RX packets (kernel-accepted): {rxp:,} ({t.get('rx_bytes', 0):,} bytes)")
         lines.append(f"- RX errors: {t.get('rx_errors', 0):,}  /  RX dropped: {t.get('rx_dropped', 0):,}")
         lines.append("")
 
@@ -339,22 +346,30 @@ def _build_metrics(traffic: list[dict[str, Any]], dhcp: list[dict[str, Any]],
     rxp = t.get("rx_packets") or 0
     bp = t.get("broadcast_packets") or 0
     mp = t.get("multicast_packets") or 0
+    total = t.get("tshark_total_packets") or 0
     pps = (rxp / window) if window > 0 else 0.0
     bpps = (bp / window) if window > 0 else 0.0
     mpps = (mp / window) if window > 0 else 0.0
+    total_pps = (total / window) if window > 0 else 0.0
+    # Percentages use total tshark-observed packets (promiscuous capture),
+    # which is the right peer to broadcast/multicast counts. rx_packets from
+    # /proc/net/dev only counts kernel-accepted frames and would give bogus
+    # > 100% values on any segment with traffic not destined to this host.
     return {
         "window_seconds": window,
-        "rx_packets": rxp,
-        "rx_bytes": t.get("rx_bytes"),
+        "rx_packets_kernel": rxp,
+        "rx_bytes_kernel": t.get("rx_bytes"),
         "rx_errors": t.get("rx_errors"),
         "rx_dropped": t.get("rx_dropped"),
+        "tshark_total_packets": total,
         "broadcast_packets": bp,
         "multicast_packets": mp,
-        "rx_pps": round(pps, 2),
+        "rx_pps_kernel": round(pps, 2),
+        "tshark_total_pps": round(total_pps, 2),
         "broadcast_pps": round(bpps, 2),
         "multicast_pps": round(mpps, 2),
-        "broadcast_pct_of_rx": round((100 * bp / rxp), 4) if rxp else 0.0,
-        "multicast_pct_of_rx": round((100 * mp / rxp), 4) if rxp else 0.0,
+        "broadcast_pct_of_observed": round((100 * bp / total), 4) if total else 0.0,
+        "multicast_pct_of_observed": round((100 * mp / total), 4) if total else 0.0,
         "dhcp_count": len(dhcp),
         "stp_event_count": len(stp),
     }
