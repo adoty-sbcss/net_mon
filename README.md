@@ -9,12 +9,16 @@ Plug an Ubuntu box into a network, collect everything about it, ship the data to
 Copy and paste this whole block into a terminal. It installs Docker, downloads App_Mon, runs the interactive setup, and starts everything.
 
 ```bash
-# Install Docker and git
+# Install Docker + Compose plugin + git (works on every Ubuntu version)
 sudo apt-get update
-sudo apt-get install -y docker.io docker-compose-plugin git openssl
-sudo systemctl enable --now docker
+sudo apt-get install -y git openssl ca-certificates curl
+curl -fsSL https://get.docker.com | sudo sh
 sudo usermod -aG docker $USER
 newgrp docker
+
+# Quick sanity check — both lines should print versions, not errors
+docker --version
+docker compose version
 
 # Get App_Mon
 git clone https://github.com/adoty-sbcss/net_mon.git App_Mon
@@ -125,6 +129,15 @@ To disable hourly uploads without removing the config, set `APPMON_SFTP_ENABLED=
 
 **"docker: permission denied" after install**
 Log out and back in (or run `newgrp docker`), then try again.
+
+**`unknown shorthand flag: 'd' in -d` when setup.sh tries to start containers**
+The Docker Compose v2 plugin isn't installed — `docker compose` doesn't exist on this box. Fix it:
+```bash
+sudo apt-get install -y docker-compose-v2
+# or, if that package can't be found:
+curl -fsSL https://get.docker.com | sudo sh
+```
+Then continue: `cd ~/App_Mon && docker compose up -d && docker compose exec collector python -m collector upload-test`
 
 **`upload-test` says "connection failed"**
 Check the SFTP server is reachable from this box: `nc -zv <sftp-host> 22`. If that works, your credentials or remote path are wrong — re-run `./setup.sh`.
