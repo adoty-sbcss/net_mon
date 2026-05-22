@@ -30,10 +30,14 @@ RUN echo "wireshark-common wireshark-common/install-setuid boolean false" | debc
 
 WORKDIR /app
 
+# Copy source before pip install. pyproject.toml's setuptools config points at
+# src/ via `packages.find where=["src"]`, so the build step needs that directory
+# to exist when `pip install .` runs — copying pyproject alone fails with
+# "error in 'egg_base' option: 'src' does not exist or is not a directory".
 COPY pyproject.toml /app/pyproject.toml
+COPY src /app/src
 RUN pip install --no-cache-dir .
 
-COPY src /app/src
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
