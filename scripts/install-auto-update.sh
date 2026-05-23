@@ -3,7 +3,7 @@
 # fresh: nightly auto-update (cheap, base-image refresh) + weekly deep
 # refresh (heavier, no-cache rebuild for layer-cached CVEs).
 #
-# Run from the App_Mon directory:
+# Run from the NetMon directory:
 #   ./scripts/install-auto-update.sh
 #
 # Or uninstall:
@@ -17,6 +17,14 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET_USER="${SUDO_USER:-${USER}}"
 
 UNITS=(
+    "netmon-update"
+    "netmon-deep-refresh"
+)
+
+# Legacy unit names from before the App_Mon → NetMon rename. We disable
+# and remove them on every install so boxes that ran the old installer
+# don't keep firing the old timers alongside the new ones.
+LEGACY_UNITS=(
     "appmon-update"
     "appmon-deep-refresh"
 )
@@ -33,8 +41,8 @@ fi
 # --- uninstall path --------------------------------------------------------
 
 if [[ "${1:-}" == "--uninstall" ]]; then
-    echo "Disabling and removing App_Mon update timers..."
-    for unit in "${UNITS[@]}"; do
+    echo "Disabling and removing NetMon update timers (and any legacy appmon-* units)..."
+    for unit in "${UNITS[@]}" "${LEGACY_UNITS[@]}"; do
         $SUDO systemctl disable --now "${unit}.timer" 2>/dev/null || true
         $SUDO rm -f "/etc/systemd/system/${unit}.service" \
                     "/etc/systemd/system/${unit}.timer"
@@ -44,15 +52,27 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     exit 0
 fi
 
+# --- always clean up the legacy units before installing ------------------
+
+for legacy in "${LEGACY_UNITS[@]}"; do
+    if [[ -f "/etc/systemd/system/${legacy}.timer" ]] \
+       || [[ -f "/etc/systemd/system/${legacy}.service" ]]; then
+        echo "Removing legacy systemd unit: $legacy"
+        $SUDO systemctl disable --now "${legacy}.timer" 2>/dev/null || true
+        $SUDO rm -f "/etc/systemd/system/${legacy}.service" \
+                    "/etc/systemd/system/${legacy}.timer"
+    fi
+done
+
 # --- install ---------------------------------------------------------------
 
 for unit in "${UNITS[@]}"; do
-    script="$REPO_DIR/scripts/$(echo "$unit" | sed 's/^appmon-//').sh"
-    # `appmon-update` -> `update.sh`? No — our scripts are `auto-update.sh` and
+    script="$REPO_DIR/scripts/$(echo "$unit" | sed 's/^netmon-//').sh"
+    # `netmon-update` -> `update.sh`? No — our scripts are `auto-update.sh` and
     # `weekly-deep-refresh.sh`. Map explicitly:
     case "$unit" in
-        appmon-update)        script="$REPO_DIR/scripts/auto-update.sh" ;;
-        appmon-deep-refresh)  script="$REPO_DIR/scripts/weekly-deep-refresh.sh" ;;
+        netmon-update)        script="$REPO_DIR/scripts/auto-update.sh" ;;
+        netmon-deep-refresh)  script="$REPO_DIR/scripts/weekly-deep-refresh.sh" ;;
     esac
     if [[ ! -x "$script" ]]; then
         echo "ERROR: $script missing or not executable" >&2
@@ -60,7 +80,7 @@ for unit in "${UNITS[@]}"; do
     fi
 done
 
-echo "Installing systemd units for App_Mon update timers..."
+echo "Installing systemd units for NetMon update timers..."
 echo "  user:      $TARGET_USER"
 echo "  repo_dir:  $REPO_DIR"
 echo "  units:     ${UNITS[*]}"
@@ -95,14 +115,14 @@ done
 
 echo ""
 echo "Installed. Useful commands:"
-echo "  systemctl list-timers 'appmon-*.timer'        # next scheduled runs"
-echo "  systemctl status appmon-update.timer          # nightly timer state"
-echo "  systemctl status appmon-deep-refresh.timer    # weekly timer state"
-echo "  journalctl -u appmon-update.service -n 50     # last nightly run"
-echo "  journalctl -u appmon-deep-refresh.service -n 50  # last deep refresh"
+echo "  systemctl list-timers 'netmon-*.timer'        # next scheduled runs"
+echo "  systemctl status netmon-update.timer          # nightly timer state"
+echo "  systemctl status netmon-deep-refresh.timer    # weekly timer state"
+echo "  journalctl -u netmon-update.service -n 50     # last nightly run"
+echo "  journalctl -u netmon-deep-refresh.service -n 50  # last deep refresh"
 echo "  $REPO_DIR/scripts/auto-update.sh              # run nightly now"
 echo "  $REPO_DIR/scripts/weekly-deep-refresh.sh      # run weekly now"
 echo "  $0 --uninstall                                # remove both timers"
 echo ""
 
-$SUDO systemctl list-timers --no-pager 'appmon-*.timer' 2>/dev/null || true
+$SUDO systemctl list-timers --no-pager 'netmon-*.timer' 2>/dev/null || true

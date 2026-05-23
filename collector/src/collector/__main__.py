@@ -28,7 +28,7 @@ log = structlog.get_logger(__name__)
 @click.group()
 @click.version_option(__version__)
 def cli() -> None:
-    """App_Mon collector — discovers network state and exports evidence bundles."""
+    """NetMon collector — discovers network state and exports evidence bundles."""
     _configure_logging()
 
 
@@ -95,7 +95,7 @@ def cmd_list(limit: int) -> None:
 @cli.command("bundle")
 @click.argument("scan_id", type=int)
 @click.option("--output", "-o", type=click.Path(), default=None,
-              help="Output path. Default: $APPMON_BUNDLE_DIR/network-scan-<host>-<ts>.zip")
+              help="Output path. Default: $NETMON_BUNDLE_DIR/network-scan-<host>-<ts>.zip")
 def cmd_bundle(scan_id: int, output: str | None) -> None:
     """Export an evidence bundle ZIP for SCAN_ID."""
     wait_for_db()

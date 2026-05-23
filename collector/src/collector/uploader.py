@@ -104,7 +104,7 @@ def build_and_upload_hour(window_end: datetime) -> dict[str, str | None]:
     # from earlier failed runs).
     if not settings.sftp_enabled:
         result["status"] = "saved_only"
-        result["message"] = "SFTP disabled (APPMON_SFTP_ENABLED=false); bundles kept locally"
+        result["message"] = "SFTP disabled (NETMON_SFTP_ENABLED=false); bundles kept locally"
         return result
 
     pending = list_pending_bundles()
@@ -195,7 +195,7 @@ def upload_file(local_path: Path) -> str:
     """Upload a single file to the configured SFTP server. Returns remote path."""
     settings = get_settings()
     if not settings.sftp_host:
-        raise RuntimeError("APPMON_SFTP_HOST not set")
+        raise RuntimeError("NETMON_SFTP_HOST not set")
 
     # Paramiko import deferred so module loads without it during tests.
     import paramiko
@@ -247,7 +247,7 @@ def test_connection() -> tuple[bool, str]:
     """Quick connectivity + auth + remote-path-exists check."""
     settings = get_settings()
     if not settings.sftp_host:
-        return False, "APPMON_SFTP_HOST is not set — run ./setup.sh"
+        return False, "NETMON_SFTP_HOST is not set — run ./setup.sh"
     try:
         import paramiko
     except ImportError as exc:
@@ -292,7 +292,7 @@ def request_stop() -> None:
 def _run_scheduler_loop() -> None:
     s = get_settings()
     if not s.sftp_enabled:
-        log.info("uploader disabled (APPMON_SFTP_ENABLED=false), scheduler not running")
+        log.info("uploader disabled (NETMON_SFTP_ENABLED=false), scheduler not running")
         return
     log.info("uploader scheduler started",
              host=s.sftp_host, port=s.sftp_port,
@@ -321,6 +321,6 @@ def start_in_background() -> threading.Thread | None:
     if not s.sftp_enabled:
         log.info("uploader disabled, not spawning scheduler thread")
         return None
-    t = threading.Thread(target=_run_scheduler_loop, name="appmon-uploader", daemon=True)
+    t = threading.Thread(target=_run_scheduler_loop, name="netmon-uploader", daemon=True)
     t.start()
     return t

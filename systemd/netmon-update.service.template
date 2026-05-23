@@ -1,7 +1,7 @@
 # Template — install-auto-update.sh substitutes ${USER} and ${REPO_DIR} before
-# installing to /etc/systemd/system/appmon-update.service. Edit there, not here.
+# installing to /etc/systemd/system/netmon-update.service. Edit there, not here.
 [Unit]
-Description=App_Mon auto-update (one-shot)
+Description=NetMon auto-update (one-shot)
 Documentation=https://github.com/adoty-sbcss/net_mon
 After=network-online.target docker.service
 Wants=network-online.target

@@ -1,12 +1,12 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: appmon-postgres
+    container_name: netmon-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-appmon}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-appmon}
-      POSTGRES_DB: ${POSTGRES_DB:-appmon}
+      POSTGRES_USER: ${POSTGRES_USER:-netmon}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-netmon}
+      POSTGRES_DB: ${POSTGRES_DB:-netmon}
     ports:
       # Bind to loopback only — the collector reaches it via host networking
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
@@ -14,15 +14,15 @@ services:
       - postgres-data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appmon} -d ${POSTGRES_DB:-appmon}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-netmon} -d ${POSTGRES_DB:-netmon}"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   collector:
     build: ./collector
-    image: appmon/collector:latest
-    container_name: appmon-collector
+    image: netmon/collector:latest
+    container_name: netmon-collector
     restart: unless-stopped
     # Host networking so we can see real interfaces, LLDP frames, broadcast traffic.
     network_mode: host
@@ -40,25 +40,25 @@ services:
     environment:
       POSTGRES_HOST: 127.0.0.1
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
-      POSTGRES_USER: ${POSTGRES_USER:-appmon}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-appmon}
-      POSTGRES_DB: ${POSTGRES_DB:-appmon}
-      APPMON_MODE: ${APPMON_MODE:-field}
-      APPMON_CAPTURE_SECONDS: ${APPMON_CAPTURE_SECONDS:-60}
-      APPMON_POLL_INTERVAL: ${APPMON_POLL_INTERVAL:-30}
-      APPMON_COOLDOWN_SECONDS: ${APPMON_COOLDOWN_SECONDS:-300}
-      APPMON_EXCLUDE_IFACES: ${APPMON_EXCLUDE_IFACES:-lo,docker0,br-,veth,virbr,tun,tap}
-      APPMON_SNMP_ENABLED: ${APPMON_SNMP_ENABLED:-false}
-      APPMON_SNMP_CONFIG: /etc/appmon/snmp.yaml
-      APPMON_SNMP_COMMUNITIES: ${APPMON_SNMP_COMMUNITIES:-}
-      APPMON_SFTP_ENABLED: ${APPMON_SFTP_ENABLED:-false}
-      APPMON_SFTP_HOST: ${APPMON_SFTP_HOST:-}
-      APPMON_SFTP_PORT: ${APPMON_SFTP_PORT:-22}
-      APPMON_SFTP_USER: ${APPMON_SFTP_USER:-}
-      APPMON_SFTP_PASSWORD: ${APPMON_SFTP_PASSWORD:-}
-      APPMON_SFTP_REMOTE_PATH: ${APPMON_SFTP_REMOTE_PATH:-/}
-      APPMON_DEVICE_NAME: ${APPMON_DEVICE_NAME:-}
-      APPMON_LOG_LEVEL: ${APPMON_LOG_LEVEL:-INFO}
+      POSTGRES_USER: ${POSTGRES_USER:-netmon}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-netmon}
+      POSTGRES_DB: ${POSTGRES_DB:-netmon}
+      NETMON_MODE: ${NETMON_MODE:-field}
+      NETMON_CAPTURE_SECONDS: ${NETMON_CAPTURE_SECONDS:-60}
+      NETMON_POLL_INTERVAL: ${NETMON_POLL_INTERVAL:-30}
+      NETMON_COOLDOWN_SECONDS: ${NETMON_COOLDOWN_SECONDS:-300}
+      NETMON_EXCLUDE_IFACES: ${NETMON_EXCLUDE_IFACES:-lo,docker0,br-,veth,virbr,tun,tap}
+      NETMON_SNMP_ENABLED: ${NETMON_SNMP_ENABLED:-false}
+      NETMON_SNMP_CONFIG: /etc/netmon/snmp.yaml
+      NETMON_SNMP_COMMUNITIES: ${NETMON_SNMP_COMMUNITIES:-}
+      NETMON_SFTP_ENABLED: ${NETMON_SFTP_ENABLED:-false}
+      NETMON_SFTP_HOST: ${NETMON_SFTP_HOST:-}
+      NETMON_SFTP_PORT: ${NETMON_SFTP_PORT:-22}
+      NETMON_SFTP_USER: ${NETMON_SFTP_USER:-}
+      NETMON_SFTP_PASSWORD: ${NETMON_SFTP_PASSWORD:-}
+      NETMON_SFTP_REMOTE_PATH: ${NETMON_SFTP_REMOTE_PATH:-/}
+      NETMON_DEVICE_NAME: ${NETMON_DEVICE_NAME:-}
+      NETMON_LOG_LEVEL: ${NETMON_LOG_LEVEL:-INFO}
     # Cap Docker's own log buffer so it can't fill the disk if the collector
     # gets chatty. Persistent history is in ./logs/ (mounted below).
     logging:
@@ -67,10 +67,10 @@ services:
         max-size: "10m"
         max-file: "5"
     volumes:
-      - ./bundles:/var/lib/appmon/bundles
-      - ./config:/etc/appmon:ro
+      - ./bundles:/var/lib/netmon/bundles
+      - ./config:/etc/netmon:ro
       # Persistent rotated logs on the host. See logging_setup.py.
-      - ./logs:/var/log/appmon
+      - ./logs:/var/log/netmon
       # Schema migrations applied by the collector on startup. Mounted (not
       # baked into the image) so an auto-update can ship new migration files
       # via `git pull` without requiring an image rebuild.

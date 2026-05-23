@@ -1,7 +1,7 @@
 # Template — install-auto-update.sh substitutes ${USER} and ${REPO_DIR}
-# before installing to /etc/systemd/system/appmon-deep-refresh.service.
+# before installing to /etc/systemd/system/netmon-deep-refresh.service.
 [Unit]
-Description=App_Mon weekly deep refresh (no-cache rebuild)
+Description=NetMon weekly deep refresh (no-cache rebuild)
 Documentation=https://github.com/adoty-sbcss/net_mon
 After=network-online.target docker.service
 Wants=network-online.target

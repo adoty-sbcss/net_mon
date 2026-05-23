@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# App_Mon setup. Run on a fresh Ubuntu box after `git clone`.
+# NetMon setup. Run on a fresh Ubuntu box after `git clone`.
 #
 # This script is the single entry point for deployment. It:
 #   1. Bootstraps system deps (docker, docker compose v2, openssl) automatically,
@@ -97,7 +97,7 @@ apt_update_once() {
 log "Checking essential packages..."
 NEED_PKGS=()
 # unattended-upgrades keeps the Ubuntu host current with security patches
-# (the containers get refreshed by appmon-update / appmon-deep-refresh timers).
+# (the containers get refreshed by netmon-update / netmon-deep-refresh timers).
 for pkg in ca-certificates curl openssl git unattended-upgrades; do
     if ! pkg_installed "$pkg"; then
         NEED_PKGS+=("$pkg")
@@ -203,7 +203,7 @@ ok "directories ready"
 # --- 6. .env scaffolding --------------------------------------------------
 
 if [[ ! -f "$EXAMPLE_FILE" ]]; then
-    die "$EXAMPLE_FILE not found. Run this from the App_Mon directory."
+    die "$EXAMPLE_FILE not found. Run this from the NetMon directory."
 fi
 if [[ ! -f "$ENV_FILE" ]]; then
     log "Creating .env from .env.example"
@@ -272,21 +272,21 @@ fi
 # --- 8. Interactive SFTP config ------------------------------------------
 
 echo ""
-echo "${C_INFO}=== App_Mon SFTP configuration ===${C_OFF}"
+echo "${C_INFO}=== NetMon SFTP configuration ===${C_OFF}"
 echo "Press Enter to keep the current/default value shown in brackets."
 echo ""
 
 default_device="$(hostname)"
-prompt APPMON_DEVICE_NAME       "Device name (used in upload filenames)" "$default_device"
+prompt NETMON_DEVICE_NAME       "Device name (used in upload filenames)" "$default_device"
 
 echo ""
 echo "  Tip: enter the hostname only (e.g. sftp.example.com or, for Azure Blob:"
 echo "       <account>.blob.core.windows.net). The username goes on the next line."
 echo ""
-prompt APPMON_SFTP_HOST         "SFTP server hostname or IP"             ""
+prompt NETMON_SFTP_HOST         "SFTP server hostname or IP"             ""
 
 # Guard: if the user pasted user@host into the host field, offer to split.
-host_value="$(current_value APPMON_SFTP_HOST)"
+host_value="$(current_value NETMON_SFTP_HOST)"
 if [[ "$host_value" == *"@"* ]]; then
     suggested_user="${host_value%@*}"
     suggested_host="${host_value#*@}"
@@ -297,31 +297,31 @@ if [[ "$host_value" == *"@"* ]]; then
     read -r -p "Split it into user='$suggested_user' and host='$suggested_host'? [Y/n]: " do_split || do_split=""
     do_split="${do_split:-Y}"
     if [[ "$do_split" =~ ^[Yy]$ ]]; then
-        set_value APPMON_SFTP_HOST "$suggested_host"
-        set_value APPMON_SFTP_USER "$suggested_user"
+        set_value NETMON_SFTP_HOST "$suggested_host"
+        set_value NETMON_SFTP_USER "$suggested_user"
         ok "split: host=$suggested_host, user=$suggested_user"
     fi
 fi
 
-prompt APPMON_SFTP_PORT         "SFTP port"                              "22"
-prompt APPMON_SFTP_USER         "SFTP username"                          ""
-prompt_secret APPMON_SFTP_PASSWORD "SFTP password"
-prompt APPMON_SFTP_REMOTE_PATH  "Remote directory for uploads"           "/"
+prompt NETMON_SFTP_PORT         "SFTP port"                              "22"
+prompt NETMON_SFTP_USER         "SFTP username"                          ""
+prompt_secret NETMON_SFTP_PASSWORD "SFTP password"
+prompt NETMON_SFTP_REMOTE_PATH  "Remote directory for uploads"           "/"
 
 # Enable upload by default once the user has filled in details.
-set_value APPMON_SFTP_ENABLED "true"
+set_value NETMON_SFTP_ENABLED "true"
 
 # --- 8b. Optional: SNMP community strings --------------------------------
 
 echo ""
 echo "${C_INFO}=== Optional: SNMP polling ===${C_OFF}"
 echo "If you have read community strings for switches/routers on the network,"
-echo "App_Mon can poll them for richer topology data (MAC tables, interface"
+echo "NetMon can poll them for richer topology data (MAC tables, interface"
 echo "counters, etc.). Polling targets the gateway and LLDP-discovered switches"
 echo "only — not random hosts."
 echo ""
 
-current_snmp_enabled="$(current_value APPMON_SNMP_ENABLED)"
+current_snmp_enabled="$(current_value NETMON_SNMP_ENABLED)"
 default_snmp_enabled="N"
 [[ "$current_snmp_enabled" == "true" ]] && default_snmp_enabled="Y"
 
@@ -329,16 +329,16 @@ read -r -p "Enable SNMP polling? [y/N]: " enable_snmp || enable_snmp=""
 enable_snmp="${enable_snmp:-$default_snmp_enabled}"
 
 if [[ "$enable_snmp" =~ ^[Yy]$ ]]; then
-    set_value APPMON_SNMP_ENABLED "true"
+    set_value NETMON_SNMP_ENABLED "true"
     echo ""
     echo "Enter one or more read communities to try, comma-separated."
     echo "The collector probes each device with each string and remembers"
     echo "which one works per-device, so subsequent scans skip the trial."
     echo "Example:  public, ourreadonly, special-string"
     echo ""
-    prompt APPMON_SNMP_COMMUNITIES "SNMP communities to try" "public"
+    prompt NETMON_SNMP_COMMUNITIES "SNMP communities to try" "public"
 else
-    set_value APPMON_SNMP_ENABLED "false"
+    set_value NETMON_SNMP_ENABLED "false"
 fi
 
 # --- 9. Lock down the env file -------------------------------------------
@@ -385,7 +385,7 @@ echo "    ./scripts/install-auto-update.sh --uninstall"
 echo ""
 
 already_installed=0
-if systemctl list-unit-files appmon-update.timer 2>/dev/null | grep -q appmon-update; then
+if systemctl list-unit-files netmon-update.timer 2>/dev/null | grep -q netmon-update; then
     already_installed=1
 fi
 
@@ -423,12 +423,12 @@ echo "Next steps:"
 echo "  1. Plug a network cable into the box (auto-scan triggers on link-up)"
 echo ""
 echo "  2. Use the operator console for everything:"
-echo "       ./appmon              # interactive menu"
-echo "       ./appmon status       # one-shot status"
-echo "       ./appmon logs         # tail live logs"
-echo "       ./appmon scan eth0    # manual scan"
-echo "       ./appmon upload-now   # force upload"
-echo "       ./appmon help         # full list"
+echo "       ./netmon              # interactive menu"
+echo "       ./netmon status       # one-shot status"
+echo "       ./netmon logs         # tail live logs"
+echo "       ./netmon scan eth0    # manual scan"
+echo "       ./netmon upload-now   # force upload"
+echo "       ./netmon help         # full list"
 echo ""
 
 [[ ${NEEDS_REGROUP:-0} -eq 1 ]] && {

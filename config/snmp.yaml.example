@@ -1,4 +1,4 @@
-# Optional SNMP configuration. Only used when APPMON_SNMP_ENABLED=true.
+# Optional SNMP configuration. Only used when NETMON_SNMP_ENABLED=true.
 # Copy to snmp.yaml and edit. The .gitignore should keep snmp.yaml out of source control.
 
 # Read-only community strings, keyed by CIDR. First match wins.

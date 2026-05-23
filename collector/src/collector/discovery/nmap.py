@@ -12,10 +12,10 @@ log = structlog.get_logger(__name__)
 def host_discovery(cidr: str, timeout: int = 120) -> list[dict[str, Any]]:
     """Ping/ARP sweep with no port scanning. Returns up hosts only."""
     # DNS is on by default — gives us hostnames where reverse PTR records
-    # exist (gateways, switches, servers). Set APPMON_NMAP_NO_DNS=true to
+    # exist (gateways, switches, servers). Set NETMON_NMAP_NO_DNS=true to
     # disable when running on an isolated network with no resolver.
     import os as _os
-    no_dns = _os.environ.get("APPMON_NMAP_NO_DNS", "").lower() in ("1", "true", "yes")
+    no_dns = _os.environ.get("NETMON_NMAP_NO_DNS", "").lower() in ("1", "true", "yes")
     cmd = [
         "nmap",
         "-sn",            # no port scan

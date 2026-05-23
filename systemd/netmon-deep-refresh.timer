@@ -1,5 +1,5 @@
 [Unit]
-Description=Weekly App_Mon deep refresh (security patches in cached layers)
+Description=Weekly NetMon deep refresh (security patches in cached layers)
 Documentation=https://github.com/adoty-sbcss/net_mon
 
 [Timer]

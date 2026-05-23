@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "appmon-collector"
+name = "netmon-collector"
 version = "0.1.0"
-description = "App_Mon network discovery collector"
+description = "NetMon network discovery collector"
 requires-python = ">=3.11"
 dependencies = [
     "click>=8.1",
@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.scripts]
-appmon = "collector.__main__:cli"
+netmon = "collector.__main__:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]

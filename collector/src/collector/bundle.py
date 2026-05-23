@@ -145,7 +145,7 @@ def _build_summary_md(
     findings: list[dict[str, Any]],
 ) -> str:
     lines = []
-    lines.append(f"# App_Mon scan #{scan['id']}")
+    lines.append(f"# NetMon scan #{scan['id']}")
     lines.append("")
     lines.append(f"- **Started:** {scan.get('started_at')}")
     lines.append(f"- **Completed:** {scan.get('completed_at')}")
@@ -234,7 +234,7 @@ def _build_hourly_summary(
     window_end: datetime,
 ) -> str:
     lines = []
-    lines.append(f"# App_Mon hourly rollup — {device_name}")
+    lines.append(f"# NetMon hourly rollup — {device_name}")
     lines.append("")
     lines.append(f"- **Window:** {window_start.isoformat()} → {window_end.isoformat()}")
     lines.append(f"- **Device:** {device_name}")
@@ -281,7 +281,7 @@ def _build_topology(
     nodes[self_id] = {
         "id": self_id,
         "type": "scanner",
-        "label": f"App_Mon ({scan.get('interface')})",
+        "label": f"NetMon ({scan.get('interface')})",
         "ip": str(scan.get("interface_cidr") or ""),
     }
 

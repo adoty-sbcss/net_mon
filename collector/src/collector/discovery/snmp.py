@@ -6,7 +6,7 @@ Behavior per candidate IP:
    - If we have a cached community, try that first. On success, poll OIDs.
    - On failure with the cached community, fall through to step 2 and
      re-trial — the operator may have rotated the string.
-2. Iterate APPMON_SNMP_COMMUNITIES in order. First one that responds wins.
+2. Iterate NETMON_SNMP_COMMUNITIES in order. First one that responds wins.
 3. On success, persist the working community to the cache so future scans
    skip the trial. On total failure, record a failure so backoff kicks in.
 

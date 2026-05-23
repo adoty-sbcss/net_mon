@@ -1,4 +1,4 @@
--- App_Mon database schema. Loaded on first postgres startup.
+-- NetMon database schema. Loaded on first postgres startup.
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
@@ -127,7 +127,7 @@ CREATE TABLE IF NOT EXISTS snmp_polls (
 CREATE INDEX IF NOT EXISTS idx_snmp_scan ON snmp_polls(scan_run_id);
 
 -- SNMP credential cache.
--- The collector tries each configured community string (APPMON_SNMP_COMMUNITIES)
+-- The collector tries each configured community string (NETMON_SNMP_COMMUNITIES)
 -- against each candidate device. Once one succeeds we remember it here so
 -- subsequent scans go straight to the known-working community and don't waste
 -- time on misses. NULL community means "we tried everything and nothing worked"

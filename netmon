@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# appmon — operator console for App_Mon.
+# netmon — operator console for NetMon.
 #
-# Interactive:    ./appmon            (shows numbered menu)
-# Non-interactive ./appmon status     (jumps straight to that task)
-#                 ./appmon scan eth0
-#                 ./appmon upload-now
-#                 ./appmon logs
-#                 ./appmon help
+# Interactive:    ./netmon            (shows numbered menu)
+# Non-interactive ./netmon status     (jumps straight to that task)
+#                 ./netmon scan eth0
+#                 ./netmon upload-now
+#                 ./netmon logs
+#                 ./netmon help
 #
 # Designed for techs who don't want to memorize `docker compose exec collector
 # python -m collector ...` commands. Every menu option wraps that for you.
@@ -35,7 +35,7 @@ dc() { "${DC[@]}" "$@"; }
 require_running() {
     # Confirm the collector container is actually up before running a command
     # that needs it.
-    if ! dc ps --status running 2>/dev/null | grep -q appmon-collector; then
+    if ! dc ps --status running 2>/dev/null | grep -q netmon-collector; then
         printf '%sCollector container is not running.%s\n' "$C_ERR" "$C_OFF" >&2
         echo "Run option 8 (Restart) or 'docker compose up -d'." >&2
         return 1
@@ -59,8 +59,8 @@ cmd_status() {
     fi
     echo ""
     printf '%s== Pending uploads ==%s\n' "$C_HEAD" "$C_OFF"
-    if dc ps --status running 2>/dev/null | grep -q appmon-postgres; then
-        dc exec -T postgres psql -U "${POSTGRES_USER:-appmon}" -d "${POSTGRES_DB:-appmon}" -c \
+    if dc ps --status running 2>/dev/null | grep -q netmon-postgres; then
+        dc exec -T postgres psql -U "${POSTGRES_USER:-netmon}" -d "${POSTGRES_DB:-netmon}" -c \
             "SELECT filename, built_at, uploaded_at, retry_count FROM bundle_uploads ORDER BY built_at DESC LIMIT 8;" 2>&1 || true
     fi
     echo ""
@@ -149,11 +149,11 @@ cmd_update() {
 
 cmd_timers() {
     printf '%s== Update timer schedule ==%s\n' "$C_HEAD" "$C_OFF"
-    systemctl list-timers --no-pager 'appmon-*.timer' 2>/dev/null || \
-        echo "(no appmon timers installed — run ./scripts/install-auto-update.sh)"
+    systemctl list-timers --no-pager 'netmon-*.timer' 2>/dev/null || \
+        echo "(no netmon timers installed — run ./scripts/install-auto-update.sh)"
     echo ""
     printf '%s== Last nightly update output ==%s\n' "$C_HEAD" "$C_OFF"
-    journalctl -u appmon-update.service -n 20 --no-pager 2>/dev/null || \
+    journalctl -u netmon-update.service -n 20 --no-pager 2>/dev/null || \
         echo "(no journal entries yet)"
 }
 
@@ -166,8 +166,8 @@ cmd_bundles() {
     fi
     echo ""
     printf '%s== Upload state (last 20 from db) ==%s\n' "$C_HEAD" "$C_OFF"
-    if dc ps --status running 2>/dev/null | grep -q appmon-postgres; then
-        dc exec -T postgres psql -U "${POSTGRES_USER:-appmon}" -d "${POSTGRES_DB:-appmon}" -c \
+    if dc ps --status running 2>/dev/null | grep -q netmon-postgres; then
+        dc exec -T postgres psql -U "${POSTGRES_USER:-netmon}" -d "${POSTGRES_DB:-netmon}" -c \
             "SELECT filename, built_at, uploaded_at, retry_count, last_error FROM bundle_uploads ORDER BY built_at DESC LIMIT 20;" 2>&1 || true
     fi
 }
@@ -184,7 +184,7 @@ cmd_selftest() {
 
 cmd_help() {
     cat <<EOF
-Usage: ./appmon [command] [args]
+Usage: ./netmon [command] [args]
 
 Interactive: run with no command for the menu.
 
@@ -213,7 +213,7 @@ menu_once() {
     cat <<EOF
 
 ${C_HEAD}╔══════════════════════════════════════════╗
-║          App_Mon — Operations            ║
+║          NetMon — Operations            ║
 ╠══════════════════════════════════════════╣${C_OFF}
    1) Status overview
    2) Tail live logs

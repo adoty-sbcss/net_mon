@@ -7,14 +7,14 @@
 # (Dockerfile + pyproject.toml) don't change. That means a CVE in nmap or
 # paramiko doesn't reach us unless we --no-cache rebuild.
 #
-# This script does that, and runs weekly via appmon-deep-refresh.timer.
+# This script does that, and runs weekly via netmon-deep-refresh.timer.
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
-LOG_TAG="appmon-deep-refresh"
+LOG_TAG="netmon-deep-refresh"
 log() {
     local msg="$*"
     if command -v logger >/dev/null 2>&1; then

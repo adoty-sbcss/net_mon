@@ -1,7 +1,7 @@
 .PHONY: help build up down logs ps shell scan list bundle clean
 
 help:
-	@echo "App_Mon — network discovery and analysis"
+	@echo "NetMon — network discovery and analysis"
 	@echo ""
 	@echo "  make build         Build the collector image"
 	@echo "  make up            Start the stack (collector + postgres)"

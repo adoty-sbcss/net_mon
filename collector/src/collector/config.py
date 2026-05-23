@@ -12,34 +12,34 @@ class Settings(BaseSettings):
 
     postgres_host: str = Field(default="127.0.0.1", alias="POSTGRES_HOST")
     postgres_port: int = Field(default=5432, alias="POSTGRES_PORT")
-    postgres_user: str = Field(default="appmon", alias="POSTGRES_USER")
-    postgres_password: str = Field(default="appmon", alias="POSTGRES_PASSWORD")
-    postgres_db: str = Field(default="appmon", alias="POSTGRES_DB")
+    postgres_user: str = Field(default="netmon", alias="POSTGRES_USER")
+    postgres_password: str = Field(default="netmon", alias="POSTGRES_PASSWORD")
+    postgres_db: str = Field(default="netmon", alias="POSTGRES_DB")
 
-    mode: Literal["field", "monitor"] = Field(default="field", alias="APPMON_MODE")
-    capture_seconds: int = Field(default=60, alias="APPMON_CAPTURE_SECONDS")
-    poll_interval: int = Field(default=30, alias="APPMON_POLL_INTERVAL")
-    cooldown_seconds: int = Field(default=300, alias="APPMON_COOLDOWN_SECONDS")
+    mode: Literal["field", "monitor"] = Field(default="field", alias="NETMON_MODE")
+    capture_seconds: int = Field(default=60, alias="NETMON_CAPTURE_SECONDS")
+    poll_interval: int = Field(default=30, alias="NETMON_POLL_INTERVAL")
+    cooldown_seconds: int = Field(default=300, alias="NETMON_COOLDOWN_SECONDS")
     exclude_ifaces: str = Field(
         default="lo,docker0,br-,veth,virbr,tun,tap",
-        alias="APPMON_EXCLUDE_IFACES",
+        alias="NETMON_EXCLUDE_IFACES",
     )
 
-    snmp_enabled: bool = Field(default=False, alias="APPMON_SNMP_ENABLED")
-    snmp_config: Path = Field(default=Path("/etc/appmon/snmp.yaml"), alias="APPMON_SNMP_CONFIG")
+    snmp_enabled: bool = Field(default=False, alias="NETMON_SNMP_ENABLED")
+    snmp_config: Path = Field(default=Path("/etc/netmon/snmp.yaml"), alias="NETMON_SNMP_CONFIG")
     # Comma-separated list of v2c communities to try, in order. The first one
     # to get a response for a given device gets cached in snmp_credentials.
-    snmp_communities: str = Field(default="", alias="APPMON_SNMP_COMMUNITIES")
+    snmp_communities: str = Field(default="", alias="NETMON_SNMP_COMMUNITIES")
 
-    sftp_enabled: bool = Field(default=False, alias="APPMON_SFTP_ENABLED")
-    sftp_host: str = Field(default="", alias="APPMON_SFTP_HOST")
-    sftp_port: int = Field(default=22, alias="APPMON_SFTP_PORT")
-    sftp_user: str = Field(default="", alias="APPMON_SFTP_USER")
-    sftp_password: str = Field(default="", alias="APPMON_SFTP_PASSWORD")
-    sftp_remote_path: str = Field(default="/", alias="APPMON_SFTP_REMOTE_PATH")
-    device_name: str = Field(default="", alias="APPMON_DEVICE_NAME")
+    sftp_enabled: bool = Field(default=False, alias="NETMON_SFTP_ENABLED")
+    sftp_host: str = Field(default="", alias="NETMON_SFTP_HOST")
+    sftp_port: int = Field(default=22, alias="NETMON_SFTP_PORT")
+    sftp_user: str = Field(default="", alias="NETMON_SFTP_USER")
+    sftp_password: str = Field(default="", alias="NETMON_SFTP_PASSWORD")
+    sftp_remote_path: str = Field(default="/", alias="NETMON_SFTP_REMOTE_PATH")
+    device_name: str = Field(default="", alias="NETMON_DEVICE_NAME")
 
-    bundle_dir: Path = Field(default=Path("/var/lib/appmon/bundles"), alias="APPMON_BUNDLE_DIR")
+    bundle_dir: Path = Field(default=Path("/var/lib/netmon/bundles"), alias="NETMON_BUNDLE_DIR")
 
     @property
     def dsn(self) -> str:

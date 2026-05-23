@@ -109,7 +109,7 @@ def _check_disk_space() -> CheckResult:
     """Bail loudly if either the bundle dir or log dir is nearly full."""
     settings = get_settings()
     thresholds_pct = 95  # warn above this
-    paths = [settings.bundle_dir, Path("/var/log/appmon")]
+    paths = [settings.bundle_dir, Path("/var/log/netmon")]
     summaries: list[str] = []
     ok = True
     for p in paths:
@@ -125,7 +125,7 @@ def _check_disk_space() -> CheckResult:
 
 
 def _check_log_dir() -> CheckResult:
-    p = Path(os.environ.get("APPMON_LOG_DIR", "/var/log/appmon"))
+    p = Path(os.environ.get("NETMON_LOG_DIR", "/var/log/netmon"))
     if not p.exists():
         try:
             p.mkdir(parents=True, exist_ok=True)

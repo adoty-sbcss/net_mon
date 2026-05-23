@@ -1,5 +1,5 @@
 [Unit]
-Description=Nightly App_Mon auto-update
+Description=Nightly NetMon auto-update
 Documentation=https://github.com/adoty-sbcss/net_mon
 
 [Timer]

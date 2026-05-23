@@ -41,7 +41,7 @@ RUN pip install --no-cache-dir .
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-RUN mkdir -p /var/lib/appmon/bundles /etc/appmon
+RUN mkdir -p /var/lib/netmon/bundles /etc/netmon
 
 # Healthcheck — runs the DB + capabilities self-checks. interval=60s gives
 # the collector time to wait for postgres on boot before being marked

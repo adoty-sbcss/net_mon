@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 CLAUDE_BUNDLE_README = """\
-# App_Mon Evidence Bundle
+# NetMon Evidence Bundle
 
 This ZIP contains the output of a single network scan. Drag-and-drop the
 files into a Claude conversation, then send the prompt below.
@@ -71,7 +71,7 @@ files into a Claude conversation, then send the prompt below.
 
 
 CLAUDE_BUNDLE_README_HOURLY = """\
-# App_Mon Hourly Evidence Bundle
+# NetMon Hourly Evidence Bundle
 
 This ZIP rolls up every network scan that completed during one hour on a
 single Ubuntu collector box. It was generated automatically and uploaded
@@ -90,7 +90,7 @@ to the configured SFTP server at the top of the hour.
 
 ## Prompt — paste this into Claude
 
-> I'm uploading an hourly rollup of network scans from an App_Mon
+> I'm uploading an hourly rollup of network scans from an NetMon
 > collector. The box does a 60-second passive + light-active capture
 > per scan, triggered by link-up or run manually. This ZIP contains
 > every scan that completed in one hour on one box.

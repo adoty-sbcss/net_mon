@@ -2,11 +2,11 @@
 
 Goals:
 - Console output (stdout) so `docker compose logs -f collector` works.
-- Persistent rotated log files under /var/log/appmon so history survives
+- Persistent rotated log files under /var/log/netmon so history survives
   container restarts and grows past Docker's buffer.
 - A separate audit.log for high-signal events (scan started/completed,
   upload result, errors). Easy to skim without wading through info logs.
-- Single `APPMON_LOG_LEVEL` env var to dial verbosity.
+- Single `NETMON_LOG_LEVEL` env var to dial verbosity.
 
 Call configure_logging() exactly once at process startup.
 """
@@ -20,15 +20,15 @@ from pathlib import Path
 
 import structlog
 
-LOG_DIR = Path(os.environ.get("APPMON_LOG_DIR", "/var/log/appmon"))
-LOG_LEVEL_NAME = os.environ.get("APPMON_LOG_LEVEL", "INFO").upper()
+LOG_DIR = Path(os.environ.get("NETMON_LOG_DIR", "/var/log/netmon"))
+LOG_LEVEL_NAME = os.environ.get("NETMON_LOG_LEVEL", "INFO").upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.INFO)
 
 # How long to keep on-disk logs. Rotates daily, gzipped.
 COLLECTOR_LOG_BACKUP_COUNT = 14   # ~2 weeks
 AUDIT_LOG_BACKUP_COUNT = 30       # ~1 month — audit lines are tiny
 
-_AUDIT_LOGGER_NAME = "appmon.audit"
+_AUDIT_LOGGER_NAME = "netmon.audit"
 
 
 def configure_logging() -> None:

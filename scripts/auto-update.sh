@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# auto-update.sh — pull latest App_Mon from main and apply.
+# auto-update.sh — pull latest NetMon from main and apply.
 #
 # Designed for nightly systemd timer execution. Safe to run by hand too.
 # Logs to syslog via `logger` so journalctl picks it up; also echoes to stdout
@@ -27,7 +27,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
-LOG_TAG="appmon-update"
+LOG_TAG="netmon-update"
 log() {
     local msg="$*"
     if command -v logger >/dev/null 2>&1; then
