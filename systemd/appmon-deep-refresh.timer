@@ -1,0 +1,15 @@
+[Unit]
+Description=Weekly App_Mon deep refresh (security patches in cached layers)
+Documentation=https://github.com/adoty-sbcss/net_mon
+
+[Timer]
+# Every Sunday at 04:00 local with up to 60 minutes of jitter. Deep refresh
+# is heavier than the nightly auto-update (full --no-cache rebuild), so we
+# space it out to once a week and run it after the nightly window.
+OnCalendar=Sun *-*-* 04:00:00
+RandomizedDelaySec=3600
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

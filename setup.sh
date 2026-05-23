@@ -96,7 +96,9 @@ apt_update_once() {
 
 log "Checking essential packages..."
 NEED_PKGS=()
-for pkg in ca-certificates curl openssl git; do
+# unattended-upgrades keeps the Ubuntu host current with security patches
+# (the containers get refreshed by appmon-update / appmon-deep-refresh timers).
+for pkg in ca-certificates curl openssl git unattended-upgrades; do
     if ! pkg_installed "$pkg"; then
         NEED_PKGS+=("$pkg")
     fi
@@ -106,6 +108,14 @@ if (( ${#NEED_PKGS[@]} > 0 )); then
     apt_update_once
     log "Installing: ${NEED_PKGS[*]}"
     apt_install "${NEED_PKGS[@]}"
+fi
+
+# Ensure unattended-upgrades is actually enabled for security updates.
+if pkg_installed unattended-upgrades; then
+    if ! systemctl is-enabled --quiet unattended-upgrades 2>/dev/null; then
+        log "Enabling unattended-upgrades for Ubuntu security patches..."
+        $SUDO systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
+    fi
 fi
 ok "essentials present"
 
@@ -186,8 +196,8 @@ dc() {
 
 # --- 5. Required directories ---------------------------------------------
 
-log "Creating bundles/ and config/ directories..."
-mkdir -p bundles config
+log "Creating bundles/, config/, and logs/ directories..."
+mkdir -p bundles config logs
 ok "directories ready"
 
 # --- 6. .env scaffolding --------------------------------------------------
@@ -412,14 +422,13 @@ fi
 echo "Next steps:"
 echo "  1. Plug a network cable into the box (auto-scan triggers on link-up)"
 echo ""
-echo "  2. Watch the collector activity:"
-echo "       $DC_CMD logs -f collector"
-echo ""
-echo "  3. List scans collected so far:"
-echo "       $DC_CMD exec collector python -m collector list"
-echo ""
-echo "  4. Force an upload now (bundles + ships the most recent hour):"
-echo "       $DC_CMD exec collector python -m collector upload-now"
+echo "  2. Use the operator console for everything:"
+echo "       ./appmon              # interactive menu"
+echo "       ./appmon status       # one-shot status"
+echo "       ./appmon logs         # tail live logs"
+echo "       ./appmon scan eth0    # manual scan"
+echo "       ./appmon upload-now   # force upload"
+echo "       ./appmon help         # full list"
 echo ""
 
 [[ ${NEEDS_REGROUP:-0} -eq 1 ]] && {

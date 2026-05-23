@@ -1,0 +1,19 @@
+# Template — install-auto-update.sh substitutes ${USER} and ${REPO_DIR}
+# before installing to /etc/systemd/system/appmon-deep-refresh.service.
+[Unit]
+Description=App_Mon weekly deep refresh (no-cache rebuild)
+Documentation=https://github.com/adoty-sbcss/net_mon
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=${USER}
+Group=${USER}
+WorkingDirectory=${REPO_DIR}
+ExecStart=${REPO_DIR}/scripts/weekly-deep-refresh.sh
+# No-cache rebuilds re-download apt and pip, can take 5-10 minutes.
+TimeoutStartSec=45min
+StandardOutput=journal
+StandardError=journal

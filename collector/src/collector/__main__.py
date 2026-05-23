@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import sys
 
 import click
@@ -10,29 +9,17 @@ from . import __version__
 from .bundle import build_bundle
 from .config import get_settings
 from .db import fetch_scan, list_scan_runs, wait_for_db
+from .logging_setup import audit, configure_logging
 from .poller import run_poller
 from .scan import run_scan
 from . import migrations as migrations_mod
+from . import selftest as selftest_mod
 from . import uploader as uploader_mod
 
 
 def _configure_logging() -> None:
-    logging.basicConfig(
-        format="%(message)s",
-        stream=sys.stdout,
-        level=logging.INFO,
-    )
-    structlog.configure(
-        processors=[
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
-            structlog.dev.ConsoleRenderer(colors=False),
-        ],
-        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-        cache_logger_on_first_use=True,
-    )
+    """Kept as a thin wrapper for backward-compat with the prior name."""
+    configure_logging()
 
 
 log = structlog.get_logger(__name__)
@@ -59,6 +46,14 @@ def cmd_run() -> None:
     # migration fails, refuse to start — better than running with a half-
     # applied schema and corrupting data.
     migrations_mod.apply_pending()
+    # Self-test once at startup. We log every check so operators can grep the
+    # boot log for the state of the box; we DON'T refuse to start on failure
+    # because some failures (e.g. no interface with carrier yet) are normal
+    # at boot and resolve once a cable is plugged in.
+    selftest_mod.log_results(selftest_mod.run_all())
+    audit("collector_started", mode=settings.mode,
+          sftp_enabled=settings.sftp_enabled,
+          device=uploader_mod.device_name())
     uploader_mod.start_in_background()
     run_poller()
 
@@ -158,6 +153,43 @@ def cmd_upload_now() -> None:
     if result.get("message"):
         click.echo(f"detail:        {result['message']}")
     sys.exit(0 if result["status"] in ("uploaded", "saved_only", "skipped") else 2)
+
+
+@cli.command("healthcheck")
+@click.option("--verbose/--no-verbose", default=False, help="Print every check result.")
+def cmd_healthcheck(verbose: bool) -> None:
+    """Run the self-test and exit non-zero if any check failed.
+
+    Used by Docker's HEALTHCHECK directive. The DB check is the one that
+    matters most for "is the container actually working" — without it the
+    collector can't persist anything. Other checks (disk, interfaces) are
+    informational here; we don't fail healthcheck on them.
+    """
+    results = selftest_mod.run_all()
+    critical_failures = []
+    for r in results:
+        prefix = "OK  " if r.ok else "FAIL"
+        if verbose or not r.ok:
+            click.echo(f"{prefix} {r.name}: {r.detail}")
+        # Treat only the DB and capabilities checks as healthcheck-blocking;
+        # disk/interfaces can be transiently bad without the collector being
+        # truly unhealthy.
+        if not r.ok and r.name in ("db", "capabilities"):
+            critical_failures.append(r.name)
+    if critical_failures:
+        click.echo(f"healthcheck FAILED: {','.join(critical_failures)}", err=True)
+        sys.exit(1)
+    if not verbose:
+        click.echo("healthcheck OK")
+
+
+@cli.command("selftest")
+def cmd_selftest() -> None:
+    """Run every self-check and print results (does not block on any failure)."""
+    results = selftest_mod.run_all()
+    for r in results:
+        prefix = "OK  " if r.ok else "WARN"
+        click.echo(f"{prefix} {r.name}: {r.detail}")
 
 
 if __name__ == "__main__":

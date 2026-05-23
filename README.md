@@ -76,19 +76,24 @@ Wait ~90 seconds, then either wait for the hourly upload or run `upload-now`.
 
 ## 5. Common commands
 
-| What you want | Command |
-|---|---|
-| Test SFTP connection | `docker compose exec collector python -m collector upload-test` |
-| Force upload right now | `docker compose exec collector python -m collector upload-now` |
-| See live activity | `docker compose logs -f collector` |
-| List all scans | `docker compose exec collector python -m collector list` |
-| Export a single scan locally | `docker compose exec collector python -m collector bundle <id>` |
-| Restart containers | `docker compose restart` |
-| Stop everything | `docker compose down` |
-| Start it again later | `docker compose up -d` |
-| Apply a new `.env` | `docker compose down && docker compose up -d` |
-| Reconfigure settings | `./setup.sh` |
-| Wipe all data and start fresh | `docker compose down -v` |
+The fastest path is the **`./appmon`** console — run it with no args for an interactive menu, or with a subcommand for one-shot use.
+
+```bash
+./appmon                # interactive menu with the top 14 operations
+./appmon status         # container/scan/upload/disk overview
+./appmon logs           # tail collector logs
+./appmon audit          # high-signal event log
+./appmon scan eth0      # manual scan
+./appmon upload-now     # force-build + ship the current bundle
+./appmon upload-test    # SFTP connection check
+./appmon bundles        # local files + upload state
+./appmon timers         # update timer schedule + last run
+./appmon update         # run auto-update.sh manually
+./appmon selftest       # collector self-checks
+./appmon help           # full list
+```
+
+Underneath it's still `docker compose ...` — see `appmon` for the exact commands if you want to call them directly.
 
 ---
 

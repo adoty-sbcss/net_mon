@@ -82,10 +82,12 @@ fi
 NEW_HEAD=$(git rev-parse HEAD)
 log "pulled to ${NEW_HEAD:0:8}"
 
-# 4. Rebuild only if container code changed.
+# 4. Rebuild only if container code changed. Always --pull so we pick up
+# any security patches in the python:3.12-slim base image. Without --pull
+# Docker keeps using the cached base layer indefinitely.
 if [[ $NEEDS_BUILD -eq 1 ]]; then
-    log "rebuilding collector image"
-    if ! docker compose build --quiet collector 2>&1 | while read -r ln; do log "  $ln"; done; then
+    log "rebuilding collector image (with --pull for base-image security updates)"
+    if ! docker compose build --pull --quiet collector 2>&1 | while read -r ln; do log "  $ln"; done; then
         log "ERROR: docker compose build failed"
         exit 1
     fi

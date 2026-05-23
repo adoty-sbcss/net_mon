@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# appmon — operator console for App_Mon.
+#
+# Interactive:    ./appmon            (shows numbered menu)
+# Non-interactive ./appmon status     (jumps straight to that task)
+#                 ./appmon scan eth0
+#                 ./appmon upload-now
+#                 ./appmon logs
+#                 ./appmon help
+#
+# Designed for techs who don't want to memorize `docker compose exec collector
+# python -m collector ...` commands. Every menu option wraps that for you.
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# --- shared helpers --------------------------------------------------------
+
+if [[ -t 1 ]]; then
+    C_HEAD=$'\033[1;36m'; C_OK=$'\033[1;32m'; C_WARN=$'\033[1;33m'
+    C_ERR=$'\033[1;31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+    C_HEAD= C_OK= C_WARN= C_ERR= C_DIM= C_OFF=
+fi
+
+# Use sudo for docker calls when the current user isn't yet in the docker group.
+if id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    DC=("docker" "compose")
+else
+    DC=("sudo" "docker" "compose")
+fi
+
+dc() { "${DC[@]}" "$@"; }
+
+require_running() {
+    # Confirm the collector container is actually up before running a command
+    # that needs it.
+    if ! dc ps --status running 2>/dev/null | grep -q appmon-collector; then
+        printf '%sCollector container is not running.%s\n' "$C_ERR" "$C_OFF" >&2
+        echo "Run option 8 (Restart) or 'docker compose up -d'." >&2
+        return 1
+    fi
+}
+
+pause() {
+    echo ""
+    read -r -p "Press Enter to return to menu..." _ || true
+}
+
+# --- task implementations --------------------------------------------------
+
+cmd_status() {
+    printf '%s== Container status ==%s\n' "$C_HEAD" "$C_OFF"
+    dc ps
+    echo ""
+    printf '%s== Recent scans ==%s\n' "$C_HEAD" "$C_OFF"
+    if require_running 2>/dev/null; then
+        dc exec -T collector python -m collector list --limit 5 2>&1 || true
+    fi
+    echo ""
+    printf '%s== Pending uploads ==%s\n' "$C_HEAD" "$C_OFF"
+    if dc ps --status running 2>/dev/null | grep -q appmon-postgres; then
+        dc exec -T postgres psql -U "${POSTGRES_USER:-appmon}" -d "${POSTGRES_DB:-appmon}" -c \
+            "SELECT filename, built_at, uploaded_at, retry_count FROM bundle_uploads ORDER BY built_at DESC LIMIT 8;" 2>&1 || true
+    fi
+    echo ""
+    printf '%s== Disk usage ==%s\n' "$C_HEAD" "$C_OFF"
+    if [[ -d ./bundles ]]; then
+        du -sh ./bundles 2>/dev/null || true
+    fi
+    if [[ -d ./logs ]]; then
+        du -sh ./logs 2>/dev/null || true
+    fi
+    df -h . | tail -2
+}
+
+cmd_logs() {
+    printf '%s== Tailing collector logs (Ctrl-C to stop) ==%s\n' "$C_HEAD" "$C_OFF"
+    dc logs -f --tail 50 collector
+}
+
+cmd_audit() {
+    printf '%s== Audit log (last 50 lines) ==%s\n' "$C_HEAD" "$C_OFF"
+    if [[ -f ./logs/audit.log ]]; then
+        tail -n 50 ./logs/audit.log
+    else
+        echo "(no audit.log yet — runs once the collector has emitted an event)"
+    fi
+}
+
+cmd_list_scans() {
+    require_running || return 1
+    dc exec -T collector python -m collector list
+}
+
+cmd_scan() {
+    local iface="${1:-}"
+    if [[ -z "$iface" ]]; then
+        printf '%s== Interfaces with carrier ==%s\n' "$C_HEAD" "$C_OFF"
+        ip -br addr 2>/dev/null | grep -v '^lo' || true
+        echo ""
+        read -r -p "Interface name (e.g. eth0, enp0s31f6): " iface || return 1
+    fi
+    [[ -z "$iface" ]] && { echo "(no interface given, abort)"; return 1; }
+    require_running || return 1
+    dc exec -T collector python -m collector scan "$iface"
+}
+
+cmd_upload_now() {
+    require_running || return 1
+    dc exec -T collector python -m collector upload-now
+}
+
+cmd_upload_test() {
+    require_running || return 1
+    dc exec -T collector python -m collector upload-test
+}
+
+cmd_config() {
+    printf '%s== Effective config (.env, password redacted) ==%s\n' "$C_HEAD" "$C_OFF"
+    if [[ ! -f .env ]]; then
+        echo "(.env not found — run ./setup.sh)"
+        return 1
+    fi
+    # Show every line, but redact anything that looks like a secret.
+    awk -F= '
+        /^[[:space:]]*#/ || NF<2 { print; next }
+        /PASSWORD/ || /SECRET/ || /TOKEN/ || /KEY/ {
+            printf "%s=%s\n", $1, "***REDACTED***"; next
+        }
+        { print }
+    ' .env
+}
+
+cmd_restart() {
+    printf '%s== Restarting containers ==%s\n' "$C_HEAD" "$C_OFF"
+    dc restart
+}
+
+cmd_update() {
+    printf '%s== Running auto-update now ==%s\n' "$C_HEAD" "$C_OFF"
+    if [[ -x ./scripts/auto-update.sh ]]; then
+        ./scripts/auto-update.sh
+    else
+        echo "scripts/auto-update.sh missing or not executable" >&2
+        return 1
+    fi
+}
+
+cmd_timers() {
+    printf '%s== Update timer schedule ==%s\n' "$C_HEAD" "$C_OFF"
+    systemctl list-timers --no-pager 'appmon-*.timer' 2>/dev/null || \
+        echo "(no appmon timers installed — run ./scripts/install-auto-update.sh)"
+    echo ""
+    printf '%s== Last nightly update output ==%s\n' "$C_HEAD" "$C_OFF"
+    journalctl -u appmon-update.service -n 20 --no-pager 2>/dev/null || \
+        echo "(no journal entries yet)"
+}
+
+cmd_bundles() {
+    printf '%s== Local bundle files (./bundles) ==%s\n' "$C_HEAD" "$C_OFF"
+    if [[ -d ./bundles ]] && [[ -n "$(ls -A ./bundles 2>/dev/null)" ]]; then
+        ls -lh ./bundles
+    else
+        echo "(no local bundles yet)"
+    fi
+    echo ""
+    printf '%s== Upload state (last 20 from db) ==%s\n' "$C_HEAD" "$C_OFF"
+    if dc ps --status running 2>/dev/null | grep -q appmon-postgres; then
+        dc exec -T postgres psql -U "${POSTGRES_USER:-appmon}" -d "${POSTGRES_DB:-appmon}" -c \
+            "SELECT filename, built_at, uploaded_at, retry_count, last_error FROM bundle_uploads ORDER BY built_at DESC LIMIT 20;" 2>&1 || true
+    fi
+}
+
+cmd_reconfigure() {
+    printf '%s== Re-running setup.sh ==%s\n' "$C_HEAD" "$C_OFF"
+    ./setup.sh
+}
+
+cmd_selftest() {
+    require_running || return 1
+    dc exec -T collector python -m collector selftest
+}
+
+cmd_help() {
+    cat <<EOF
+Usage: ./appmon [command] [args]
+
+Interactive: run with no command for the menu.
+
+Commands:
+  status         Container, scan, upload, and disk overview
+  logs           Tail live collector logs
+  audit          Show the audit log (high-signal events)
+  list           List recent scans
+  scan [iface]   Run a manual scan (prompts if iface not given)
+  upload-now     Force-build + upload the current bundle right now
+  upload-test    Test SFTP connection
+  config         Show .env (passwords redacted)
+  restart        Restart containers
+  update         Run auto-update.sh manually
+  timers         Show update timer schedule + last run output
+  bundles        Show local bundle files + upload state
+  reconfigure    Re-run ./setup.sh
+  selftest       Run the collector's internal self-checks
+  help           Show this help
+EOF
+}
+
+# --- interactive menu ------------------------------------------------------
+
+menu_once() {
+    cat <<EOF
+
+${C_HEAD}╔══════════════════════════════════════════╗
+║          App_Mon — Operations            ║
+╠══════════════════════════════════════════╣${C_OFF}
+   1) Status overview
+   2) Tail live logs
+   3) Audit log (high-signal events)
+   4) List recent scans
+   5) Run a manual scan
+   6) Force upload now
+   7) Test SFTP connection
+   8) Show config (.env, redacted)
+   9) Restart containers
+  10) Update now (git pull + rebuild)
+  11) View update timer schedule
+  12) Bundle history (local + uploaded)
+  13) Re-run ./setup.sh
+  14) Run collector self-test
+   q) Quit
+${C_HEAD}╚══════════════════════════════════════════╝${C_OFF}
+EOF
+    read -r -p "Choice: " choice || return 1
+    case "$choice" in
+         1) cmd_status ;;
+         2) cmd_logs ;;
+         3) cmd_audit ;;
+         4) cmd_list_scans ;;
+         5) cmd_scan ;;
+         6) cmd_upload_now ;;
+         7) cmd_upload_test ;;
+         8) cmd_config ;;
+         9) cmd_restart ;;
+        10) cmd_update ;;
+        11) cmd_timers ;;
+        12) cmd_bundles ;;
+        13) cmd_reconfigure ;;
+        14) cmd_selftest ;;
+        q|Q|exit|quit) return 99 ;;
+        *) printf '%s(unknown choice: %s)%s\n' "$C_WARN" "$choice" "$C_OFF" ;;
+    esac
+    pause
+    return 0
+}
+
+# --- dispatch --------------------------------------------------------------
+
+if [[ $# -eq 0 ]]; then
+    # Interactive menu loop.
+    while true; do
+        menu_once || { rc=$?; [[ $rc -eq 99 ]] && exit 0; exit $rc; }
+    done
+else
+    case "${1:-}" in
+        status)        cmd_status ;;
+        logs)          cmd_logs ;;
+        audit)         cmd_audit ;;
+        list)          cmd_list_scans ;;
+        scan)          shift; cmd_scan "${1:-}" ;;
+        upload-now)    cmd_upload_now ;;
+        upload-test)   cmd_upload_test ;;
+        config)        cmd_config ;;
+        restart)       cmd_restart ;;
+        update)        cmd_update ;;
+        timers)        cmd_timers ;;
+        bundles)       cmd_bundles ;;
+        reconfigure)   cmd_reconfigure ;;
+        selftest)      cmd_selftest ;;
+        help|-h|--help) cmd_help ;;
+        *) cmd_help; exit 1 ;;
+    esac
+fi

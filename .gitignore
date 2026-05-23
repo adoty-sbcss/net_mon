@@ -1,5 +1,6 @@
 .env
 bundles/
+logs/
 config/snmp.yaml
 **/__pycache__/
 *.pyc

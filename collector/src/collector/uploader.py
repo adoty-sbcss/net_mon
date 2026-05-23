@@ -10,7 +10,19 @@ import structlog
 
 from .bundle import build_hourly_bundle
 from .config import get_settings
-from .db import list_scan_runs_in_window
+from .db import (
+    list_pending_bundles,
+    list_scan_runs_in_window,
+    list_uploaded_bundles_older_than,
+    record_bundle_built,
+    record_bundle_upload_failure,
+    record_bundle_uploaded,
+)
+from .logging_setup import audit
+
+# How long we keep successfully-uploaded ZIPs on local disk before pruning.
+# Adjust by editing here; not surfaced as env to keep config simple for v1.
+LOCAL_BUNDLE_RETENTION_DAYS = 30
 
 log = structlog.get_logger(__name__)
 
@@ -45,6 +57,8 @@ def _filename_for(window_end: datetime) -> str:
 
 def build_and_upload_hour(window_end: datetime) -> dict[str, str | None]:
     """Build a bundle for the hour ending at window_end and upload it.
+    Also retries any prior bundle whose upload failed, and prunes old
+    successfully-uploaded local files.
 
     Returns dict with: local_path, remote_path, status, message, scans.
     """
@@ -57,45 +71,124 @@ def build_and_upload_hour(window_end: datetime) -> dict[str, str | None]:
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
         "scans": "0",
+        "retried": "0",
     }
-    if not runs:
-        result["message"] = "no scans completed in this hour"
-        log.info("hourly upload skipped, no scans",
+
+    # 1. Build the current-hour bundle (if there's anything to bundle).
+    if runs:
+        scan_ids = [int(r["id"]) for r in runs]
+        result["scans"] = str(len(scan_ids))
+        filename = _filename_for(window_end)
+        bundle_path = settings.bundle_dir / filename
+        bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        build_hourly_bundle(
+            scan_ids,
+            bundle_path,
+            device_name=device_name(),
+            window_start=window_start,
+            window_end=window_end,
+        )
+        result["local_path"] = str(bundle_path)
+        try:
+            size = bundle_path.stat().st_size
+        except OSError:
+            size = 0
+        record_bundle_built(filename, str(bundle_path), size)
+        audit("bundle_built", filename=filename, size_bytes=size,
+              scans=len(scan_ids))
+    else:
+        log.info("no scans in this hour, nothing new to bundle",
                  start=window_start.isoformat(), end=window_end.isoformat())
-        return result
 
-    scan_ids = [int(r["id"]) for r in runs]
-    result["scans"] = str(len(scan_ids))
-
-    filename = _filename_for(window_end)
-    bundle_path = settings.bundle_dir / filename
-    bundle_path.parent.mkdir(parents=True, exist_ok=True)
-    build_hourly_bundle(
-        scan_ids,
-        bundle_path,
-        device_name=device_name(),
-        window_start=window_start,
-        window_end=window_end,
-    )
-    result["local_path"] = str(bundle_path)
-
+    # 2. Try to upload every pending bundle (today's plus anything orphaned
+    # from earlier failed runs).
     if not settings.sftp_enabled:
         result["status"] = "saved_only"
-        result["message"] = "SFTP disabled (APPMON_SFTP_ENABLED=false); bundle kept locally"
-        log.info("hourly bundle built but not uploaded",
-                 path=str(bundle_path), reason="sftp disabled")
+        result["message"] = "SFTP disabled (APPMON_SFTP_ENABLED=false); bundles kept locally"
         return result
 
-    try:
-        remote = upload_file(bundle_path)
-        result["remote_path"] = remote
+    pending = list_pending_bundles()
+    if not pending:
+        if runs:
+            result["status"] = "uploaded"
+            result["message"] = "current bundle was the only pending one and it shipped"
+        else:
+            result["message"] = "nothing pending to upload"
+        # Still prune old uploaded files so we don't fill the disk.
+        _prune_old_uploaded_bundles()
+        return result
+
+    log.info("uploading pending bundles", count=len(pending))
+    succeeded = 0
+    failed = 0
+    last_error: str | None = None
+    for row in pending:
+        fname = row["filename"]
+        path = Path(row["local_path"])
+        if not path.exists():
+            log.warning("pending bundle file missing on disk, marking failed",
+                        filename=fname, path=str(path))
+            record_bundle_upload_failure(fname, "local file missing")
+            failed += 1
+            last_error = "local file missing"
+            continue
+        try:
+            remote = upload_file(path)
+            record_bundle_uploaded(fname, remote)
+            audit("bundle_uploaded", filename=fname, remote_path=remote,
+                  size_bytes=path.stat().st_size)
+            succeeded += 1
+            if path.name == Path(result.get("local_path") or "").name:
+                result["remote_path"] = remote
+        except Exception as exc:
+            err = str(exc)
+            log.exception("sftp upload failed", filename=fname, error=err)
+            record_bundle_upload_failure(fname, err)
+            audit("bundle_upload_failed", filename=fname, error=err)
+            failed += 1
+            last_error = err
+
+    # 3. Result summary.
+    result["retried"] = str(len(pending) - (1 if runs else 0))
+    if failed == 0:
         result["status"] = "uploaded"
-        result["message"] = f"uploaded {bundle_path.name}"
-    except Exception as exc:
-        log.exception("sftp upload failed", path=str(bundle_path), error=str(exc))
+        result["message"] = f"uploaded {succeeded} bundle(s)"
+    elif succeeded == 0:
         result["status"] = "upload_failed"
-        result["message"] = str(exc)
+        result["message"] = last_error or "all uploads failed"
+    else:
+        result["status"] = "partial"
+        result["message"] = (f"{succeeded} bundle(s) uploaded, "
+                             f"{failed} failed (last error: {last_error})")
+
+    # 4. Disk hygiene.
+    _prune_old_uploaded_bundles()
     return result
+
+
+def _prune_old_uploaded_bundles() -> None:
+    """Delete local bundle files that were uploaded > N days ago."""
+    try:
+        rows = list_uploaded_bundles_older_than(LOCAL_BUNDLE_RETENTION_DAYS)
+    except Exception as exc:
+        log.warning("prune query failed", error=str(exc))
+        return
+    if not rows:
+        return
+    n = 0
+    for row in rows:
+        p = Path(row["local_path"])
+        if p.exists():
+            try:
+                p.unlink()
+                n += 1
+            except OSError as exc:
+                log.warning("could not delete bundle file",
+                            filename=row["filename"], error=str(exc))
+    if n:
+        log.info("pruned old uploaded bundles", count=n,
+                 retention_days=LOCAL_BUNDLE_RETENTION_DAYS)
+        audit("bundles_pruned", count=n, retention_days=LOCAL_BUNDLE_RETENTION_DAYS)
 
 
 def upload_file(local_path: Path) -> str:

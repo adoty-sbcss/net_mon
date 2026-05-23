@@ -8,6 +8,7 @@ import structlog
 
 from .config import get_settings
 from .db import complete_scan_run, insert_many, insert_scan_run, recent_network_scan
+from .logging_setup import audit
 from .discovery import arp as arp_mod
 from .discovery import interfaces as iface_mod
 from .discovery import lldp as lldp_mod
@@ -58,6 +59,10 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool) -> int | None:
     log.info("scan started",
              scan_id=scan_id, interface=state.name,
              cidr=state.primary_cidr, gateway=state.gateway_ip)
+    audit("scan_started",
+          scan_id=scan_id, interface=state.name,
+          cidr=state.primary_cidr, gateway=state.gateway_ip,
+          trigger=trigger_reason)
 
     ctx = ScanContext(
         scan_id=scan_id,
@@ -127,11 +132,14 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool) -> int | None:
 
     except Exception as exc:
         log.exception("scan failed", scan_id=scan_id, error=str(exc))
+        audit("scan_failed", scan_id=scan_id, error=str(exc))
         error = str(exc)
     finally:
         duration = int(time.monotonic() - ctx.started_monotonic)
         complete_scan_run(scan_id, duration_sec=duration, error=error)
         log.info("scan complete", scan_id=scan_id, duration_sec=duration, error=error)
+        audit("scan_completed", scan_id=scan_id, duration_sec=duration,
+              error=error or "none")
 
     return scan_id
 

@@ -58,9 +58,19 @@ services:
       APPMON_SFTP_PASSWORD: ${APPMON_SFTP_PASSWORD:-}
       APPMON_SFTP_REMOTE_PATH: ${APPMON_SFTP_REMOTE_PATH:-/}
       APPMON_DEVICE_NAME: ${APPMON_DEVICE_NAME:-}
+      APPMON_LOG_LEVEL: ${APPMON_LOG_LEVEL:-INFO}
+    # Cap Docker's own log buffer so it can't fill the disk if the collector
+    # gets chatty. Persistent history is in ./logs/ (mounted below).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     volumes:
       - ./bundles:/var/lib/appmon/bundles
       - ./config:/etc/appmon:ro
+      # Persistent rotated logs on the host. See logging_setup.py.
+      - ./logs:/var/log/appmon
       # Schema migrations applied by the collector on startup. Mounted (not
       # baked into the image) so an auto-update can ship new migration files
       # via `git pull` without requiring an image rebuild.

@@ -228,6 +228,91 @@ def record_snmp_failure(device_ip: str) -> None:
             )
 
 
+def record_bundle_built(filename: str, local_path: str, size_bytes: int) -> None:
+    """Record that a bundle file was just built. Upserts on filename so a
+    rebuilt-same-hour ZIP doesn't create duplicate rows."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bundle_uploads
+                    (filename, local_path, built_at, size_bytes)
+                VALUES (%s, %s, NOW(), %s)
+                ON CONFLICT (filename) DO UPDATE
+                    SET local_path = EXCLUDED.local_path,
+                        built_at   = NOW(),
+                        size_bytes = EXCLUDED.size_bytes,
+                        -- If we're rebuilding, the prior upload is stale.
+                        uploaded_at = NULL,
+                        remote_path = NULL
+                """,
+                (filename, local_path, size_bytes),
+            )
+
+
+def record_bundle_uploaded(filename: str, remote_path: str) -> None:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE bundle_uploads
+                   SET uploaded_at     = NOW(),
+                       last_attempt_at = NOW(),
+                       remote_path     = %s,
+                       last_error      = NULL
+                 WHERE filename = %s
+                """,
+                (remote_path, filename),
+            )
+
+
+def record_bundle_upload_failure(filename: str, error: str) -> None:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE bundle_uploads
+                   SET last_attempt_at = NOW(),
+                       last_error      = %s,
+                       retry_count     = retry_count + 1
+                 WHERE filename = %s
+                """,
+                (error[:500] if error else error, filename),
+            )
+
+
+def list_pending_bundles() -> list[dict[str, Any]]:
+    """Bundles built but not yet successfully uploaded. FIFO order."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, filename, local_path, built_at, last_attempt_at,
+                       retry_count, last_error
+                  FROM bundle_uploads
+                 WHERE uploaded_at IS NULL
+                 ORDER BY built_at ASC
+                """,
+            )
+            return list(cur.fetchall())
+
+
+def list_uploaded_bundles_older_than(days: int) -> list[dict[str, Any]]:
+    """Successfully-uploaded bundles whose local file we can safely prune."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, filename, local_path, uploaded_at
+                  FROM bundle_uploads
+                 WHERE uploaded_at IS NOT NULL
+                   AND uploaded_at < NOW() - (%s || ' days')::interval
+                """,
+                (str(days),),
+            )
+            return list(cur.fetchall())
+
+
 def insert_many(table: str, rows: list[dict[str, Any]]) -> None:
     """Insert a batch of rows by column-name dict. Table name is whitelisted."""
     if not rows:

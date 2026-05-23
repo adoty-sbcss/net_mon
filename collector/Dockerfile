@@ -43,5 +43,11 @@ RUN chmod +x /entrypoint.sh
 
 RUN mkdir -p /var/lib/appmon/bundles /etc/appmon
 
+# Healthcheck — runs the DB + capabilities self-checks. interval=60s gives
+# the collector time to wait for postgres on boot before being marked
+# unhealthy; start-period=90s prevents false-unhealthy during initial wait.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=3 \
+    CMD python -m collector healthcheck >/dev/null || exit 1
+
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
 CMD ["run"]
