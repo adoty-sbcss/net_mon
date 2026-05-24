@@ -11,6 +11,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")"
+REPO_DIR="$(pwd)"
 
 # --- load shared modules --------------------------------------------------
 
@@ -20,8 +21,6 @@ cd "$(dirname "$0")"
 . "./lib/docker.sh"
 . "./lib/envfile.sh"
 . "./lib/validate.sh"
-. "./lib/sftp.sh"
-. "./lib/snmp.sh"
 
 # --- platform + paths -----------------------------------------------------
 
@@ -53,27 +52,36 @@ ensure_docker_engine
 ensure_docker_compose
 ensure_docker_membership
 
-# --- 3. Seed netmon.env from .env.example on first run -------------------
+# --- 3. Install netmon-wizard + first-boot profile snippet ---------------
 
-seed_env_from_example "./.env.example"
+log "Linking netmon-wizard into /usr/local/sbin..."
+# Symlink, not copy: any git pull that updates bin/netmon-wizard is picked
+# up automatically. The wizard discovers its lib/ relative to its own
+# location, so the symlink target (in-repo) resolves the right lib/.
+$SUDO ln -sf "$REPO_DIR/bin/netmon-wizard" /usr/local/sbin/netmon-wizard
+ok "netmon-wizard linked (-> $REPO_DIR/bin/netmon-wizard)"
 
-# --- 4. Auto-generate POSTGRES_PASSWORD if still the placeholder ---------
+log "Installing first-boot login prompt to /etc/profile.d/..."
+$SUDO install -m 644 -o root -g root "$REPO_DIR/scripts/netmon-firstboot.sh" \
+    /etc/profile.d/netmon-firstboot.sh
+ok "first-boot prompt installed"
 
-current_pgpw="$(current_value POSTGRES_PASSWORD)"
-if [[ -z "$current_pgpw" || "$current_pgpw" == "change-me-please" ]]; then
-    new_pgpw="$(openssl rand -hex 16 2>/dev/null || head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)"
-    set_value POSTGRES_PASSWORD "$new_pgpw"
-    log "Generated random POSTGRES_PASSWORD."
+# --- 4. Run the wizard ----------------------------------------------------
+
+WIZARD_SENTINEL="${NETMON_VAR_DIR}/.wizard-done"
+run_wizard=1
+if [[ -f "$WIZARD_SENTINEL" ]]; then
+    ok "wizard already completed on this box"
+    if ! prompt_yesno "Re-run the full wizard (keeps current values as defaults)?" "N"; then
+        run_wizard=0
+    fi
 fi
 
-# --- 5. Interactive SFTP + SNMP config -----------------------------------
+if [[ $run_wizard -eq 1 ]]; then
+    /usr/local/sbin/netmon-wizard
+fi
 
-prompt_sftp_config "$(hostname)"
-prompt_snmp_config
-
-ok "settings written to $NETMON_ENV_FILE (chmod 600)"
-
-# --- 6. Build, start, optional SFTP test ---------------------------------
+# --- 5. Build, start, optional SFTP test ---------------------------------
 
 echo ""
 log "Building containers (first build takes a few minutes)..."
@@ -95,11 +103,11 @@ if prompt_yesno "Test the SFTP connection now?" "Y"; then
     if dc exec -T collector python -m collector upload-test; then
         ok "SFTP test passed"
     else
-        warn "SFTP test failed. Re-run ./setup.sh to update credentials."
+        warn "SFTP test failed. Re-run 'sudo netmon-wizard sftp' to update credentials."
     fi
 fi
 
-# --- 7. Optional: install nightly auto-update timer ---------------------
+# --- 6. Optional: install nightly auto-update timer ----------------------
 
 echo ""
 echo "${C_INFO}=== Optional: nightly auto-update ===${C_OFF}"
@@ -116,9 +124,9 @@ fi
 
 if [[ $already_installed -eq 1 ]]; then
     ok "auto-update timer already installed"
-    do_install=1
-    if ! prompt_yesno "Re-install (to pick up any updated paths/user)?" "N"; then
-        do_install=0
+    do_install=0
+    if prompt_yesno "Re-install (to pick up any updated paths/user)?" "N"; then
+        do_install=1
     fi
 else
     do_install=1
@@ -152,6 +160,13 @@ echo "       ./netmon logs         # tail live logs"
 echo "       ./netmon scan eth0    # manual scan"
 echo "       ./netmon upload-now   # force upload"
 echo "       ./netmon help         # full list"
+echo ""
+echo "  3. Reconfigure any time:"
+echo "       sudo netmon-wizard               # full re-run"
+echo "       sudo netmon-wizard identity      # just district/school/device"
+echo "       sudo netmon-wizard sftp          # just SFTP destination"
+echo "       sudo netmon-wizard snmp          # just SNMP communities"
+echo "       sudo netmon-wizard advanced      # scan mode / cadence / log level"
 echo ""
 
 [[ ${NETMON_NEEDS_REGROUP:-0} -eq 1 ]] && {

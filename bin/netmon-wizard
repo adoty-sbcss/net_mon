@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# netmon-wizard — interactive setup wizard for /etc/netmon/netmon.env.
+#
+# Usage:
+#   netmon-wizard               # full wizard (essentials -> ask advanced -> advanced)
+#   netmon-wizard identity      # just the district/school/device prompts
+#   netmon-wizard sftp          # just the SFTP destination
+#   netmon-wizard snmp          # just SNMP communities
+#   netmon-wizard advanced      # just scan mode/cadence/log-level
+#
+# Designed to be called from:
+#   - setup.sh        (final step of a fresh install)
+#   - /etc/profile.d  (first SSH/console login on a freshly-imaged box)
+#   - ./netmon menu   ("Configure" submenu)
+#
+# Creates /var/lib/netmon/.wizard-done after a successful full run so the
+# profile.d auto-launch only triggers once per box.
+
+set -euo pipefail
+
+# Resolve the script's real location even when invoked via a symlink in
+# /usr/local/sbin (which setup.sh installs).
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")"
+REPO_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+LIB_DIR="$REPO_DIR/lib"
+
+if [[ ! -d "$LIB_DIR" ]]; then
+    echo "ERROR: lib/ not found relative to $SCRIPT_PATH" >&2
+    exit 1
+fi
+
+# We always cd into the repo so relative paths (e.g. .env.example) resolve
+# and so docker compose pickup uses ./docker-compose.yml.
+cd "$REPO_DIR"
+
+. "$LIB_DIR/common.sh"
+. "$LIB_DIR/paths.sh"
+. "$LIB_DIR/envfile.sh"
+. "$LIB_DIR/validate.sh"
+. "$LIB_DIR/identity.sh"
+. "$LIB_DIR/sftp.sh"
+. "$LIB_DIR/snmp.sh"
+. "$LIB_DIR/advanced.sh"
+
+WIZARD_SENTINEL="${NETMON_VAR_DIR}/.wizard-done"
+
+# Always ensure the canonical paths exist before any prompt writes config.
+ensure_paths
+
+# Seed netmon.env from the repo template on the very first run so the prompts
+# show sensible defaults instead of blank lines.
+seed_env_from_example "$REPO_DIR/.env.example"
+
+print_banner() {
+    cat <<EOF
+
+${C_HEAD}╔══════════════════════════════════════════════════════════════╗
+║                  NetMon — first-boot wizard                  ║
+╚══════════════════════════════════════════════════════════════╝${C_OFF}
+
+This walks you through the settings the box needs to start collecting
+and uploading. You can re-run any time with:  sudo netmon-wizard
+Per-section runs:  sudo netmon-wizard identity | sftp | snmp | advanced
+
+Press Enter at any prompt to keep the current value (shown in brackets).
+
+EOF
+}
+
+run_essentials() {
+    prompt_identity_config
+
+    # Auto-generate POSTGRES_PASSWORD if still the placeholder.
+    local current_pgpw
+    current_pgpw="$(current_value POSTGRES_PASSWORD)"
+    if [[ -z "$current_pgpw" || "$current_pgpw" == "change-me-please" ]]; then
+        local new_pgpw
+        new_pgpw="$(openssl rand -hex 16 2>/dev/null || head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)"
+        set_value POSTGRES_PASSWORD "$new_pgpw"
+        log "Generated random POSTGRES_PASSWORD"
+    fi
+
+    prompt_sftp_config "$(current_value NETMON_DEVICE)"
+}
+
+mark_wizard_done() {
+    $SUDO install -m 644 -o "$NETMON_OWNER_USER" -g "$NETMON_OWNER_USER" \
+        /dev/null "$WIZARD_SENTINEL"
+}
+
+run_full() {
+    print_banner
+    run_essentials
+    prompt_snmp_config
+
+    echo ""
+    if prompt_yesno "Set up advanced options now (scan mode, cadence, log level)?" "N"; then
+        prompt_advanced_config
+    else
+        echo "  (skipped — change later with: sudo netmon-wizard advanced)"
+    fi
+
+    mark_wizard_done
+
+    echo ""
+    ok "wizard complete — settings written to $NETMON_ENV_FILE"
+    echo ""
+    echo "Useful next steps:"
+    echo "  ./netmon status         # check container state"
+    echo "  ./netmon upload-test    # verify SFTP creds"
+    echo "  ./netmon                # interactive menu"
+    echo ""
+}
+
+# --- dispatch -------------------------------------------------------------
+
+case "${1:-}" in
+    ""|all|full)   run_full ;;
+    identity)      prompt_identity_config ;;
+    sftp)          prompt_sftp_config "$(current_value NETMON_DEVICE)" ;;
+    snmp)          prompt_snmp_config ;;
+    advanced)      prompt_advanced_config ;;
+    cadence)       prompt_scan_cadence ;;
+    mode)          prompt_scan_mode ;;
+    loglevel|log)  prompt_log_level ;;
+    -h|--help|help)
+        sed -n '2,15p' "$0" | sed 's/^# //; s/^#//'
+        ;;
+    *)
+        echo "ERROR: unknown section: $1" >&2
+        echo "Try: identity | sftp | snmp | advanced | cadence | mode | loglevel" >&2
+        exit 1
+        ;;
+esac

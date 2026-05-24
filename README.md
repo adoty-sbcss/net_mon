@@ -22,7 +22,7 @@ Boxes provisioned before this layout existed get **auto-migrated** on the next `
 
 ## 1. One-time setup on a fresh Ubuntu box
 
-Copy-paste this. `setup.sh` does all the heavy lifting — installs Docker, installs the Compose plugin, resolves any package conflicts, adds you to the docker group, creates `/etc/netmon` + `/var/lib/netmon`, builds and starts the containers, then asks for SFTP details.
+Copy-paste this. `setup.sh` does all the heavy lifting — installs Docker + the Compose plugin, resolves any package conflicts, adds you to the docker group, creates `/etc/netmon` + `/var/lib/netmon`, installs the `netmon-wizard` command, then launches the wizard for your inputs.
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
@@ -31,25 +31,40 @@ cd NetMon
 ./setup.sh
 ```
 
-That's it. `setup.sh` is **safe to re-run** any time — it skips steps that are already done, so it's also how you change settings later.
+That's it. `setup.sh` is **safe to re-run** any time — it skips steps that are already done, so it's also how you reinstall things.
 
-`setup.sh` asks you:
+### The first-boot wizard
 
-- **Device name** — used in upload filenames. Defaults to the box's hostname.
-- **SFTP server hostname or IP**
-- **SFTP port** (default `22`)
-- **SFTP username**
-- **SFTP password** (typed silently)
-- **Remote directory** (default `/`)
-- **SNMP polling** — optional; if enabled, asks for community strings.
+`setup.sh` invokes `netmon-wizard` which walks you through:
 
-After the SFTP prompts, it builds the containers, starts them, and offers to test the SFTP connection. Say yes when prompted.
+**Essentials** (always asked):
+- **Identity** — district, school, and device/location label (e.g. "Library IDF"). These tag every scan and organize uploads on the SFTP server into `<district>/<school>/<device>/` folders.
+- **SFTP destination** — host, port, user, password (silent), remote path.
 
-> **Updating later?** `cd ~/NetMon && git pull && docker compose build && docker compose up -d`
->
-> Or just run `./netmon update` — the nightly timer does the same thing automatically at ~03:00.
+**Then** the wizard asks "Set up advanced options now?" — say yes only if you want to override defaults for:
+- SNMP communities (if you have read strings for switches/routers)
+- Scan mode (`field` vs `monitor`)
+- Capture cadence / log level
 
-> **Changing settings later?** Re-run `./setup.sh` — it keeps your current values and shows them in brackets so you can press Enter to keep them. The expanded operator menu (Phase 2) will offer per-setting submenus too.
+After the wizard, `setup.sh` builds the containers, starts them, and offers to test the SFTP connection.
+
+### Re-running the wizard later
+
+```bash
+sudo netmon-wizard               # full re-run (current values shown as defaults)
+sudo netmon-wizard identity      # just district / school / device
+sudo netmon-wizard sftp          # just SFTP destination
+sudo netmon-wizard snmp          # just SNMP communities
+sudo netmon-wizard advanced      # mode / cadence / log level
+```
+
+You can also reach all of those from `./netmon` → **Configure** submenu.
+
+### First-boot login hint
+
+A `/etc/profile.d/` snippet posts a reminder on the first interactive login that the wizard hasn't been run yet. The reminder goes away once the wizard completes successfully (sentinel at `/var/lib/netmon/.wizard-done`).
+
+> **Updating later?** `./netmon update` — or wait for the nightly timer (~03:00).
 
 ---
 
@@ -93,22 +108,38 @@ Wait ~90 seconds, then either wait for the hourly upload or run `upload-now`.
 
 ---
 
-## 5. Common commands
+## 5. Common commands — the `./netmon` console
 
-The fastest path is the **`./netmon`** console — run it with no args for an interactive menu, or with a subcommand for one-shot use.
+Run with no args for the interactive menu, or with a subcommand for one-shot use.
+
+The menu is **main + 3 submenus**:
+
+```
+NetMon — Operations
+  1) Status overview            5) Manual scan
+  2) Tail live logs             6) Force upload now
+  3) Audit log                  7) Test SFTP connection
+  4) Recent scans               8) Restart containers
+
+  c) Configure ▶   s) System ▶   d) Diagnostics ▶   q) Quit
+```
+
+- **Configure ▶** — Identity / SFTP / SNMP / scan mode / cadence / log level / show config / re-run full wizard. (All delegate to `netmon-wizard`.)
+- **System ▶** — Bundle history / update timer schedule / run update now / version info / reboot.
+- **Diagnostics ▶** — Ping / DNS lookup / collector self-test (from inside the collector container).
+
+Frequently-used one-shots:
 
 ```bash
-./netmon                # interactive menu with the top 14 operations
-./netmon status         # container/scan/upload/disk overview
+./netmon status         # container/identity/scan/upload/disk overview
 ./netmon logs           # tail collector logs
 ./netmon audit          # high-signal event log
 ./netmon scan eth0      # manual scan
 ./netmon upload-now     # force-build + ship the current bundle
 ./netmon upload-test    # SFTP connection check
-./netmon bundles        # local files + upload state
-./netmon timers         # update timer schedule + last run
-./netmon update         # run auto-update.sh manually
-./netmon selftest       # collector self-checks
+./netmon wizard         # alias for sudo netmon-wizard
+./netmon sftp           # alias for sudo netmon-wizard sftp
+./netmon version        # git SHA + image + wizard status
 ./netmon help           # full list
 ```
 
@@ -118,22 +149,18 @@ Underneath it's still `docker compose ...` — see `netmon` for the exact comman
 
 ## 6. Two settings you might want to change
 
-Edit `/etc/netmon/netmon.env` (needs `sudo`) to change behavior. The two that matter most:
+The two that matter most are scan mode and capture window. Both are reached from `./netmon` → **Configure ▶** → option 4 (mode) and option 5 (cadence). Or one-shot:
 
 ```bash
-# field   = scan once per network, then idle (good for site visits)
-# monitor = keep scanning every time something changes
-NETMON_MODE=field
-
-# How long each scan listens for traffic (seconds). Longer = catches more.
-NETMON_CAPTURE_SECONDS=60
+sudo netmon-wizard mode       # field (one-shot per network) vs monitor (continuous)
+sudo netmon-wizard cadence    # capture seconds / poll interval / cooldown
 ```
 
-After editing, restart: `./netmon restart` (or `sudo docker compose down && sudo docker compose up -d`).
+After changing, the menu reminds you to restart (`./netmon restart`) to apply.
 
-To disable hourly uploads without removing the config, set `NETMON_SFTP_ENABLED=false`.
+To disable hourly uploads without removing the SFTP creds, edit `/etc/netmon/netmon.env` and set `NETMON_SFTP_ENABLED=false` (or rerun `sudo netmon-wizard sftp` and pick a fresh path — the wizard always re-enables on save).
 
-**Prefer not to hand-edit?** Re-run `./setup.sh` and press Enter past every prompt you don't want to change — it'll edit `/etc/netmon/netmon.env` for you and restart the containers.
+**Prefer to hand-edit anyway?** `sudo nano /etc/netmon/netmon.env`, then `./netmon restart`.
 
 ---
 
