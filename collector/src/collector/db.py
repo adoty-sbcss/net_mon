@@ -54,19 +54,24 @@ def insert_scan_run(
     network_id: str | None,
     mode: str,
 ) -> int:
+    s = get_settings()
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO scan_runs (
                     trigger_reason, interface, interface_cidr,
-                    gateway_ip, gateway_mac, network_id, mode
+                    gateway_ip, gateway_mac, network_id, mode,
+                    district_slug, school_slug, device_slug
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (trigger_reason, interface, interface_cidr, gateway_ip,
-                 gateway_mac, network_id, mode),
+                 gateway_mac, network_id, mode,
+                 s.district_slug or None,
+                 s.school_slug or None,
+                 s.device_slug or None),
             )
             row = cur.fetchone()
             assert row is not None

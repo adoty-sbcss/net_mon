@@ -36,6 +36,19 @@ log() {
     printf '[%s] %s\n' "$(date -Iseconds)" "$msg"
 }
 
+# Source paths.sh so we can run ensure_paths after the git pull lands new
+# code. Migrating from the old in-repo layout to /etc/netmon + /var/lib/netmon
+# happens on the next call. Older clones won't have lib/, so guard the source.
+ensure_paths_if_available() {
+    if [[ -f "$REPO_DIR/lib/common.sh" ]] && [[ -f "$REPO_DIR/lib/paths.sh" ]]; then
+        # shellcheck source=/dev/null
+        . "$REPO_DIR/lib/common.sh"
+        # shellcheck source=/dev/null
+        . "$REPO_DIR/lib/paths.sh"
+        ensure_paths
+    fi
+}
+
 # Refuse to run on a dirty working tree — we'd lose local changes.
 if [[ -n "$(git status --porcelain)" ]]; then
     log "FATAL: working tree has uncommitted changes; refusing to auto-update"
@@ -81,6 +94,12 @@ if ! git pull --ff-only --quiet origin main; then
 fi
 NEW_HEAD=$(git rev-parse HEAD)
 log "pulled to ${NEW_HEAD:0:8}"
+
+# 3b. Run path migration with the freshly-pulled code. This is what moves
+# legacy in-repo state (./.env, ./bundles, ./logs, ./config/snmp.yaml) into
+# /etc/netmon + /var/lib/netmon + /var/log/netmon. Idempotent.
+log "ensuring canonical paths (and migrating legacy layout if needed)"
+ensure_paths_if_available 2>&1 | while read -r ln; do log "  $ln"; done
 
 # 4. Rebuild only if container code changed. Always --pull so we pick up
 # any security patches in the python:3.12-slim base image. Without --pull

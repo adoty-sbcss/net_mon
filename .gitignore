@@ -1,7 +1,12 @@
+# Legacy in-repo state — kept ignored in case anyone re-creates these locally.
+# After Phase 1, the canonical locations are:
+#   /etc/netmon/netmon.env, /etc/netmon/snmp.yaml
+#   /var/lib/netmon/bundles, /var/log/netmon
 .env
 bundles/
 logs/
 config/snmp.yaml
+
 **/__pycache__/
 *.pyc
 .venv/

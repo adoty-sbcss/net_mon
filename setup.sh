@@ -1,116 +1,44 @@
 #!/usr/bin/env bash
 # NetMon setup. Run on a fresh Ubuntu box after `git clone`.
 #
-# This script is the single entry point for deployment. It:
-#   1. Bootstraps system deps (docker, docker compose v2, openssl) automatically,
-#      resolving the most common conflicts on the fly (e.g. docker.io vs
-#      docker-ce, missing compose plugin).
-#   2. Creates the directories the containers need.
-#   3. Prompts interactively for SFTP host / port / user / password / path.
-#   4. Writes .env, locks it down, and optionally tests the SFTP connection.
+# This is a thin orchestrator. Each step lives in lib/*.sh so the same
+# helpers can be reused by the first-boot wizard, operator menu, and
+# auto-update script. To see what any step actually does, read the
+# matching lib file.
 #
-# Safe to re-run any time. Each section detects what's already in place and
-# only fixes what's missing. No interactive prompts in the bootstrap phase —
-# you only get prompted for SFTP details.
+# Idempotent: safe to re-run any time. Each section detects what's
+# already in place and only fixes what's missing.
 
 set -euo pipefail
-
 cd "$(dirname "$0")"
 
-ENV_FILE=".env"
-EXAMPLE_FILE=".env.example"
+# --- load shared modules --------------------------------------------------
 
-# --- console formatting ---------------------------------------------------
+. "./lib/common.sh"
+. "./lib/paths.sh"
+. "./lib/pkg.sh"
+. "./lib/docker.sh"
+. "./lib/envfile.sh"
+. "./lib/validate.sh"
+. "./lib/sftp.sh"
+. "./lib/snmp.sh"
 
-if [[ -t 1 ]]; then
-    C_OK=$'\033[1;32m'
-    C_WARN=$'\033[1;33m'
-    C_ERR=$'\033[1;31m'
-    C_INFO=$'\033[1;36m'
-    C_OFF=$'\033[0m'
-else
-    C_OK= C_WARN= C_ERR= C_INFO= C_OFF=
-fi
+# --- platform + paths -----------------------------------------------------
 
-log()  { printf '%s==>%s %s\n' "$C_INFO" "$C_OFF" "$*"; }
-ok()   { printf '%s  ok%s %s\n' "$C_OK" "$C_OFF" "$*"; }
-warn() { printf '%s  !!%s %s\n' "$C_WARN" "$C_OFF" "$*" >&2; }
-die()  { printf '%sFAIL:%s %s\n' "$C_ERR" "$C_OFF" "$*" >&2; exit 1; }
+require_linux
 
-# --- sudo wrapper ---------------------------------------------------------
-# Use sudo when needed, no-op when already root.
-
-if [[ ${EUID} -eq 0 ]]; then
-    SUDO=""
-else
-    if ! command -v sudo >/dev/null 2>&1; then
-        die "This script needs root or sudo. Install sudo or re-run as root."
-    fi
-    SUDO="sudo"
-    if ! sudo -n true 2>/dev/null; then
-        log "Some steps need sudo. You may be prompted for your password."
-        sudo -v || die "Could not obtain sudo."
-        # keep sudo cred fresh in the background
-        ( while true; do sudo -n true; sleep 50; done ) 2>/dev/null &
-        SUDO_KEEPER=$!
-        trap '[[ -n "${SUDO_KEEPER:-}" ]] && kill "$SUDO_KEEPER" 2>/dev/null || true' EXIT
-    fi
-fi
-
-# --- platform check -------------------------------------------------------
-
-if [[ "$(uname -s)" != "Linux" ]]; then
-    die "This script must be run on Linux (Ubuntu). For development, use docker compose directly."
-fi
-if ! command -v apt-get >/dev/null 2>&1; then
-    die "apt-get not found. This script only supports Debian/Ubuntu-family distros."
-fi
-
-# --- helpers --------------------------------------------------------------
-
-pkg_installed() {
-    # Returns 0 if pkg is installed (and "ii" status), 1 otherwise.
-    dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null | grep -q "install ok installed"
-}
-
-pkg_available() {
-    # Returns 0 if pkg is available in apt, 1 otherwise.
-    apt-cache show "$1" >/dev/null 2>&1
-}
-
-apt_install() {
-    DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq "$@" >/dev/null
-}
-
-# Cache `apt-get update` to once per script run, but only when needed.
-APT_UPDATED=0
-apt_update_once() {
-    if [[ $APT_UPDATED -eq 0 ]]; then
-        log "apt update..."
-        $SUDO apt-get update -qq >/dev/null
-        APT_UPDATED=1
-    fi
-}
+# Create /etc/netmon, /var/lib/netmon, /var/log/netmon and migrate any
+# legacy in-repo state (./.env, ./config/snmp.yaml, ./bundles, ./logs)
+# into the new layout. Idempotent.
+ensure_paths
 
 # --- 1. Essential apt packages -------------------------------------------
 
 log "Checking essential packages..."
-NEED_PKGS=()
 # unattended-upgrades keeps the Ubuntu host current with security patches
 # (the containers get refreshed by netmon-update / netmon-deep-refresh timers).
-for pkg in ca-certificates curl openssl git unattended-upgrades; do
-    if ! pkg_installed "$pkg"; then
-        NEED_PKGS+=("$pkg")
-    fi
-done
+ensure_packages ca-certificates curl openssl git unattended-upgrades
 
-if (( ${#NEED_PKGS[@]} > 0 )); then
-    apt_update_once
-    log "Installing: ${NEED_PKGS[*]}"
-    apt_install "${NEED_PKGS[@]}"
-fi
-
-# Ensure unattended-upgrades is actually enabled for security updates.
 if pkg_installed unattended-upgrades; then
     if ! systemctl is-enabled --quiet unattended-upgrades 2>/dev/null; then
         log "Enabling unattended-upgrades for Ubuntu security patches..."
@@ -119,148 +47,17 @@ if pkg_installed unattended-upgrades; then
 fi
 ok "essentials present"
 
-# --- 2. Docker engine -----------------------------------------------------
+# --- 2. Docker engine + compose + group membership -----------------------
 
-log "Checking docker..."
-if command -v docker >/dev/null 2>&1 && docker --version >/dev/null 2>&1; then
-    ok "docker present: $(docker --version)"
-else
-    # Prefer Ubuntu's docker.io — least conflict potential. We deliberately
-    # avoid `curl get.docker.com | sh` because if docker.io was ever installed
-    # (even partly), the docker-ce package conflicts at the file level and
-    # dpkg refuses to proceed.
-    apt_update_once
-    log "Installing docker.io (Ubuntu's docker engine)..."
-    apt_install docker.io
-    log "Enabling and starting docker service..."
-    $SUDO systemctl enable --now docker >/dev/null
-    ok "docker installed: $(docker --version)"
-fi
+ensure_docker_engine
+ensure_docker_compose
+ensure_docker_membership
 
-# Catch the rare bad state where both docker.io and docker-ce got installed.
-if pkg_installed docker.io && pkg_installed docker-ce; then
-    warn "Both docker.io and docker-ce are installed — that's a conflict."
-    warn "Removing docker-ce to keep docker.io (Ubuntu's package)."
-    DEBIAN_FRONTEND=noninteractive $SUDO apt-get remove -y -qq docker-ce docker-ce-cli >/dev/null || true
-fi
+# --- 3. Seed netmon.env from .env.example on first run -------------------
 
-# --- 3. Docker compose v2 plugin -----------------------------------------
+seed_env_from_example "./.env.example"
 
-log "Checking docker compose v2..."
-if docker compose version >/dev/null 2>&1; then
-    ok "docker compose present: $(docker compose version | head -1)"
-else
-    apt_update_once
-    # Ubuntu 24.04+ has 'docker-compose-v2'. Older Ubuntu may have
-    # 'docker-compose-plugin' via Docker Inc.'s repo (if get.docker.com ran).
-    if pkg_available docker-compose-v2; then
-        log "Installing docker-compose-v2 (Ubuntu's compose v2 plugin)..."
-        apt_install docker-compose-v2
-    elif pkg_available docker-compose-plugin; then
-        log "Installing docker-compose-plugin..."
-        apt_install docker-compose-plugin
-    else
-        die "Neither docker-compose-v2 nor docker-compose-plugin is available in apt. \
-Try enabling the 'universe' component: \
-'$SUDO add-apt-repository -y universe && $SUDO apt-get update', then re-run this script."
-    fi
-    # Sanity-check the plugin is reachable
-    if ! docker compose version >/dev/null 2>&1; then
-        die "docker compose plugin installed but 'docker compose version' still fails."
-    fi
-    ok "docker compose installed: $(docker compose version | head -1)"
-fi
-
-# --- 4. Docker group membership ------------------------------------------
-
-log "Checking docker group membership..."
-CURRENT_USER="${SUDO_USER:-${USER:-$(id -un)}}"
-if id -nG "$CURRENT_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
-    ok "$CURRENT_USER is in the docker group"
-else
-    log "Adding $CURRENT_USER to the docker group..."
-    $SUDO usermod -aG docker "$CURRENT_USER"
-    warn "Group change applied. For future sessions you can run 'docker' without sudo."
-    warn "This script will use sudo for docker commands in the current shell."
-    NEEDS_REGROUP=1
-fi
-
-# Helper: docker compose with sudo if needed
-dc() {
-    if [[ ${NEEDS_REGROUP:-0} -eq 1 ]]; then
-        $SUDO docker compose "$@"
-    else
-        docker compose "$@"
-    fi
-}
-
-# --- 5. Required directories ---------------------------------------------
-
-log "Creating bundles/, config/, and logs/ directories..."
-mkdir -p bundles config logs
-ok "directories ready"
-
-# --- 6. .env scaffolding --------------------------------------------------
-
-if [[ ! -f "$EXAMPLE_FILE" ]]; then
-    die "$EXAMPLE_FILE not found. Run this from the NetMon directory."
-fi
-if [[ ! -f "$ENV_FILE" ]]; then
-    log "Creating .env from .env.example"
-    cp "$EXAMPLE_FILE" "$ENV_FILE"
-fi
-
-current_value() {
-    local name="$1"
-    grep -E "^${name}=" "$ENV_FILE" 2>/dev/null | head -1 | sed -E "s/^${name}=//; s/^\"//; s/\"$//" || true
-}
-
-set_value() {
-    local name="$1"
-    local value="$2"
-    local escaped
-    escaped=$(printf '%s' "$value" | sed -e 's/[\/&|]/\\&/g')
-    if grep -qE "^${name}=" "$ENV_FILE"; then
-        sed -i -E "s|^${name}=.*|${name}=\"${escaped}\"|" "$ENV_FILE"
-    else
-        printf '%s="%s"\n' "$name" "$value" >> "$ENV_FILE"
-    fi
-}
-
-prompt() {
-    local name="$1" label="$2" default="$3"
-    local current shown answer
-    current="$(current_value "$name")"
-    shown="${current:-$default}"
-    if [[ -n "$shown" ]]; then
-        read -r -p "$label [$shown]: " answer || answer=""
-    else
-        read -r -p "$label: " answer || answer=""
-    fi
-    answer="${answer:-$shown}"
-    set_value "$name" "$answer"
-}
-
-prompt_secret() {
-    local name="$1" label="$2"
-    local current hint answer
-    current="$(current_value "$name")"
-    hint="enter to keep current"
-    [[ -z "$current" ]] && hint="required"
-    read -r -s -p "$label ($hint): " answer || answer=""
-    echo
-    if [[ -z "$answer" ]]; then
-        if [[ -z "$current" ]]; then
-            echo "  ! value is required, try again"
-            prompt_secret "$name" "$label"
-            return
-        fi
-        return
-    fi
-    set_value "$name" "$answer"
-}
-
-# --- 7. Auto-generate POSTGRES_PASSWORD if still the placeholder ---------
+# --- 4. Auto-generate POSTGRES_PASSWORD if still the placeholder ---------
 
 current_pgpw="$(current_value POSTGRES_PASSWORD)"
 if [[ -z "$current_pgpw" || "$current_pgpw" == "change-me-please" ]]; then
@@ -269,84 +66,14 @@ if [[ -z "$current_pgpw" || "$current_pgpw" == "change-me-please" ]]; then
     log "Generated random POSTGRES_PASSWORD."
 fi
 
-# --- 8. Interactive SFTP config ------------------------------------------
+# --- 5. Interactive SFTP + SNMP config -----------------------------------
 
-echo ""
-echo "${C_INFO}=== NetMon SFTP configuration ===${C_OFF}"
-echo "Press Enter to keep the current/default value shown in brackets."
-echo ""
+prompt_sftp_config "$(hostname)"
+prompt_snmp_config
 
-default_device="$(hostname)"
-prompt NETMON_DEVICE_NAME       "Device name (used in upload filenames)" "$default_device"
+ok "settings written to $NETMON_ENV_FILE (chmod 600)"
 
-echo ""
-echo "  Tip: enter the hostname only (e.g. sftp.example.com or, for Azure Blob:"
-echo "       <account>.blob.core.windows.net). The username goes on the next line."
-echo ""
-prompt NETMON_SFTP_HOST         "SFTP server hostname or IP"             ""
-
-# Guard: if the user pasted user@host into the host field, offer to split.
-host_value="$(current_value NETMON_SFTP_HOST)"
-if [[ "$host_value" == *"@"* ]]; then
-    suggested_user="${host_value%@*}"
-    suggested_host="${host_value#*@}"
-    echo ""
-    warn "The host you entered contains '@':"
-    warn "    $host_value"
-    warn "That's a combined user@host string, not a hostname — DNS can't resolve it."
-    read -r -p "Split it into user='$suggested_user' and host='$suggested_host'? [Y/n]: " do_split || do_split=""
-    do_split="${do_split:-Y}"
-    if [[ "$do_split" =~ ^[Yy]$ ]]; then
-        set_value NETMON_SFTP_HOST "$suggested_host"
-        set_value NETMON_SFTP_USER "$suggested_user"
-        ok "split: host=$suggested_host, user=$suggested_user"
-    fi
-fi
-
-prompt NETMON_SFTP_PORT         "SFTP port"                              "22"
-prompt NETMON_SFTP_USER         "SFTP username"                          ""
-prompt_secret NETMON_SFTP_PASSWORD "SFTP password"
-prompt NETMON_SFTP_REMOTE_PATH  "Remote directory for uploads"           "/"
-
-# Enable upload by default once the user has filled in details.
-set_value NETMON_SFTP_ENABLED "true"
-
-# --- 8b. Optional: SNMP community strings --------------------------------
-
-echo ""
-echo "${C_INFO}=== Optional: SNMP polling ===${C_OFF}"
-echo "If you have read community strings for switches/routers on the network,"
-echo "NetMon can poll them for richer topology data (MAC tables, interface"
-echo "counters, etc.). Polling targets the gateway and LLDP-discovered switches"
-echo "only — not random hosts."
-echo ""
-
-current_snmp_enabled="$(current_value NETMON_SNMP_ENABLED)"
-default_snmp_enabled="N"
-[[ "$current_snmp_enabled" == "true" ]] && default_snmp_enabled="Y"
-
-read -r -p "Enable SNMP polling? [y/N]: " enable_snmp || enable_snmp=""
-enable_snmp="${enable_snmp:-$default_snmp_enabled}"
-
-if [[ "$enable_snmp" =~ ^[Yy]$ ]]; then
-    set_value NETMON_SNMP_ENABLED "true"
-    echo ""
-    echo "Enter one or more read communities to try, comma-separated."
-    echo "The collector probes each device with each string and remembers"
-    echo "which one works per-device, so subsequent scans skip the trial."
-    echo "Example:  public, ourreadonly, special-string"
-    echo ""
-    prompt NETMON_SNMP_COMMUNITIES "SNMP communities to try" "public"
-else
-    set_value NETMON_SNMP_ENABLED "false"
-fi
-
-# --- 9. Lock down the env file -------------------------------------------
-
-chmod 600 "$ENV_FILE"
-ok "settings written to $ENV_FILE (chmod 600)"
-
-# --- 10. Build, start, optional SFTP test --------------------------------
+# --- 6. Build, start, optional SFTP test ---------------------------------
 
 echo ""
 log "Building containers (first build takes a few minutes)..."
@@ -356,7 +83,7 @@ log "Starting containers..."
 dc up -d
 
 log "Waiting for the collector to come up..."
-for i in 1 2 3 4 5 6 7 8 9 10; do
+for _ in 1 2 3 4 5 6 7 8 9 10; do
     if dc exec -T collector python -m collector --version >/dev/null 2>&1; then
         break
     fi
@@ -364,9 +91,7 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
 done
 
 echo ""
-read -r -p "Test the SFTP connection now? [Y/n]: " do_test || do_test=""
-do_test="${do_test:-Y}"
-if [[ "$do_test" =~ ^[Yy]$ ]]; then
+if prompt_yesno "Test the SFTP connection now?" "Y"; then
     if dc exec -T collector python -m collector upload-test; then
         ok "SFTP test passed"
     else
@@ -374,7 +99,7 @@ if [[ "$do_test" =~ ^[Yy]$ ]]; then
     fi
 fi
 
-# --- 11. Optional: install nightly auto-update timer ---------------------
+# --- 7. Optional: install nightly auto-update timer ---------------------
 
 echo ""
 echo "${C_INFO}=== Optional: nightly auto-update ===${C_OFF}"
@@ -389,18 +114,20 @@ if systemctl list-unit-files netmon-update.timer 2>/dev/null | grep -q netmon-up
     already_installed=1
 fi
 
-default_au="Y"
 if [[ $already_installed -eq 1 ]]; then
     ok "auto-update timer already installed"
-    echo "Re-install (to pick up any updated paths/user)? [y/N]: "
-    default_au="N"
-    read -r enable_au || enable_au=""
+    do_install=1
+    if ! prompt_yesno "Re-install (to pick up any updated paths/user)?" "N"; then
+        do_install=0
+    fi
 else
-    read -r -p "Install the nightly auto-update timer? [Y/n]: " enable_au || enable_au=""
+    do_install=1
+    if ! prompt_yesno "Install the nightly auto-update timer?" "Y"; then
+        do_install=0
+    fi
 fi
-enable_au="${enable_au:-$default_au}"
 
-if [[ "$enable_au" =~ ^[Yy]$ ]]; then
+if [[ $do_install -eq 1 ]]; then
     if [[ -x ./scripts/install-auto-update.sh ]]; then
         ./scripts/install-auto-update.sh
     else
@@ -411,14 +138,10 @@ fi
 echo ""
 ok "Setup complete."
 echo ""
-# Decide which prefix the user should use, based on whether they're already
-# in the docker group in this shell. Until they re-login, sudo is required.
-if [[ ${NEEDS_REGROUP:-0} -eq 1 ]]; then
-    DC_CMD="sudo docker compose"
-else
-    DC_CMD="docker compose"
-fi
-
+echo "Config lives at:  $NETMON_ENV_FILE"
+echo "Bundles land at:  $NETMON_BUNDLES_DIR"
+echo "Logs land at:     $NETMON_LOG_DIR"
+echo ""
 echo "Next steps:"
 echo "  1. Plug a network cable into the box (auto-scan triggers on link-up)"
 echo ""
@@ -431,7 +154,7 @@ echo "       ./netmon upload-now   # force upload"
 echo "       ./netmon help         # full list"
 echo ""
 
-[[ ${NEEDS_REGROUP:-0} -eq 1 ]] && {
+[[ ${NETMON_NEEDS_REGROUP:-0} -eq 1 ]] && {
     warn "You were added to the docker group. Log out and back in (or run"
     warn "'newgrp docker') so you can run 'docker compose' without 'sudo'."
 }

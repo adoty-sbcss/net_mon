@@ -16,12 +16,31 @@ cd "$(dirname "$0")"
 
 # --- shared helpers --------------------------------------------------------
 
-if [[ -t 1 ]]; then
-    C_HEAD=$'\033[1;36m'; C_OK=$'\033[1;32m'; C_WARN=$'\033[1;33m'
-    C_ERR=$'\033[1;31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+# Source lib/common.sh + lib/paths.sh if present (post-Phase-1 boxes have
+# them; older clones don't). Falls back to inline colors so the menu still
+# works on a stale checkout.
+if [[ -f ./lib/common.sh ]] && [[ -f ./lib/paths.sh ]]; then
+    # shellcheck source=/dev/null
+    . ./lib/common.sh
+    # shellcheck source=/dev/null
+    . ./lib/paths.sh
+    # Make sure /etc/netmon + /var/lib/netmon exist and any legacy in-repo
+    # files have been migrated. Cheap when nothing needs doing.
+    ensure_paths >/dev/null 2>&1 || true
 else
-    C_HEAD= C_OK= C_WARN= C_ERR= C_DIM= C_OFF=
+    if [[ -t 1 ]]; then
+        C_HEAD=$'\033[1;36m'; C_OK=$'\033[1;32m'; C_WARN=$'\033[1;33m'
+        C_ERR=$'\033[1;31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+    else
+        C_HEAD= C_OK= C_WARN= C_ERR= C_DIM= C_OFF=
+    fi
 fi
+
+# Canonical paths. lib/paths.sh exports these; this fallback keeps the menu
+# working on a stale checkout that hasn't pulled the Phase 1 refactor yet.
+NETMON_BUNDLES_DIR="${NETMON_BUNDLES_DIR:-/var/lib/netmon/bundles}"
+NETMON_LOG_DIR="${NETMON_LOG_DIR:-/var/log/netmon}"
+NETMON_ENV_FILE="${NETMON_ENV_FILE:-/etc/netmon/netmon.env}"
 
 # Use sudo for docker calls when the current user isn't yet in the docker group.
 if id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
@@ -65,13 +84,13 @@ cmd_status() {
     fi
     echo ""
     printf '%s== Disk usage ==%s\n' "$C_HEAD" "$C_OFF"
-    if [[ -d ./bundles ]]; then
-        du -sh ./bundles 2>/dev/null || true
+    if [[ -d "$NETMON_BUNDLES_DIR" ]]; then
+        du -sh "$NETMON_BUNDLES_DIR" 2>/dev/null || true
     fi
-    if [[ -d ./logs ]]; then
-        du -sh ./logs 2>/dev/null || true
+    if [[ -d "$NETMON_LOG_DIR" ]]; then
+        du -sh "$NETMON_LOG_DIR" 2>/dev/null || true
     fi
-    df -h . | tail -2
+    df -h "$NETMON_BUNDLES_DIR" 2>/dev/null | tail -2
 }
 
 cmd_logs() {
@@ -81,8 +100,9 @@ cmd_logs() {
 
 cmd_audit() {
     printf '%s== Audit log (last 50 lines) ==%s\n' "$C_HEAD" "$C_OFF"
-    if [[ -f ./logs/audit.log ]]; then
-        tail -n 50 ./logs/audit.log
+    local audit_log="${NETMON_LOG_DIR}/audit.log"
+    if [[ -f "$audit_log" ]]; then
+        sudo tail -n 50 "$audit_log" 2>/dev/null || tail -n 50 "$audit_log"
     else
         echo "(no audit.log yet — runs once the collector has emitted an event)"
     fi
@@ -117,19 +137,27 @@ cmd_upload_test() {
 }
 
 cmd_config() {
-    printf '%s== Effective config (.env, password redacted) ==%s\n' "$C_HEAD" "$C_OFF"
-    if [[ ! -f .env ]]; then
-        echo "(.env not found — run ./setup.sh)"
+    printf '%s== Effective config (%s, password redacted) ==%s\n' \
+        "$C_HEAD" "$NETMON_ENV_FILE" "$C_OFF"
+    if [[ ! -f "$NETMON_ENV_FILE" ]]; then
+        echo "($NETMON_ENV_FILE not found — run ./setup.sh)"
         return 1
     fi
     # Show every line, but redact anything that looks like a secret.
-    awk -F= '
+    # sudo because the file is chmod 600 owned by the netmon user.
+    sudo awk -F= '
         /^[[:space:]]*#/ || NF<2 { print; next }
         /PASSWORD/ || /SECRET/ || /TOKEN/ || /KEY/ {
             printf "%s=%s\n", $1, "***REDACTED***"; next
         }
         { print }
-    ' .env
+    ' "$NETMON_ENV_FILE" 2>/dev/null || awk -F= '
+        /^[[:space:]]*#/ || NF<2 { print; next }
+        /PASSWORD/ || /SECRET/ || /TOKEN/ || /KEY/ {
+            printf "%s=%s\n", $1, "***REDACTED***"; next
+        }
+        { print }
+    ' "$NETMON_ENV_FILE"
 }
 
 cmd_restart() {
@@ -158,9 +186,9 @@ cmd_timers() {
 }
 
 cmd_bundles() {
-    printf '%s== Local bundle files (./bundles) ==%s\n' "$C_HEAD" "$C_OFF"
-    if [[ -d ./bundles ]] && [[ -n "$(ls -A ./bundles 2>/dev/null)" ]]; then
-        ls -lh ./bundles
+    printf '%s== Local bundle files (%s) ==%s\n' "$C_HEAD" "$NETMON_BUNDLES_DIR" "$C_OFF"
+    if [[ -d "$NETMON_BUNDLES_DIR" ]] && [[ -n "$(ls -A "$NETMON_BUNDLES_DIR" 2>/dev/null)" ]]; then
+        ls -lh "$NETMON_BUNDLES_DIR"
     else
         echo "(no local bundles yet)"
     fi
@@ -196,7 +224,7 @@ Commands:
   scan [iface]   Run a manual scan (prompts if iface not given)
   upload-now     Force-build + upload the current bundle right now
   upload-test    Test SFTP connection
-  config         Show .env (passwords redacted)
+  config         Show /etc/netmon/netmon.env (passwords redacted)
   restart        Restart containers
   update         Run auto-update.sh manually
   timers         Show update timer schedule + last run output
@@ -222,7 +250,7 @@ ${C_HEAD}╔══════════════════════�
    5) Run a manual scan
    6) Force upload now
    7) Test SFTP connection
-   8) Show config (.env, redacted)
+   8) Show config (/etc/netmon/netmon.env, redacted)
    9) Restart containers
   10) Update now (git pull + rebuild)
   11) View update timer schedule

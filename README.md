@@ -4,9 +4,25 @@ Plug an Ubuntu box into a network, collect everything about it, ship the data to
 
 ---
 
+## Where things live
+
+After `./setup.sh` runs, the canonical paths on the box are:
+
+| Path | Contents |
+|---|---|
+| `/etc/netmon/netmon.env` | All configuration (SFTP creds, SNMP, identity). `chmod 600`. |
+| `/etc/netmon/snmp.yaml` | Optional per-device SNMP overrides. |
+| `/var/lib/netmon/bundles/` | Hourly ZIPs awaiting upload + recent uploads. |
+| `/var/log/netmon/` | `collector.log` + `audit.log`, rotated nightly. |
+| *this repo* | Code only — no state. Safe to `rm -rf` and re-clone. |
+
+Boxes provisioned before this layout existed get **auto-migrated** on the next `./setup.sh` or nightly auto-update. The old in-repo `.env`, `bundles/`, `logs/`, and `config/snmp.yaml` are moved into place atomically. See [lib/paths.sh](lib/paths.sh).
+
+---
+
 ## 1. One-time setup on a fresh Ubuntu box
 
-Copy-paste this. `setup.sh` does all the heavy lifting — installs Docker, installs the Compose plugin, resolves any package conflicts, adds you to the docker group, builds and starts the containers, then asks for SFTP details.
+Copy-paste this. `setup.sh` does all the heavy lifting — installs Docker, installs the Compose plugin, resolves any package conflicts, adds you to the docker group, creates `/etc/netmon` + `/var/lib/netmon`, builds and starts the containers, then asks for SFTP details.
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
@@ -25,12 +41,15 @@ That's it. `setup.sh` is **safe to re-run** any time — it skips steps that are
 - **SFTP username**
 - **SFTP password** (typed silently)
 - **Remote directory** (default `/`)
+- **SNMP polling** — optional; if enabled, asks for community strings.
 
 After the SFTP prompts, it builds the containers, starts them, and offers to test the SFTP connection. Say yes when prompted.
 
 > **Updating later?** `cd ~/NetMon && git pull && docker compose build && docker compose up -d`
+>
+> Or just run `./netmon update` — the nightly timer does the same thing automatically at ~03:00.
 
-> **Changing settings later?** Just re-run `./setup.sh` — it keeps your current values and shows them in brackets so you can press Enter to keep them.
+> **Changing settings later?** Re-run `./setup.sh` — it keeps your current values and shows them in brackets so you can press Enter to keep them. The expanded operator menu (Phase 2) will offer per-setting submenus too.
 
 ---
 
@@ -99,7 +118,7 @@ Underneath it's still `docker compose ...` — see `netmon` for the exact comman
 
 ## 6. Two settings you might want to change
 
-Edit `.env` to change behavior. The two that matter most:
+Edit `/etc/netmon/netmon.env` (needs `sudo`) to change behavior. The two that matter most:
 
 ```bash
 # field   = scan once per network, then idle (good for site visits)
@@ -110,9 +129,11 @@ NETMON_MODE=field
 NETMON_CAPTURE_SECONDS=60
 ```
 
-After editing `.env`, restart: `docker compose down && docker compose up -d`.
+After editing, restart: `./netmon restart` (or `sudo docker compose down && sudo docker compose up -d`).
 
 To disable hourly uploads without removing the config, set `NETMON_SFTP_ENABLED=false`.
+
+**Prefer not to hand-edit?** Re-run `./setup.sh` and press Enter past every prompt you don't want to change — it'll edit `/etc/netmon/netmon.env` for you and restart the containers.
 
 ---
 
@@ -141,7 +162,8 @@ The uploader skips empty hours. If you went a full hour with no link-up events a
 
 **Want to start completely over**
 ```bash
-docker compose down -v   # WARNING: deletes all collected scans
+docker compose down -v                              # WARNING: deletes all collected scans
+sudo rm -rf /etc/netmon /var/lib/netmon /var/log/netmon   # also wipes all config
 ./setup.sh
 ```
 

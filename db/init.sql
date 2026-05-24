@@ -17,10 +17,17 @@ CREATE TABLE IF NOT EXISTS scan_runs (
     duration_sec    INTEGER,
     mode            TEXT NOT NULL DEFAULT 'field',
     notes           TEXT,
-    error           TEXT
+    error           TEXT,
+    -- Box identity, populated from NETMON_*_SLUG env vars. Nullable so a
+    -- box that hasn't been through the first-boot wizard yet still inserts.
+    district_slug   TEXT,
+    school_slug     TEXT,
+    device_slug     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_scan_runs_network ON scan_runs(network_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_runs_identity
+    ON scan_runs(district_slug, school_slug, device_slug, started_at DESC);
 
 CREATE TABLE IF NOT EXISTS devices (
     id              SERIAL PRIMARY KEY,

@@ -44,7 +44,10 @@ bundle:
 	@test -n "$(ID)" || (echo "usage: make bundle ID=N" && exit 1)
 	docker compose exec collector python -m collector bundle $(ID)
 	@echo ""
-	@echo "Bundle written to ./bundles/  — upload the ZIP to Claude for analysis."
+	@echo "Bundle written to /var/lib/netmon/bundles/  — upload the ZIP to Claude for analysis."
 
 clean:
+	@echo "This stops containers and removes the postgres volume."
+	@echo "Config in /etc/netmon and bundles in /var/lib/netmon are PRESERVED."
+	@echo "To wipe everything including config, see README 'start completely over'."
 	docker compose down -v

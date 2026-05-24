@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     sftp_remote_path: str = Field(default="/", alias="NETMON_SFTP_REMOTE_PATH")
     device_name: str = Field(default="", alias="NETMON_DEVICE_NAME")
 
+    # Box identity (set by the first-boot wizard; empty on pre-wizard installs).
+    # Used to tag scan_runs rows and, in a future phase, to drive the
+    # hierarchical SFTP path and bundle filenames.
+    district_slug: str = Field(default="", alias="NETMON_DISTRICT_SLUG")
+    school_slug: str = Field(default="", alias="NETMON_SCHOOL_SLUG")
+    device_slug: str = Field(default="", alias="NETMON_DEVICE_SLUG")
+
     bundle_dir: Path = Field(default=Path("/var/lib/netmon/bundles"), alias="NETMON_BUNDLE_DIR")
 
     @property

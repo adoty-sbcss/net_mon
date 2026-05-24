@@ -1,14 +1,22 @@
+# Config and state live OUTSIDE the repo, under /etc/netmon and /var/lib/netmon,
+# so a re-clone of this repo never disturbs them. The env file is created by
+# setup.sh (or the first-boot wizard) and contains all NETMON_* and POSTGRES_*
+# settings. Migration from the old in-repo layout happens automatically on
+# the next ./setup.sh or auto-update run; see lib/paths.sh.
+
 services:
   postgres:
     image: postgres:16-alpine
     container_name: netmon-postgres
     restart: unless-stopped
+    env_file:
+      - /etc/netmon/netmon.env
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-netmon}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-netmon}
       POSTGRES_DB: ${POSTGRES_DB:-netmon}
     ports:
-      # Bind to loopback only — the collector reaches it via host networking
+      # Bind to loopback only — the collector reaches it via host networking.
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
@@ -37,40 +45,30 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    env_file:
+      - /etc/netmon/netmon.env
     environment:
+      # Wiring + defaults if the env file doesn't set them. Everything operator-
+      # configurable belongs in /etc/netmon/netmon.env, not here.
       POSTGRES_HOST: 127.0.0.1
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       POSTGRES_USER: ${POSTGRES_USER:-netmon}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-netmon}
       POSTGRES_DB: ${POSTGRES_DB:-netmon}
-      NETMON_MODE: ${NETMON_MODE:-field}
-      NETMON_CAPTURE_SECONDS: ${NETMON_CAPTURE_SECONDS:-60}
-      NETMON_POLL_INTERVAL: ${NETMON_POLL_INTERVAL:-30}
-      NETMON_COOLDOWN_SECONDS: ${NETMON_COOLDOWN_SECONDS:-300}
-      NETMON_EXCLUDE_IFACES: ${NETMON_EXCLUDE_IFACES:-lo,docker0,br-,veth,virbr,tun,tap}
-      NETMON_SNMP_ENABLED: ${NETMON_SNMP_ENABLED:-false}
       NETMON_SNMP_CONFIG: /etc/netmon/snmp.yaml
-      NETMON_SNMP_COMMUNITIES: ${NETMON_SNMP_COMMUNITIES:-}
-      NETMON_SFTP_ENABLED: ${NETMON_SFTP_ENABLED:-false}
-      NETMON_SFTP_HOST: ${NETMON_SFTP_HOST:-}
-      NETMON_SFTP_PORT: ${NETMON_SFTP_PORT:-22}
-      NETMON_SFTP_USER: ${NETMON_SFTP_USER:-}
-      NETMON_SFTP_PASSWORD: ${NETMON_SFTP_PASSWORD:-}
-      NETMON_SFTP_REMOTE_PATH: ${NETMON_SFTP_REMOTE_PATH:-/}
-      NETMON_DEVICE_NAME: ${NETMON_DEVICE_NAME:-}
-      NETMON_LOG_LEVEL: ${NETMON_LOG_LEVEL:-INFO}
+      NETMON_BUNDLE_DIR: /var/lib/netmon/bundles
     # Cap Docker's own log buffer so it can't fill the disk if the collector
-    # gets chatty. Persistent history is in ./logs/ (mounted below).
+    # gets chatty. Persistent history is in /var/log/netmon (mounted below).
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "5"
     volumes:
-      - ./bundles:/var/lib/netmon/bundles
-      - ./config:/etc/netmon:ro
+      - /var/lib/netmon/bundles:/var/lib/netmon/bundles
+      - /etc/netmon:/etc/netmon:ro
       # Persistent rotated logs on the host. See logging_setup.py.
-      - ./logs:/var/log/netmon
+      - /var/log/netmon:/var/log/netmon
       # Schema migrations applied by the collector on startup. Mounted (not
       # baked into the image) so an auto-update can ship new migration files
       # via `git pull` without requiring an image rebuild.
