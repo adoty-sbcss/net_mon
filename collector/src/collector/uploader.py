@@ -38,16 +38,55 @@ def _next_hour_boundary(now: datetime | None = None) -> datetime:
 
 
 def device_name() -> str:
+    """Human-readable device label for bundle metadata. Falls back to hostname."""
     s = get_settings()
     if s.device_name:
         return s.device_name
     return socket.gethostname()
 
 
+def _identity_slugs() -> tuple[str, str, str] | None:
+    """Return (district, school, device) slugs if all three are set, else None.
+    Pre-wizard boxes have empty slugs and fall back to legacy flat uploads."""
+    s = get_settings()
+    if s.district_slug and s.school_slug and s.device_slug:
+        return s.district_slug, s.school_slug, s.device_slug
+    return None
+
+
 def _filename_for(window_end: datetime) -> str:
-    """Window end is the top-of-hour we're closing. File names the hour just completed."""
+    """Filename for the bundle covering the hour that just completed.
+
+    With identity set:  <device_slug>_YYYY_MM_DD_HH.zip
+    Legacy fallback:    <device_name>_YYYY_MM_DD_HH.zip
+
+    The slug variant avoids spaces in filenames and stays consistent with the
+    hierarchical SFTP path that contains the same slug.
+    """
     completed_hour = window_end - timedelta(hours=1)
-    return f"{device_name()}_{completed_hour.strftime('%Y_%m_%d_%H')}.zip"
+    stamp = completed_hour.strftime('%Y_%m_%d_%H')
+    slugs = _identity_slugs()
+    if slugs is not None:
+        _, _, device_slug = slugs
+        return f"{device_slug}_{stamp}.zip"
+    return f"{device_name()}_{stamp}.zip"
+
+
+def _remote_dir() -> str:
+    """Where to put uploads on the SFTP server.
+
+    With identity set:  <sftp_remote_path>/<district>/<school>/<device>
+    Legacy fallback:    <sftp_remote_path>
+
+    Trailing slashes stripped; the upload step adds the filename.
+    """
+    s = get_settings()
+    base = (s.sftp_remote_path or "/").rstrip("/")
+    slugs = _identity_slugs()
+    if slugs is None:
+        return base or "/"
+    district, school, device = slugs
+    return f"{base}/{district}/{school}/{device}"
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +231,17 @@ def _prune_old_uploaded_bundles() -> None:
 
 
 def upload_file(local_path: Path) -> str:
-    """Upload a single file to the configured SFTP server. Returns remote path."""
+    """Upload a single file to the configured SFTP server. Returns remote path.
+
+    Path on the server is hierarchical when identity is set:
+        <sftp_remote_path>/<district>/<school>/<device>/<filename>
+    Otherwise (pre-wizard boxes) the file lands flat at:
+        <sftp_remote_path>/<filename>
+
+    _ensure_remote_dir does mkdir -p for the full hierarchy on each upload,
+    so a brand-new district/school/device combo creates its subtree
+    automatically on first upload.
+    """
     settings = get_settings()
     if not settings.sftp_host:
         raise RuntimeError("NETMON_SFTP_HOST not set")
@@ -200,8 +249,9 @@ def upload_file(local_path: Path) -> str:
     # Paramiko import deferred so module loads without it during tests.
     import paramiko
 
+    target_dir = _remote_dir()
     log.info("sftp connecting", host=settings.sftp_host, port=settings.sftp_port,
-             user=settings.sftp_user, remote_path=settings.sftp_remote_path)
+             user=settings.sftp_user, remote_dir=target_dir)
 
     transport = paramiko.Transport((settings.sftp_host, settings.sftp_port))
     try:
@@ -210,8 +260,8 @@ def upload_file(local_path: Path) -> str:
         if sftp is None:
             raise RuntimeError("could not open SFTP channel")
         try:
-            _ensure_remote_dir(sftp, settings.sftp_remote_path)
-            remote = f"{settings.sftp_remote_path.rstrip('/') or ''}/{local_path.name}"
+            _ensure_remote_dir(sftp, target_dir)
+            remote = f"{target_dir.rstrip('/') or ''}/{local_path.name}"
             sftp.put(str(local_path), remote)
             log.info("sftp upload complete", local=str(local_path), remote=remote,
                      size=local_path.stat().st_size)
@@ -244,14 +294,21 @@ def _ensure_remote_dir(sftp, path: str) -> None:
 
 
 def test_connection() -> tuple[bool, str]:
-    """Quick connectivity + auth + remote-path-exists check."""
+    """Quick connectivity + auth + remote-path-exists check.
+
+    Tests against the hierarchical target directory (district/school/device)
+    when identity is set, so the operator sees the actual upload destination,
+    not just the SFTP root.
+    """
     settings = get_settings()
     if not settings.sftp_host:
-        return False, "NETMON_SFTP_HOST is not set — run ./setup.sh"
+        return False, "NETMON_SFTP_HOST is not set — run: sudo netmon-wizard sftp"
     try:
         import paramiko
     except ImportError as exc:
         return False, f"paramiko not installed: {exc}"
+
+    target_dir = _remote_dir()
     try:
         transport = paramiko.Transport((settings.sftp_host, settings.sftp_port))
         transport.connect(username=settings.sftp_user, password=settings.sftp_password)
@@ -261,13 +318,13 @@ def test_connection() -> tuple[bool, str]:
             return False, "could not open SFTP channel"
         try:
             try:
-                entries = sftp.listdir(settings.sftp_remote_path)
+                entries = sftp.listdir(target_dir)
                 msg = (f"connected to {settings.sftp_host}:{settings.sftp_port} as "
-                       f"{settings.sftp_user}; remote path {settings.sftp_remote_path!r} "
+                       f"{settings.sftp_user}; target {target_dir!r} "
                        f"has {len(entries)} entries")
             except IOError:
                 msg = (f"connected to {settings.sftp_host}:{settings.sftp_port} as "
-                       f"{settings.sftp_user}; remote path {settings.sftp_remote_path!r} "
+                       f"{settings.sftp_user}; target {target_dir!r} "
                        f"does not exist yet (will be created on first upload)")
             return True, msg
         finally:
@@ -296,7 +353,8 @@ def _run_scheduler_loop() -> None:
         return
     log.info("uploader scheduler started",
              host=s.sftp_host, port=s.sftp_port,
-             remote_path=s.sftp_remote_path, device=device_name())
+             remote_dir=_remote_dir(), device=device_name(),
+             identity_set=_identity_slugs() is not None)
 
     while not _stop_event.is_set():
         target = _next_hour_boundary()
