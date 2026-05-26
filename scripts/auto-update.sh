@@ -132,6 +132,22 @@ log "pulled to ${NEW_HEAD:0:8}"
 log "ensuring canonical paths (and migrating legacy layout if needed)"
 ensure_paths_if_available 2>&1 | while read -r ln; do log "  $ln"; done
 
+# 4c. If install-auto-update.sh or any systemd unit file changed in this
+# pull AND the boxes' update timer is already installed (i.e. setup.sh has
+# been run at least once), re-run the installer so any NEW timers added
+# in this release land on the box automatically. Skips if the user never
+# enabled the timers in the first place.
+if systemctl list-unit-files netmon-update.timer 2>/dev/null | grep -q netmon-update; then
+    if echo "$CHANGED" | grep -qE '^(scripts/install-auto-update\.sh|systemd/)'; then
+        log "systemd units or installer changed; re-running install-auto-update.sh"
+        if [[ -x "$REPO_DIR/scripts/install-auto-update.sh" ]]; then
+            "$REPO_DIR/scripts/install-auto-update.sh" 2>&1 \
+                | while read -r ln; do log "  $ln"; done || \
+                log "WARN: installer re-run reported errors"
+        fi
+    fi
+fi
+
 # 5. Rebuild only if container code changed. Always --pull so we pick up
 # any security patches in the python:3.12-slim base image.
 if [[ $NEEDS_BUILD -eq 1 ]]; then
