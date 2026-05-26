@@ -1,0 +1,14 @@
+[Unit]
+Description=NetMon nightly config backup to SFTP (runs ~02:30 with jitter)
+Documentation=https://github.com/adoty-sbcss/net_mon
+
+[Timer]
+# Run at 02:30 local time daily, before netmon-update.timer's 03:00 slot.
+# RandomizedDelaySec spreads the load if many boxes hit the same SFTP server.
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=15min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

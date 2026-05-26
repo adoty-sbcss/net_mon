@@ -12,6 +12,7 @@ from .db import fetch_scan, list_scan_runs, wait_for_db
 from .logging_setup import audit, configure_logging
 from .poller import run_poller
 from .scan import run_scan
+from . import config_backup as config_backup_mod
 from . import migrations as migrations_mod
 from . import selftest as selftest_mod
 from . import uploader as uploader_mod
@@ -190,6 +191,48 @@ def cmd_selftest() -> None:
     for r in results:
         prefix = "OK  " if r.ok else "WARN"
         click.echo(f"{prefix} {r.name}: {r.detail}")
+
+
+@cli.command("config-backup")
+def cmd_config_backup() -> None:
+    """Build + upload a ZIP of /etc/netmon/* to the SFTP _config/ tree."""
+    try:
+        remote = config_backup_mod.upload_backup()
+        click.echo(f"OK   uploaded to {remote}")
+    except Exception as exc:
+        click.echo(f"FAIL config-backup: {exc}", err=True)
+        sys.exit(2)
+
+
+@cli.command("config-list")
+def cmd_config_list() -> None:
+    """List available config backups on the SFTP server for this box."""
+    try:
+        backups = config_backup_mod.list_available_backups()
+    except Exception as exc:
+        click.echo(f"FAIL config-list: {exc}", err=True)
+        sys.exit(2)
+    if not backups:
+        click.echo("(no backups found)")
+        return
+    for b in backups:
+        click.echo(b)
+
+
+@cli.command("config-download")
+@click.option("--date", default=None,
+              help="YYYY-MM-DD. Defaults to most recent available.")
+@click.option("--out", default="/var/lib/netmon/config-restore.zip",
+              show_default=True, help="Where to write the downloaded ZIP.")
+def cmd_config_download(date: str | None, out: str) -> None:
+    """Download a config backup ZIP to disk (host script then unzips it)."""
+    from pathlib import Path
+    try:
+        path = config_backup_mod.download_backup(date=date, out_path=Path(out))
+        click.echo(f"OK   {path}")
+    except Exception as exc:
+        click.echo(f"FAIL config-download: {exc}", err=True)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

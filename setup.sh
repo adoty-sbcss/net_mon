@@ -54,17 +54,29 @@ ensure_docker_membership
 
 # --- 3. Install netmon-wizard + first-boot profile snippet ---------------
 
-log "Linking netmon-wizard into /usr/local/sbin..."
-# Symlink, not copy: any git pull that updates bin/netmon-wizard is picked
-# up automatically. The wizard discovers its lib/ relative to its own
-# location, so the symlink target (in-repo) resolves the right lib/.
+log "Linking netmon-wizard + netmon-config-restore into /usr/local/sbin..."
+# Symlinks (not copies) so any git pull that updates these is picked up
+# automatically. Each script discovers its lib/ relative to its own
+# location, so symlink targets resolve the right lib/.
 $SUDO ln -sf "$REPO_DIR/bin/netmon-wizard" /usr/local/sbin/netmon-wizard
-ok "netmon-wizard linked (-> $REPO_DIR/bin/netmon-wizard)"
+$SUDO ln -sf "$REPO_DIR/bin/netmon-config-restore" /usr/local/sbin/netmon-config-restore
+ok "wizard + config-restore linked"
 
 log "Installing first-boot login prompt to /etc/profile.d/..."
 $SUDO install -m 644 -o root -g root "$REPO_DIR/scripts/netmon-firstboot.sh" \
     /etc/profile.d/netmon-firstboot.sh
 ok "first-boot prompt installed"
+
+log "Installing MOTD status banner..."
+# Ubuntu's update-motd machinery runs /etc/update-motd.d/* at login;
+# 99-netmon makes it the last (most prominent) entry.
+if [[ -d /etc/update-motd.d ]]; then
+    $SUDO install -m 755 -o root -g root "$REPO_DIR/scripts/netmon-motd.sh" \
+        /etc/update-motd.d/99-netmon
+    ok "MOTD installed (shows version + identity + container health on login)"
+else
+    warn "No /etc/update-motd.d on this host; skipping MOTD install"
+fi
 
 # --- 4. Run the wizard ----------------------------------------------------
 

@@ -164,7 +164,38 @@ To disable hourly uploads without removing the SFTP creds, edit `/etc/netmon/net
 
 ---
 
-## 7. Troubleshooting
+## 7. Recovery & self-healing
+
+NetMon runs three background timers to keep itself current and durable:
+
+| Timer | Cadence | What it does |
+|---|---|---|
+| `netmon-update` | nightly ~03:00 | `git pull` + rebuild + `up -d`. **Pre-update**: `pg_dump` snapshot + tag current image as `:previous`. **Post-update**: 2-min healthcheck → auto-rollback if it fails. |
+| `netmon-watchdog` | every 15 min | Prunes bundles + logs >7 days; emergency cleanup if disk >85%; restarts collector if no upload in 6h; restarts postgres if unreachable >5min. |
+| `netmon-config-backup` | nightly ~02:30 | Uploads `/etc/netmon/netmon.env` + `snmp.yaml` as a small ZIP to `<sftp>/_config/<district>/<school>/<device>/config_YYYY-MM-DD.zip`. |
+
+Check them with:
+```bash
+systemctl list-timers 'netmon-*.timer'
+journalctl -u netmon-watchdog.service -n 20
+journalctl -u netmon-update.service -n 50
+```
+
+### Recovery scenarios
+
+| Symptom | What to do |
+|---|---|
+| **Nightly auto-update broke the collector** | Auto-rollback should have already fired. Verify with `journalctl -u netmon-update.service -n 50`. To force a manual rollback: `./netmon rollback`. |
+| **Collector container is in a weird state but data is fine** | `./netmon quick-rebuild` — wipes the image, rebuilds from current source, keeps DB + config. |
+| **Box is misconfigured beyond repair** | `./netmon factory-reset` — wipes DB + config + logs. Re-run the wizard to start over. If you have a config backup on SFTP, `sudo netmon-config-restore` restores it after the wizard. |
+| **Walked up to a factory-reset box** | 1) `./setup.sh` (installs deps + runs the wizard). 2) `sudo netmon-config-restore --list` (see backups). 3) `sudo netmon-config-restore` (pulls the most recent). |
+| **DB snapshots filling disk** | Watchdog prunes >7 days. Override with `NETMON_RETENTION_DAYS=N` env var on the watchdog service. |
+
+All three recovery levels are also in the operator menu: `./netmon` → **System ▶** → options 6 (rollback) / 7 (quick rebuild) / 8 (factory reset) / 9 (restore from SFTP backup).
+
+---
+
+## 8. Troubleshooting
 
 **"docker: permission denied" after install**
 `setup.sh` added you to the docker group, but the current shell hasn't picked it up yet. Log out and back in (or run `newgrp docker`), then try again. While you're in the current shell, you can also just prefix commands with `sudo`.

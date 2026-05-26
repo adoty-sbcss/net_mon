@@ -19,6 +19,8 @@ TARGET_USER="${SUDO_USER:-${USER}}"
 UNITS=(
     "netmon-update"
     "netmon-deep-refresh"
+    "netmon-watchdog"
+    "netmon-config-backup"
 )
 
 # Legacy unit names from before the App_Mon → NetMon rename. We disable
@@ -67,12 +69,12 @@ done
 # --- install ---------------------------------------------------------------
 
 for unit in "${UNITS[@]}"; do
-    script="$REPO_DIR/scripts/$(echo "$unit" | sed 's/^netmon-//').sh"
-    # `netmon-update` -> `update.sh`? No — our scripts are `auto-update.sh` and
-    # `weekly-deep-refresh.sh`. Map explicitly:
     case "$unit" in
-        netmon-update)        script="$REPO_DIR/scripts/auto-update.sh" ;;
-        netmon-deep-refresh)  script="$REPO_DIR/scripts/weekly-deep-refresh.sh" ;;
+        netmon-update)         script="$REPO_DIR/scripts/auto-update.sh" ;;
+        netmon-deep-refresh)   script="$REPO_DIR/scripts/weekly-deep-refresh.sh" ;;
+        netmon-watchdog)       script="$REPO_DIR/scripts/netmon-watchdog.sh" ;;
+        netmon-config-backup)  script="$REPO_DIR/scripts/netmon-config-backup.sh" ;;
+        *) echo "ERROR: no script mapping for unit $unit" >&2; exit 1 ;;
     esac
     if [[ ! -x "$script" ]]; then
         echo "ERROR: $script missing or not executable" >&2
@@ -115,14 +117,15 @@ done
 
 echo ""
 echo "Installed. Useful commands:"
-echo "  systemctl list-timers 'netmon-*.timer'        # next scheduled runs"
-echo "  systemctl status netmon-update.timer          # nightly timer state"
-echo "  systemctl status netmon-deep-refresh.timer    # weekly timer state"
-echo "  journalctl -u netmon-update.service -n 50     # last nightly run"
-echo "  journalctl -u netmon-deep-refresh.service -n 50  # last deep refresh"
-echo "  $REPO_DIR/scripts/auto-update.sh              # run nightly now"
-echo "  $REPO_DIR/scripts/weekly-deep-refresh.sh      # run weekly now"
-echo "  $0 --uninstall                                # remove both timers"
+echo "  systemctl list-timers 'netmon-*.timer'           # next scheduled runs"
+echo "  journalctl -u netmon-update.service -n 50        # last nightly auto-update"
+echo "  journalctl -u netmon-deep-refresh.service -n 50  # last weekly deep refresh"
+echo "  journalctl -u netmon-watchdog.service -n 20      # last watchdog tick"
+echo "  journalctl -u netmon-config-backup.service -n 20 # last config backup"
+echo "  $REPO_DIR/scripts/auto-update.sh                 # run nightly now"
+echo "  $REPO_DIR/scripts/netmon-watchdog.sh             # run watchdog now"
+echo "  $REPO_DIR/scripts/netmon-config-backup.sh        # back up config now"
+echo "  $0 --uninstall                                   # remove all timers"
 echo ""
 
 $SUDO systemctl list-timers --no-pager 'netmon-*.timer' 2>/dev/null || true

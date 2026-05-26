@@ -1,0 +1,15 @@
+[Unit]
+Description=NetMon watchdog — periodic self-healing checks
+Documentation=https://github.com/adoty-sbcss/net_mon
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=${USER}
+Group=${USER}
+WorkingDirectory=${REPO_DIR}
+ExecStart=${REPO_DIR}/scripts/netmon-watchdog.sh
+TimeoutStartSec=600
+# Inherit a sane PATH so docker/psql/find/etc resolve under systemd.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
