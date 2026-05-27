@@ -117,10 +117,23 @@ to the configured SFTP server at the top of the hour.
 >      native VLAN)
 >    - **Unusual hosts** (vendor OUI mismatches, unexpected devices)
 >    - **Interface health** (high error/drop counts, asymmetric flow)
-> 5. Rank findings by severity and confidence (definite vs.
+> 5. If the bundle contains a `wifi/` folder, also analyze the Wi-Fi side:
+>    - Open `wifi/wifi_scan_<id>/summary.md` first for context, then
+>      `aps.csv`, `channels.json`, and `events.json`.
+>    - Call out **rogue or unexpected APs** (open SSIDs, hidden SSIDs,
+>      BSSIDs not from your known vendor list).
+>    - Flag **evil-twin candidates**: the same SSID broadcast from
+>      multiple BSSIDs, especially with different encryption settings.
+>    - Note **weak encryption**: OPEN, WEP, or WPA1-only networks.
+>    - Identify **channel congestion**: 2.4 GHz channels other than
+>      1/6/11 in use; any channel showing high busy_pct.
+>    - Compare against any prior hour's Wi-Fi data in the same site for
+>      churn (BSSIDs appearing/disappearing).
+> 6. Rank findings by severity and confidence (definite vs.
 >    suggestive). Cite the scan id and file that supports each finding.
-> 6. End with a short list of follow-up checks (SNMP polls, switch
->    CLI, longer captures, specific MACs to track).
+> 7. End with a short list of follow-up checks (SNMP polls, switch
+>    CLI, longer captures, specific MACs to track, monitor-mode
+>    Wi-Fi capture for deauth / station-level data).
 >
 > If a scan is missing data or looks truncated, say so.
 """

@@ -14,6 +14,7 @@ from .db import (
     list_pending_bundles,
     list_scan_runs_in_window,
     list_uploaded_bundles_older_than,
+    list_wifi_scans_in_window,
     record_bundle_built,
     record_bundle_upload_failure,
     record_bundle_uploaded,
@@ -104,18 +105,21 @@ def build_and_upload_hour(window_end: datetime) -> dict[str, str | None]:
     settings = get_settings()
     window_start = window_end - timedelta(hours=1)
     runs = list_scan_runs_in_window(window_start, window_end)
+    wifi_runs = list_wifi_scans_in_window(window_start, window_end)
     result: dict[str, str | None] = {
         "local_path": None, "remote_path": None,
         "status": "skipped", "message": None,
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
         "scans": "0",
+        "wifi_scans": str(len(wifi_runs)),
         "retried": "0",
     }
 
-    # 1. Build the current-hour bundle (if there's anything to bundle).
-    if runs:
+    # 1. Build the current-hour bundle if EITHER wired or Wi-Fi data exists.
+    if runs or wifi_runs:
         scan_ids = [int(r["id"]) for r in runs]
+        wifi_scan_ids = [int(r["id"]) for r in wifi_runs]
         result["scans"] = str(len(scan_ids))
         filename = _filename_for(window_end)
         bundle_path = settings.bundle_dir / filename
@@ -126,6 +130,7 @@ def build_and_upload_hour(window_end: datetime) -> dict[str, str | None]:
             device_name=device_name(),
             window_start=window_start,
             window_end=window_end,
+            wifi_scan_ids=wifi_scan_ids,
         )
         result["local_path"] = str(bundle_path)
         try:
@@ -134,9 +139,9 @@ def build_and_upload_hour(window_end: datetime) -> dict[str, str | None]:
             size = 0
         record_bundle_built(filename, str(bundle_path), size)
         audit("bundle_built", filename=filename, size_bytes=size,
-              scans=len(scan_ids))
+              scans=len(scan_ids), wifi_scans=len(wifi_scan_ids))
     else:
-        log.info("no scans in this hour, nothing new to bundle",
+        log.info("no scans in this hour (wired or wifi), nothing new to bundle",
                  start=window_start.isoformat(), end=window_end.isoformat())
 
     # 2. Try to upload every pending bundle (today's plus anything orphaned

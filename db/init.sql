@@ -164,6 +164,83 @@ CREATE INDEX IF NOT EXISTS idx_bundle_uploads_pending
     ON bundle_uploads(uploaded_at)
     WHERE uploaded_at IS NULL;
 
+-- Wi-Fi monitoring tables (Phase 1).
+CREATE TABLE IF NOT EXISTS wifi_scans (
+    id               SERIAL PRIMARY KEY,
+    started_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at     TIMESTAMPTZ,
+    trigger_reason   TEXT NOT NULL,
+    interface        TEXT NOT NULL,
+    profile          TEXT NOT NULL,
+    duration_sec    INTEGER,
+    channels_scanned INTEGER[],
+    error            TEXT,
+    notes            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wifi_scans_started ON wifi_scans(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS wifi_aps (
+    id              SERIAL PRIMARY KEY,
+    wifi_scan_id    INTEGER NOT NULL REFERENCES wifi_scans(id) ON DELETE CASCADE,
+    bssid           MACADDR NOT NULL,
+    essid           TEXT,
+    channel         INTEGER,
+    frequency_mhz   INTEGER,
+    band            TEXT,
+    privacy         TEXT,
+    cipher          TEXT,
+    auth            TEXT,
+    signal_dbm      INTEGER,
+    beacon_count    INTEGER,
+    data_count      INTEGER,
+    vendor          TEXT,
+    first_seen_at   TIMESTAMPTZ,
+    last_seen_at    TIMESTAMPTZ,
+    extra           JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_wifi_aps_scan  ON wifi_aps(wifi_scan_id);
+CREATE INDEX IF NOT EXISTS idx_wifi_aps_bssid ON wifi_aps(bssid);
+
+CREATE TABLE IF NOT EXISTS wifi_stations (
+    id                SERIAL PRIMARY KEY,
+    wifi_scan_id      INTEGER NOT NULL REFERENCES wifi_scans(id) ON DELETE CASCADE,
+    station_mac       MACADDR NOT NULL,
+    associated_bssid  MACADDR,
+    probed_essids     TEXT[],
+    signal_dbm        INTEGER,
+    frame_count       INTEGER,
+    vendor            TEXT,
+    first_seen_at     TIMESTAMPTZ,
+    last_seen_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_wifi_stations_scan ON wifi_stations(wifi_scan_id);
+
+CREATE TABLE IF NOT EXISTS wifi_channel_stats (
+    id              SERIAL PRIMARY KEY,
+    wifi_scan_id    INTEGER NOT NULL REFERENCES wifi_scans(id) ON DELETE CASCADE,
+    channel         INTEGER NOT NULL,
+    frequency_mhz   INTEGER,
+    band            TEXT,
+    ap_count        INTEGER NOT NULL DEFAULT 0,
+    noise_dbm       INTEGER,
+    active_ms       BIGINT,
+    busy_ms         BIGINT,
+    busy_pct        NUMERIC(5,2)
+);
+CREATE INDEX IF NOT EXISTS idx_wifi_channel_stats_scan ON wifi_channel_stats(wifi_scan_id);
+
+CREATE TABLE IF NOT EXISTS wifi_events (
+    id              SERIAL PRIMARY KEY,
+    wifi_scan_id    INTEGER NOT NULL REFERENCES wifi_scans(id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL,
+    severity        TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    detail          TEXT,
+    evidence        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_wifi_events_scan ON wifi_events(wifi_scan_id);
+
 CREATE TABLE IF NOT EXISTS findings (
     id          SERIAL PRIMARY KEY,
     scan_run_id INTEGER NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,

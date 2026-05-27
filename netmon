@@ -135,6 +135,21 @@ cmd_upload_now() {
     dc exec -T collector python -m collector upload-now
 }
 
+cmd_wifi_scan() {
+    require_running || return 1
+    dc exec -T collector python -m collector wifi-scan "$@"
+}
+
+cmd_wifi_list() {
+    require_running || return 1
+    dc exec -T collector python -m collector wifi-list
+}
+
+cmd_wifi_status() {
+    require_running || return 1
+    dc exec -T collector python -m collector wifi-status
+}
+
 cmd_upload_test() {
     require_running || return 1
     dc exec -T collector python -m collector upload-test
@@ -289,6 +304,12 @@ Main commands:
   update         Run auto-update.sh manually
   selftest       Run the collector's internal self-checks
 
+Wireless:
+  wifi-scan      Run a one-off Wi-Fi spectrum scan
+  wifi-list      List recent Wi-Fi scans
+  wifi-status    Show Wi-Fi configuration + adapter readiness
+  wifi           Re-run the wizard's Wi-Fi section
+
 Configure (delegates to netmon-wizard):
   wizard         Re-run the full wizard
   identity       Edit district/school/device labels
@@ -330,8 +351,9 @@ submenu_configure() {
             menu_item 4 "Scan mode (field / monitor)"
             menu_item 5 "Scan cadence (capture / cooldown / poll)"
             menu_item 6 "Log verbosity"
-            menu_item 7 "Show current config (redacted)"
-            menu_item 8 "Re-run full wizard"
+            menu_item 7 "Wi-Fi monitoring (profile / interface / scan)"
+            menu_item 8 "Show current config (redacted)"
+            menu_item 9 "Re-run full wizard"
             menu_footer "b" "Back to main menu" "q" "Quit"
             local choice
             choice="$(menu_read)"
@@ -339,7 +361,7 @@ submenu_configure() {
             echo ""
             echo "Configure"
             echo "  1) Identity   2) SFTP   3) SNMP   4) Mode   5) Cadence"
-            echo "  6) Log level  7) Show config   8) Full wizard"
+            echo "  6) Log level  7) Wi-Fi   8) Show config   9) Full wizard"
             echo "  b) Back       q) Quit"
             read -r -p "Choice: " choice || choice="q"
         fi
@@ -350,15 +372,16 @@ submenu_configure() {
             4) cmd_wizard mode ;;
             5) cmd_wizard cadence ;;
             6) cmd_wizard loglevel ;;
-            7) cmd_config ;;
-            8) cmd_wizard ;;
+            7) cmd_wizard wifi ;;
+            8) cmd_config ;;
+            9) cmd_wizard ;;
             b|B) return 0 ;;
             q|Q|exit|quit) return 99 ;;
             *) printf '%s(unknown choice: %s)%s\n' "$C_WARN" "$choice" "$C_OFF" ;;
         esac
         # After any write op, hint that a restart applies the change.
         case "$choice" in
-            1|2|3|4|5|6|8)
+            1|2|3|4|5|6|7|9)
                 echo ""
                 printf '%sNote:%s settings updated. Restart containers (main menu option 8) to apply.\n' \
                     "$C_INFO" "$C_OFF"
@@ -503,6 +526,10 @@ else
         scan)          shift; cmd_scan "${1:-}" ;;
         upload-now)    cmd_upload_now ;;
         upload-test)   cmd_upload_test ;;
+        wifi-scan)     shift; cmd_wifi_scan "$@" ;;
+        wifi-list)     cmd_wifi_list ;;
+        wifi-status)   cmd_wifi_status ;;
+        wifi)          shift; cmd_wizard wifi ;;
         config)        cmd_config ;;
         restart)       cmd_restart ;;
         update)        cmd_update ;;

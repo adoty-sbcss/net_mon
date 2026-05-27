@@ -12,7 +12,12 @@ from typing import Any
 import structlog
 
 from .config import get_settings
-from .db import fetch_scan, fetch_table_for_scan
+from .db import (
+    fetch_scan,
+    fetch_table_for_scan,
+    fetch_table_for_wifi_scan,
+    fetch_wifi_scan,
+)
 from .prompts import get_bundle_readme, get_bundle_readme_hourly
 
 log = structlog.get_logger(__name__)
@@ -61,15 +66,22 @@ def build_hourly_bundle(
     device_name: str,
     window_start: datetime,
     window_end: datetime,
+    wifi_scan_ids: list[int] | None = None,
 ) -> Path:
-    """Build a single ZIP rolling up every scan that completed in the hour."""
-    if not scan_ids:
-        raise ValueError("build_hourly_bundle called with no scan_ids")
+    """Build a single ZIP rolling up every scan that completed in the hour.
+
+    Wired and Wi-Fi scans are both included; the ZIP gets `scans/scan_<id>/`
+    folders for wired and `wifi/wifi_scan_<id>/` folders for Wi-Fi.
+    """
+    wifi_scan_ids = wifi_scan_ids or []
+    if not scan_ids and not wifi_scan_ids:
+        raise ValueError("build_hourly_bundle called with no scan_ids and no wifi_scan_ids")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     summary = _build_hourly_summary(
         scan_ids=scan_ids,
+        wifi_scan_ids=wifi_scan_ids,
         device_name=device_name,
         window_start=window_start,
         window_end=window_end,
@@ -82,10 +94,116 @@ def build_hourly_bundle(
             payload = _scan_payload(sid)
             for name, content in payload.items():
                 z.writestr(f"scans/scan_{sid}/{name}", content)
+        for wsid in wifi_scan_ids:
+            payload = _wifi_scan_payload(wsid)
+            for name, content in payload.items():
+                z.writestr(f"wifi/wifi_scan_{wsid}/{name}", content)
 
     log.info("hourly bundle written", path=str(output_path),
-             scans=len(scan_ids), size_bytes=output_path.stat().st_size)
+             scans=len(scan_ids), wifi_scans=len(wifi_scan_ids),
+             size_bytes=output_path.stat().st_size)
     return output_path
+
+
+def _wifi_scan_payload(wifi_scan_id: int) -> dict[str, str]:
+    """All files for one Wi-Fi scan, keyed by relative path inside the bundle."""
+    scan = fetch_wifi_scan(wifi_scan_id)
+    if scan is None:
+        raise ValueError(f"wifi_scan id {wifi_scan_id} not found")
+
+    aps = fetch_table_for_wifi_scan("wifi_aps", wifi_scan_id)
+    stations = fetch_table_for_wifi_scan("wifi_stations", wifi_scan_id)
+    channels = fetch_table_for_wifi_scan("wifi_channel_stats", wifi_scan_id)
+    events = fetch_table_for_wifi_scan("wifi_events", wifi_scan_id)
+
+    return {
+        "summary.md": _build_wifi_summary_md(scan, aps, channels, events),
+        "aps.csv": _wifi_aps_csv(aps),
+        "stations.csv": _wifi_stations_csv(stations),
+        "channels.json": _jsonify(channels),
+        "events.json": _jsonify(events),
+        "raw/wifi_scan.json": _jsonify(scan),
+    }
+
+
+def _build_wifi_summary_md(
+    scan: dict[str, Any],
+    aps: list[dict[str, Any]],
+    channels: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+) -> str:
+    lines: list[str] = []
+    lines.append(f"# Wi-Fi scan #{scan.get('id')}")
+    lines.append("")
+    lines.append(f"- **Started:** {scan.get('started_at')}")
+    lines.append(f"- **Completed:** {scan.get('completed_at')}")
+    lines.append(f"- **Duration:** {scan.get('duration_sec')} seconds")
+    lines.append(f"- **Trigger:** {scan.get('trigger_reason')}")
+    lines.append(f"- **Profile:** {scan.get('profile')}")
+    lines.append(f"- **Interface:** {scan.get('interface')}")
+    lines.append(f"- **Channels touched:** {scan.get('channels_scanned')}")
+    if scan.get("error"):
+        lines.append(f"- **Error:** {scan['error']}")
+    lines.append("")
+    lines.append("## Counts")
+    lines.append("")
+    lines.append(f"- APs visible: **{len(aps)}**")
+    lines.append(f"- Channels with stats: **{len(channels)}**")
+    lines.append(f"- Findings (anomalies): **{len(events)}**")
+    lines.append("")
+
+    # Security breakdown.
+    if aps:
+        from collections import Counter
+        priv = Counter((ap.get("privacy") or "?").upper() for ap in aps)
+        lines.append("## Security breakdown")
+        lines.append("")
+        for k, v in sorted(priv.items(), key=lambda x: -x[1]):
+            lines.append(f"- {k}: {v}")
+        lines.append("")
+
+    # Band breakdown.
+    if aps:
+        from collections import Counter
+        bands = Counter(ap.get("band") or "?" for ap in aps)
+        lines.append("## Band breakdown")
+        lines.append("")
+        for k, v in sorted(bands.items(), key=lambda x: -x[1]):
+            lines.append(f"- {k}: {v}")
+        lines.append("")
+
+    if events:
+        lines.append("## Findings (anomalies)")
+        lines.append("")
+        for ev in events:
+            lines.append(f"- **[{ev.get('severity')}] {ev.get('title')}** — {ev.get('detail')}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _wifi_aps_csv(rows: list[dict[str, Any]]) -> str:
+    buf = io.StringIO()
+    fieldnames = ["id", "bssid", "essid", "channel", "frequency_mhz", "band",
+                  "privacy", "cipher", "auth", "signal_dbm", "vendor",
+                  "first_seen_at", "last_seen_at"]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: ("" if r.get(k) is None else str(r.get(k))) for k in fieldnames})
+    return buf.getvalue()
+
+
+def _wifi_stations_csv(rows: list[dict[str, Any]]) -> str:
+    buf = io.StringIO()
+    fieldnames = ["id", "station_mac", "associated_bssid", "signal_dbm",
+                  "frame_count", "vendor", "probed_essids",
+                  "first_seen_at", "last_seen_at"]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: ("" if r.get(k) is None else str(r.get(k))) for k in fieldnames})
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -232,30 +350,51 @@ def _build_hourly_summary(
     device_name: str,
     window_start: datetime,
     window_end: datetime,
+    wifi_scan_ids: list[int] | None = None,
 ) -> str:
+    wifi_scan_ids = wifi_scan_ids or []
     lines = []
     lines.append(f"# NetMon hourly rollup — {device_name}")
     lines.append("")
     lines.append(f"- **Window:** {window_start.isoformat()} → {window_end.isoformat()}")
     lines.append(f"- **Device:** {device_name}")
-    lines.append(f"- **Scans in this hour:** {len(scan_ids)}")
+    lines.append(f"- **Wired scans in this hour:** {len(scan_ids)}")
+    lines.append(f"- **Wi-Fi scans in this hour:** {len(wifi_scan_ids)}")
     lines.append("")
-    lines.append("## Scans")
-    lines.append("")
-    lines.append("| ID | Interface | CIDR | Gateway | Trigger | Duration |")
-    lines.append("|---:|-----------|------|---------|---------|---------:|")
-    for sid in scan_ids:
-        scan = fetch_scan(sid) or {}
-        lines.append(
-            f"| {sid} "
-            f"| {scan.get('interface') or '-'} "
-            f"| {scan.get('interface_cidr') or '-'} "
-            f"| {scan.get('gateway_ip') or '-'} "
-            f"| {scan.get('trigger_reason') or '-'} "
-            f"| {scan.get('duration_sec') or '-'}s |"
-        )
-    lines.append("")
-    lines.append("Open each `scans/scan_<id>/summary.md` for per-scan detail.")
+    if scan_ids:
+        lines.append("## Wired scans")
+        lines.append("")
+        lines.append("| ID | Interface | CIDR | Gateway | Trigger | Duration |")
+        lines.append("|---:|-----------|------|---------|---------|---------:|")
+        for sid in scan_ids:
+            scan = fetch_scan(sid) or {}
+            lines.append(
+                f"| {sid} "
+                f"| {scan.get('interface') or '-'} "
+                f"| {scan.get('interface_cidr') or '-'} "
+                f"| {scan.get('gateway_ip') or '-'} "
+                f"| {scan.get('trigger_reason') or '-'} "
+                f"| {scan.get('duration_sec') or '-'}s |"
+            )
+        lines.append("")
+        lines.append("Open each `scans/scan_<id>/summary.md` for per-scan detail.")
+        lines.append("")
+    if wifi_scan_ids:
+        lines.append("## Wi-Fi scans")
+        lines.append("")
+        lines.append("| ID | Interface | Profile | Trigger | Duration |")
+        lines.append("|---:|-----------|---------|---------|---------:|")
+        for wsid in wifi_scan_ids:
+            wsc = fetch_wifi_scan(wsid) or {}
+            lines.append(
+                f"| {wsid} "
+                f"| {wsc.get('interface') or '-'} "
+                f"| {wsc.get('profile') or '-'} "
+                f"| {wsc.get('trigger_reason') or '-'} "
+                f"| {wsc.get('duration_sec') or '-'}s |"
+            )
+        lines.append("")
+        lines.append("Open each `wifi/wifi_scan_<id>/summary.md` for per-scan detail.")
     lines.append("")
     return "\n".join(lines)
 

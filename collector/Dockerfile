@@ -17,6 +17,8 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         nmap \
         tshark \
         iproute2 \
+        iw \
+        wireless-tools \
         iputils-ping \
         dnsutils \
         ca-certificates \

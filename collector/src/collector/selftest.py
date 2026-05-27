@@ -38,6 +38,7 @@ def run_all() -> list[CheckResult]:
         _check_bundle_dir,
         _check_interfaces,
         _check_capabilities,
+        _check_wifi,
     ]
     out: list[CheckResult] = []
     for fn in checks:
@@ -171,6 +172,24 @@ def _check_interfaces() -> CheckResult:
     if seen_up:
         return CheckResult("interfaces", True, f"with carrier: {', '.join(seen_up)}")
     return CheckResult("interfaces", False, "no non-excluded interface has carrier yet")
+
+
+def _check_wifi() -> CheckResult:
+    """If Wi-Fi monitoring is enabled, verify the interface exists and iw is present."""
+    settings = get_settings()
+    if not settings.wifi_enabled:
+        return CheckResult("wifi", True, "disabled (NETMON_WIFI_ENABLED=false)")
+    if not settings.wifi_interface:
+        return CheckResult("wifi", False, "enabled but NETMON_WIFI_INTERFACE not set")
+    if shutil.which("iw") is None:
+        return CheckResult("wifi", False, "iw binary not on PATH inside container")
+    iface_dir = Path(f"/sys/class/net/{settings.wifi_interface}")
+    if not iface_dir.is_dir():
+        return CheckResult("wifi", False,
+                           f"interface {settings.wifi_interface!r} not visible to container "
+                           f"(check host networking + interface name)")
+    return CheckResult("wifi", True,
+                       f"enabled on {settings.wifi_interface} (profile={settings.profile})")
 
 
 def _check_capabilities() -> CheckResult:

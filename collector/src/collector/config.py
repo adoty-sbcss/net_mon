@@ -31,6 +31,22 @@ class Settings(BaseSettings):
     # to get a response for a given device gets cached in snmp_credentials.
     snmp_communities: str = Field(default="", alias="NETMON_SNMP_COMMUNITIES")
 
+    # Profile: 'survey' (mobile field tool — Wi-Fi spectrum surveys primary)
+    # or 'monitor' (stationary — wired primary, hourly Wi-Fi snapshot).
+    profile: Literal["survey", "monitor"] = Field(default="monitor", alias="NETMON_PROFILE")
+
+    # Wi-Fi monitoring (Phase 1)
+    wifi_enabled: bool = Field(default=False, alias="NETMON_WIFI_ENABLED")
+    wifi_interface: str = Field(default="", alias="NETMON_WIFI_INTERFACE")
+    # Override durations if you want; defaults are profile-driven (see properties below).
+    wifi_scan_seconds: int = Field(default=0, alias="NETMON_WIFI_SCAN_SECONDS")
+    # Comma-separated channel list (e.g. "1,6,11,36,40,44"). Empty = let airodump-ng
+    # hop across all channels the radio supports.
+    wifi_channels: str = Field(default="", alias="NETMON_WIFI_CHANNELS")
+    # Minute of the hour at which monitor-profile boxes auto-fire a Wi-Fi snapshot.
+    # Chosen to sit between scan triggers (top of hour) and uploads (top of next).
+    wifi_hourly_minute: int = Field(default=20, alias="NETMON_WIFI_HOURLY_MINUTE")
+
     sftp_enabled: bool = Field(default=False, alias="NETMON_SFTP_ENABLED")
     sftp_host: str = Field(default="", alias="NETMON_SFTP_HOST")
     sftp_port: int = Field(default=22, alias="NETMON_SFTP_PORT")
@@ -63,6 +79,28 @@ class Settings(BaseSettings):
     @property
     def snmp_community_list(self) -> tuple[str, ...]:
         return tuple(s.strip() for s in self.snmp_communities.split(",") if s.strip())
+
+    @property
+    def wifi_channel_list(self) -> tuple[int, ...]:
+        out: list[int] = []
+        for s in self.wifi_channels.split(","):
+            s = s.strip()
+            if not s:
+                continue
+            try:
+                out.append(int(s))
+            except ValueError:
+                continue
+        return tuple(out)
+
+    @property
+    def effective_wifi_scan_seconds(self) -> int:
+        """Profile-driven defaults: survey gets a long sweep, monitor a quick one."""
+        if self.wifi_scan_seconds > 0:
+            return self.wifi_scan_seconds
+        if self.profile == "survey":
+            return 300   # 5 minutes
+        return 90        # 1.5 minutes — fast spectrum snapshot
 
 
 _settings: Settings | None = None

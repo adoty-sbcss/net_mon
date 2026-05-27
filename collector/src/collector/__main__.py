@@ -16,6 +16,7 @@ from . import config_backup as config_backup_mod
 from . import migrations as migrations_mod
 from . import selftest as selftest_mod
 from . import uploader as uploader_mod
+from . import wifi_scheduler as wifi_scheduler_mod
 
 
 def _configure_logging() -> None:
@@ -56,6 +57,9 @@ def cmd_run() -> None:
           sftp_enabled=settings.sftp_enabled,
           device=uploader_mod.device_name())
     uploader_mod.start_in_background()
+    # Monitor-profile boxes auto-fire a Wi-Fi snapshot once an hour; survey-
+    # profile boxes only scan on manual trigger.
+    wifi_scheduler_mod.start_in_background()
     run_poller()
 
 
@@ -232,6 +236,79 @@ def cmd_config_download(date: str | None, out: str) -> None:
         click.echo(f"OK   {path}")
     except Exception as exc:
         click.echo(f"FAIL config-download: {exc}", err=True)
+        sys.exit(2)
+
+
+@cli.command("wifi-scan")
+@click.option("--interface", "-i", default=None,
+              help="Wi-Fi interface; defaults to NETMON_WIFI_INTERFACE.")
+@click.option("--reason", default="manual", help="Trigger reason recorded with the scan.")
+def cmd_wifi_scan(interface: str | None, reason: str) -> None:
+    """Run a one-off Wi-Fi scan and persist results."""
+    wait_for_db()
+    from . import wifi_scan as wifi_scan_mod
+    wifi_scan_id = wifi_scan_mod.run_wifi_scan(trigger_reason=reason, interface=interface)
+    if wifi_scan_id is None:
+        click.echo("wifi scan did not run (disabled, no interface, or pre-check failed)", err=True)
+        sys.exit(2)
+    click.echo(f"wifi scan complete, id={wifi_scan_id}")
+
+
+@cli.command("wifi-list")
+@click.option("--limit", default=25, show_default=True, help="Max rows to show.")
+def cmd_wifi_list(limit: int) -> None:
+    """List recent Wi-Fi scans."""
+    wait_for_db()
+    from .db import list_wifi_scans
+    rows = list_wifi_scans(limit=limit)
+    if not rows:
+        click.echo("(no wifi scans yet)")
+        return
+    click.echo(f"{'id':>4}  {'started':<25}  {'iface':<10}  {'profile':<8}  {'dur':>4}  reason")
+    for r in rows:
+        started = r["started_at"].strftime("%Y-%m-%d %H:%M:%S%z") if r.get("started_at") else "-"
+        click.echo(
+            f"{r['id']:>4}  {started:<25}  "
+            f"{(r.get('interface') or '-'):<10}  "
+            f"{(r.get('profile') or '-'):<8}  "
+            f"{str(r.get('duration_sec') or '-'):>4}  "
+            f"{r.get('trigger_reason') or '-'}"
+        )
+
+
+@cli.command("wifi-status")
+def cmd_wifi_status() -> None:
+    """Show the Wi-Fi configuration and adapter readiness."""
+    settings = get_settings()
+    click.echo(f"profile:           {settings.profile}")
+    click.echo(f"wifi_enabled:      {settings.wifi_enabled}")
+    click.echo(f"wifi_interface:    {settings.wifi_interface or '(unset)'}")
+    click.echo(f"scan_seconds:      {settings.effective_wifi_scan_seconds}  "
+               f"(profile default; override with NETMON_WIFI_SCAN_SECONDS)")
+    click.echo(f"hourly_minute:     {settings.wifi_hourly_minute}  (monitor profile only)")
+    if not settings.wifi_enabled:
+        click.echo("(wifi disabled — nothing more to report)")
+        return
+
+    # Probe the configured interface to see if it can scan at all.
+    import subprocess
+    iface = settings.wifi_interface
+    if not iface:
+        click.echo("wifi_interface is empty — set NETMON_WIFI_INTERFACE in .env", err=True)
+        sys.exit(2)
+    try:
+        out = subprocess.run(
+            ["iw", "dev", iface, "info"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if out.returncode == 0:
+            click.echo("")
+            click.echo(out.stdout.strip())
+        else:
+            click.echo(f"iw dev {iface} info failed: {out.stderr.strip()}", err=True)
+            sys.exit(2)
+    except FileNotFoundError:
+        click.echo("`iw` is not installed in this container", err=True)
         sys.exit(2)
 
 

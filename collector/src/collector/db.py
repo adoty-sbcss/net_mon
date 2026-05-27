@@ -174,6 +174,127 @@ def fetch_table_for_scan(table: str, scan_id: int) -> list[dict[str, Any]]:
             return list(cur.fetchall())
 
 
+# ---------------------------------------------------------------------------
+# Wi-Fi scan helpers
+# ---------------------------------------------------------------------------
+
+
+def insert_wifi_scan(*, trigger_reason: str, interface: str, profile: str) -> int:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO wifi_scans (trigger_reason, interface, profile)
+                VALUES (%s, %s, %s)
+                RETURNING id
+                """,
+                (trigger_reason, interface, profile),
+            )
+            row = cur.fetchone()
+            assert row is not None
+            return int(row["id"])
+
+
+def complete_wifi_scan(
+    wifi_scan_id: int,
+    *,
+    duration_sec: int,
+    channels_scanned: list[int] | None = None,
+    error: str | None = None,
+    notes: str | None = None,
+) -> None:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE wifi_scans
+                   SET completed_at     = NOW(),
+                       duration_sec     = %s,
+                       channels_scanned = %s,
+                       error            = %s,
+                       notes            = %s
+                 WHERE id = %s
+                """,
+                (duration_sec, channels_scanned, error, notes, wifi_scan_id),
+            )
+
+
+def list_wifi_scans(limit: int = 50) -> list[dict[str, Any]]:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, started_at, completed_at, trigger_reason,
+                       interface, profile, duration_sec, error
+                  FROM wifi_scans
+                 ORDER BY started_at DESC
+                 LIMIT %s
+                """,
+                (limit,),
+            )
+            return list(cur.fetchall())
+
+
+def list_wifi_scans_in_window(start, end) -> list[dict[str, Any]]:
+    """Wi-Fi scans completed in [start, end). Times must be tz-aware."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, started_at, completed_at, trigger_reason,
+                       interface, profile, duration_sec, error
+                  FROM wifi_scans
+                 WHERE completed_at IS NOT NULL
+                   AND completed_at >= %s
+                   AND completed_at <  %s
+                 ORDER BY started_at ASC
+                """,
+                (start, end),
+            )
+            return list(cur.fetchall())
+
+
+def fetch_wifi_scan(wifi_scan_id: int) -> dict[str, Any] | None:
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM wifi_scans WHERE id = %s", (wifi_scan_id,))
+            return cur.fetchone()
+
+
+def fetch_table_for_wifi_scan(table: str, wifi_scan_id: int) -> list[dict[str, Any]]:
+    """Fetch all rows from a wifi-scan-scoped table. Table name is whitelisted."""
+    allowed = {"wifi_aps", "wifi_stations", "wifi_channel_stats", "wifi_events"}
+    if table not in allowed:
+        raise ValueError(f"table {table!r} is not allowed")
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT * FROM {table} WHERE wifi_scan_id = %s ORDER BY id",
+                (wifi_scan_id,),
+            )
+            return list(cur.fetchall())
+
+
+def insert_wifi_rows(table: str, wifi_scan_id: int, rows: list[dict[str, Any]]) -> None:
+    """Insert wifi-scan-scoped rows. Each row gets wifi_scan_id stamped on it."""
+    if not rows:
+        return
+    allowed = {"wifi_aps", "wifi_stations", "wifi_channel_stats", "wifi_events"}
+    if table not in allowed:
+        raise ValueError(f"table {table!r} is not allowed")
+    # Stamp scan id and harmonize column names.
+    stamped = [{**r, "wifi_scan_id": wifi_scan_id} for r in rows]
+    cols = list(stamped[0].keys())
+    placeholders = ", ".join(["%s"] * len(cols))
+    col_sql = ", ".join(cols)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})",
+                [tuple(r.get(c) for c in cols) for r in stamped],
+            )
+
+
 def get_snmp_credential(device_ip: str) -> dict[str, Any] | None:
     """Return cached (community, version, failure_count, last_attempt_at) for a device.
 

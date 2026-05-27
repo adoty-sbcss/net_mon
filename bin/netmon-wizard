@@ -41,6 +41,7 @@ cd "$REPO_DIR"
 . "$LIB_DIR/sftp.sh"
 . "$LIB_DIR/snmp.sh"
 . "$LIB_DIR/advanced.sh"
+. "$LIB_DIR/wifi.sh"
 
 WIZARD_SENTINEL="${NETMON_VAR_DIR}/.wizard-done"
 
@@ -92,6 +93,7 @@ run_full() {
     print_banner
     run_essentials
     prompt_snmp_config
+    prompt_wifi_config
 
     echo ""
     if prompt_yesno "Set up advanced options now (scan mode, cadence, log level)?" "N"; then
@@ -119,6 +121,8 @@ case "${1:-}" in
     identity)      prompt_identity_config ;;
     sftp)          prompt_sftp_config "$(current_value NETMON_DEVICE)" ;;
     snmp)          prompt_snmp_config ;;
+    wifi)          prompt_wifi_config ;;
+    profile)       prompt_wifi_profile ;;
     advanced)      prompt_advanced_config ;;
     cadence)       prompt_scan_cadence ;;
     mode)          prompt_scan_mode ;;
@@ -128,7 +132,7 @@ case "${1:-}" in
         ;;
     *)
         echo "ERROR: unknown section: $1" >&2
-        echo "Try: identity | sftp | snmp | advanced | cadence | mode | loglevel" >&2
+        echo "Try: identity | sftp | snmp | wifi | profile | advanced | cadence | mode | loglevel" >&2
         exit 1
         ;;
 esac
