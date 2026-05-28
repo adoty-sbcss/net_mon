@@ -7,7 +7,7 @@ from typing import Any
 
 import psycopg
 import structlog
-from psycopg.rows import dict_row
+from psycopg.rows import DictRow, dict_row
 
 from .config import get_settings
 
@@ -15,7 +15,10 @@ log = structlog.get_logger(__name__)
 
 
 @contextmanager
-def connect() -> Iterator[psycopg.Connection]:
+def connect() -> Iterator[psycopg.Connection[DictRow]]:
+    # row_factory=dict_row makes every cursor yield dict rows (not tuples), so
+    # the connection is typed Connection[DictRow]. Without this annotation mypy
+    # assumes the default tuple rows and flags every row["col"] access.
     settings = get_settings()
     conn = psycopg.connect(settings.dsn, row_factory=dict_row, autocommit=False)
     try:
