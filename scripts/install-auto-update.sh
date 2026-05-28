@@ -49,8 +49,9 @@ if [[ "${1:-}" == "--uninstall" ]]; then
         $SUDO rm -f "/etc/systemd/system/${unit}.service" \
                     "/etc/systemd/system/${unit}.timer"
     done
+    $SUDO rm -f /etc/sudoers.d/netmon-update
     $SUDO systemctl daemon-reload
-    echo "Uninstalled."
+    echo "Uninstalled (timers + sudoers drop-in removed)."
     exit 0
 fi
 
@@ -114,6 +115,38 @@ $SUDO systemctl daemon-reload
 for unit in "${UNITS[@]}"; do
     $SUDO systemctl enable --now "${unit}.timer"
 done
+
+# --- passwordless sudo for the unattended update path ---------------------
+# The timers run auto-update.sh / db-snapshot.sh / watchdog as $TARGET_USER
+# (non-interactive). Those scripts need root to write /var/lib/netmon, read
+# the root-owned /etc/netmon secrets, and drive docker/systemctl. Without a
+# NOPASSWD grant, sudo prompts for a password that no TTY can answer, so every
+# scheduled run dies at the first sudo (this is what froze the pilot box at an
+# old commit). Grant the update user passwordless sudo so the timers work.
+#
+# This is the standard posture for a single-purpose appliance where the admin
+# account already has full control. If your security policy forbids it, remove
+# this drop-in and instead run the timers' service units as User=root.
+SUDOERS_FILE="/etc/sudoers.d/netmon-update"
+if [[ ! -f "$SUDOERS_FILE" ]]; then
+    TMP_SUDO="$(mktemp)"
+    {
+        echo "# Installed by netmon scripts/install-auto-update.sh."
+        echo "# Lets the scheduled auto-update / snapshot / watchdog run unattended."
+        echo "${TARGET_USER} ALL=(ALL) NOPASSWD:ALL"
+    } > "$TMP_SUDO"
+    # Validate syntax before installing — a broken sudoers file can lock you out.
+    if $SUDO visudo -cf "$TMP_SUDO" >/dev/null 2>&1; then
+        $SUDO install -m 440 -o root -g root "$TMP_SUDO" "$SUDOERS_FILE"
+        echo "Granted passwordless sudo to $TARGET_USER ($SUDOERS_FILE) for unattended updates."
+    else
+        echo "WARN: generated sudoers file failed validation; NOT installing it." >&2
+        echo "      Scheduled updates will fail until $TARGET_USER has passwordless sudo." >&2
+    fi
+    rm -f "$TMP_SUDO"
+else
+    echo "Sudoers drop-in already present ($SUDOERS_FILE)."
+fi
 
 echo ""
 echo "Installed. Useful commands:"
