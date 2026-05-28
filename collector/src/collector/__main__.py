@@ -6,16 +6,16 @@ import click
 import structlog
 
 from . import __version__
+from . import config_backup as config_backup_mod
+from . import migrations as migrations_mod
+from . import selftest as selftest_mod
+from . import uploader as uploader_mod
 from .bundle import build_bundle
 from .config import get_settings
 from .db import fetch_scan, list_scan_runs, wait_for_db
 from .logging_setup import audit, configure_logging
 from .poller import run_poller
 from .scan import run_scan
-from . import config_backup as config_backup_mod
-from . import migrations as migrations_mod
-from . import selftest as selftest_mod
-from . import uploader as uploader_mod
 
 
 def _configure_logging() -> None:

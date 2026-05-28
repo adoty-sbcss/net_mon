@@ -5,7 +5,7 @@ import io
 import json
 import socket
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,8 +36,9 @@ def build_bundle(scan_id: int, output_path: str | None = None) -> Path:
         settings.bundle_dir.mkdir(parents=True, exist_ok=True)
         ts = _stamp(scan.get("started_at"))
         host = socket.gethostname()
-        output_path = settings.bundle_dir / f"network-scan-{host}-{ts}.zip"
-    out = Path(output_path)
+        out = settings.bundle_dir / f"network-scan-{host}-{ts}.zip"
+    else:
+        out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -412,7 +413,7 @@ def _jsonify(obj: Any) -> str:
 def _default(o: Any) -> Any:
     if isinstance(o, datetime):
         if o.tzinfo is None:
-            o = o.replace(tzinfo=timezone.utc)
+            o = o.replace(tzinfo=UTC)
         return o.isoformat()
     return str(o)
 
@@ -420,4 +421,4 @@ def _default(o: Any) -> Any:
 def _stamp(dt: Any) -> str:
     if isinstance(dt, datetime):
         return dt.strftime("%Y%m%d-%H%M%S")
-    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return datetime.now(UTC).strftime("%Y%m%d-%H%M%S")

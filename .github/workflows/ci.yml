@@ -1,0 +1,107 @@
+name: CI
+
+# Runs on every push to any branch and on PRs into main. The whole point is
+# to catch the class of bug that crash-looped a box in May 2026: a poller that
+# referenced settings.rescan_interval (didn't exist) and called run_scan with
+# an is_primary kwarg (the function didn't accept). Plain syntax checks miss
+# those — they're valid Python that only fails at runtime. The mypy step below
+# catches both as attr-defined / call-arg errors.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+# Cancel an in-progress run if the same ref gets a newer push.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  collector:
+    name: Collector (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install collector + dev tools
+        run: |
+          python -m pip install --upgrade pip
+          # Installs runtime deps so mypy can resolve real imports (pydantic,
+          # etc.) plus the [dev] extra (mypy, ruff).
+          pip install -e "collector[dev]"
+
+      - name: Syntax (compileall)
+        run: python -m compileall -q collector/src/collector
+
+      - name: Lint (ruff)
+        run: ruff check collector/src/collector
+
+      - name: Type check (mypy)
+        # This is the step that would have caught the crash-loop bug.
+        run: mypy collector/src/collector --ignore-missing-imports --check-untyped-defs
+
+      - name: Import smoke test
+        # Belt-and-suspenders: actually import every module so an import-time
+        # error (circular import, bad top-level statement) fails CI even if it
+        # somehow slipped past the static checks.
+        run: |
+          cd collector/src
+          python - <<'PY'
+          import importlib, pkgutil, collector
+          failed = []
+          for m in pkgutil.walk_packages(collector.__path__, "collector."):
+              try:
+                  importlib.import_module(m.name)
+              except Exception as exc:  # noqa: BLE001
+                  failed.append((m.name, repr(exc)))
+          if failed:
+              for name, err in failed:
+                  print(f"IMPORT FAILED: {name}: {err}")
+              raise SystemExit(1)
+          print("all modules import cleanly")
+          PY
+
+  shell:
+    name: Shell scripts (bash -n)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax-check every shell script
+        # bash -n is the shell equivalent of py_compile: it catches syntax
+        # errors (the kind that break a deploy) without executing anything.
+        run: |
+          set -e
+          fail=0
+          # Top-level entry scripts + every module/script in the tree.
+          mapfile -t files < <(
+            printf '%s\n' netmon setup.sh
+            find bin lib scripts -type f \( -name '*.sh' -o ! -name '*.*' \) 2>/dev/null
+          )
+          for f in "${files[@]}"; do
+            [ -f "$f" ] || continue
+            # Only check files that are actually shell (shebang or .sh).
+            if head -1 "$f" | grep -q 'bash\|sh' || [[ "$f" == *.sh ]]; then
+              if ! bash -n "$f"; then
+                echo "SYNTAX ERROR: $f"
+                fail=1
+              fi
+            fi
+          done
+          [ "$fail" -eq 0 ] && echo "all shell scripts parse cleanly"
+          exit "$fail"
+
+      - name: ShellCheck (informational)
+        # Style/robustness warnings. Non-blocking for now — flip to a hard gate
+        # later once the existing scripts are clean.
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning netmon setup.sh bin/* lib/*.sh scripts/*.sh || true

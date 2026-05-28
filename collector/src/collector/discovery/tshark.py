@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -33,7 +33,7 @@ CAPTURE_FILTER = (
 
 def run_capture(*, interface: str, seconds: int) -> CaptureResult:
     """Run tshark for `seconds` and parse out the structured events we care about."""
-    started_at = datetime.now(timezone.utc)
+    started_at = datetime.now(UTC)
     cmd = [
         "tshark",
         "-i", interface,
@@ -53,15 +53,15 @@ def run_capture(*, interface: str, seconds: int) -> CaptureResult:
         )
     except FileNotFoundError:
         log.warning("tshark not found")
-        return CaptureResult(started_at=started_at, completed_at=datetime.now(timezone.utc))
+        return CaptureResult(started_at=started_at, completed_at=datetime.now(UTC))
     except subprocess.TimeoutExpired:
         log.warning("tshark hard-timeout", seconds=seconds)
-        return CaptureResult(started_at=started_at, completed_at=datetime.now(timezone.utc))
+        return CaptureResult(started_at=started_at, completed_at=datetime.now(UTC))
 
     if proc.returncode not in (0, 1):  # 1 means it captured nothing matching
         log.warning("tshark failed", returncode=proc.returncode, stderr=proc.stderr[:500])
 
-    result = CaptureResult(started_at=started_at, completed_at=datetime.now(timezone.utc))
+    result = CaptureResult(started_at=started_at, completed_at=datetime.now(UTC))
     for line in proc.stdout.splitlines():
         if not line.strip() or line.startswith('{"index"'):
             continue

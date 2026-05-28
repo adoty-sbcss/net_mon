@@ -8,13 +8,13 @@ import structlog
 
 from .config import get_settings
 from .db import complete_scan_run, insert_many, insert_scan_run, recent_network_scan
-from .logging_setup import audit
 from .discovery import arp as arp_mod
 from .discovery import interfaces as iface_mod
 from .discovery import lldp as lldp_mod
 from .discovery import nmap as nmap_mod
 from .discovery import snmp as snmp_mod
 from .discovery import tshark as tshark_mod
+from .logging_setup import audit
 from .models import ScanContext
 
 log = structlog.get_logger(__name__)

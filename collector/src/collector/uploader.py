@@ -282,15 +282,15 @@ def _ensure_remote_dir(sftp, path: str) -> None:
         current = current + "/" + p
         try:
             sftp.stat(current)
-        except IOError:
+        except OSError:
             try:
                 sftp.mkdir(current)
-            except IOError as exc:
+            except OSError as exc:
                 # Race or read-only — try to stat again before giving up.
                 try:
                     sftp.stat(current)
-                except IOError:
-                    raise exc
+                except OSError:
+                    raise exc from None
 
 
 def test_connection() -> tuple[bool, str]:
@@ -322,7 +322,7 @@ def test_connection() -> tuple[bool, str]:
                 msg = (f"connected to {settings.sftp_host}:{settings.sftp_port} as "
                        f"{settings.sftp_user}; target {target_dir!r} "
                        f"has {len(entries)} entries")
-            except IOError:
+            except OSError:
                 msg = (f"connected to {settings.sftp_host}:{settings.sftp_port} as "
                        f"{settings.sftp_user}; target {target_dir!r} "
                        f"does not exist yet (will be created on first upload)")

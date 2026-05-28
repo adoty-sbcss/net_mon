@@ -19,8 +19,42 @@ dependencies = [
     "paramiko>=3.4",
 ]
 
+[project.optional-dependencies]
+# Tools the CI guard installs. `pip install -e .[dev]` gets you the same
+# checks locally that CI runs.
+dev = [
+    "mypy>=1.8",
+    "ruff>=0.4",
+]
+
 [project.scripts]
 netmon = "collector.__main__:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.mypy]
+python_version = "3.11"
+# Third-party libs (psycopg, structlog, pysnmp, paramiko, manuf, ...) ship
+# without type stubs; don't fail on their missing imports.
+ignore_missing_imports = true
+# THE important one: check the bodies of functions even when they lack type
+# annotations. Without this, mypy skips most of our code and would NOT have
+# caught the settings.mode / run_scan(is_primary=...) crash. With it, those
+# show up as attr-defined / call-arg errors.
+check_untyped_defs = true
+# Keep the signal high: we care about real call/attribute bugs, not a
+# campaign to fully annotate the codebase.
+disallow_untyped_defs = false
+warn_unused_ignores = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# E/W = pycodestyle, F = pyflakes (undefined names, unused imports),
+# B = bugbear (likely bugs), I = import sorting, UP = pyupgrade.
+select = ["E", "F", "B", "I", "UP"]
+# Don't sweat line length — we have some long log lines and SQL strings.
+ignore = ["E501"]

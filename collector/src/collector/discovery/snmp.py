@@ -40,7 +40,7 @@ PROBE_TIMEOUT_SEC = 1.5
 PROBE_RETRIES = 0  # we iterate communities ourselves, no need to retry within pysnmp
 
 # Full poll OID set (after a working community is identified).
-DEFAULT_OIDS = [
+DEFAULT_OIDS: list[dict[str, Any]] = [
     {"name": "sysDescr",          "oid": "1.3.6.1.2.1.1.1.0"},
     {"name": "sysName",           "oid": "1.3.6.1.2.1.1.5.0"},
     {"name": "sysObjectID",       "oid": "1.3.6.1.2.1.1.2.0"},
@@ -76,8 +76,14 @@ def poll(candidate_ips: list[str]) -> list[dict[str, Any]]:
     # environments where snmp libs aren't installed.
     try:
         from pysnmp.hlapi import (
-            CommunityData, ContextData, ObjectIdentity, ObjectType,
-            SnmpEngine, UdpTransportTarget, getCmd, nextCmd,
+            CommunityData,
+            ContextData,
+            ObjectIdentity,
+            ObjectType,
+            SnmpEngine,
+            UdpTransportTarget,
+            getCmd,
+            nextCmd,
         )
     except Exception as exc:
         log.warning("pysnmp unavailable, skipping SNMP", error=str(exc))

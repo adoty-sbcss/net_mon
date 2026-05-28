@@ -13,3 +13,9 @@ config/snmp.yaml
 .idea/
 .vscode/
 .claude/
+
+# Python build artifacts
+*.egg-info/
+build/
+dist/
+__pycache__/

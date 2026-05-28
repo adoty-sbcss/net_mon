@@ -19,8 +19,9 @@ import io
 import json
 import socket
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import structlog
 
@@ -52,20 +53,20 @@ def _config_dir() -> str:
 
 
 def _today_filename() -> str:
-    return f"config_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.zip"
+    return f"config_{datetime.now(UTC).strftime('%Y-%m-%d')}.zip"
 
 
 def build_backup_zip() -> bytes:
     """Build the in-memory ZIP of config items + manifest. Returns bytes."""
     s = get_settings()
     buf = io.BytesIO()
-    manifest: dict[str, object] = {
+    manifest: dict[str, Any] = {
         "device_name": s.device_name or socket.gethostname(),
         "district": getattr(s, "district_slug", ""),
         "school": getattr(s, "school_slug", ""),
         "device": getattr(s, "device_slug", ""),
         "collector_version": __version__,
-        "backed_up_at": datetime.now(timezone.utc).isoformat(),
+        "backed_up_at": datetime.now(UTC).isoformat(),
         "files": [],
     }
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -130,7 +131,7 @@ def list_available_backups() -> list[str]:
         try:
             try:
                 entries = sftp.listdir(remote_dir)
-            except IOError:
+            except OSError:
                 return []
             backups = sorted(
                 (e for e in entries if e.startswith("config_") and e.endswith(".zip")),
