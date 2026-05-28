@@ -34,12 +34,13 @@ def run_poller() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    # Per-interface last-seen network id, so we know what was up last tick.
-    previous: dict[str, str | None] = {}
+    log.info("poller started",
+             poll_interval=settings.poll_interval,
+             rescan_interval=settings.rescan_interval)
 
     while not _stop:
         try:
-            tick(previous)
+            tick()
         except Exception as exc:  # pragma: no cover — keep loop alive
             log.exception("poller tick failed", error=str(exc))
         # Sleep in small slices so SIGTERM is handled quickly.
@@ -49,37 +50,49 @@ def run_poller() -> None:
             time.sleep(1)
 
 
-def tick(previous: dict[str, str | None]) -> None:
+def tick() -> None:
+    """Scan every active interface whose current network hasn't been scanned
+    within the rescan interval.
+
+    This single DB-backed rule does everything we need:
+      - A newly plugged-in network has no recent scan -> scanned on the next
+        tick (within poll_interval seconds of link-up).
+      - A stable network gets re-scanned once the rescan interval elapses,
+        producing fresh hourly data for the uploader to bundle.
+      - State lives in the DB (scan_runs), so a collector restart doesn't
+        reset the schedule or cause a thundering re-scan.
+
+    All interfaces with a usable IP are treated equally — the box's primary
+    uplink and any secondary connections (Wi-Fi, future VLAN sub-interfaces)
+    are each scanned on their own cadence. The primary is labeled in the
+    scan record but not scanned any differently.
+    """
     settings = get_settings()
     states = iface_mod.snapshot(exclude_prefixes=settings.exclude_prefixes)
+    primary = iface_mod.primary_interface()
 
-    seen_now: dict[str, str | None] = {}
     for st in states:
         if not st.has_usable_ip:
-            seen_now[st.name] = None
             continue
 
         net_id = _network_id(st.gateway_mac, st.primary_cidr)
-        seen_now[st.name] = net_id
-        prev = previous.get(st.name)
 
-        if prev == net_id:
-            # Same interface, same network as last tick — nothing new.
-            continue
+        # Due for a scan if this network has NOT been scanned within the
+        # rescan interval. recent_network_scan returns the most recent scan
+        # row for net_id inside the window, or None.
+        if net_id is not None:
+            recent = recent_network_scan(net_id, settings.rescan_interval)
+            if recent is not None:
+                continue  # scanned recently enough; not due yet
 
-        # Either a new interface, new network on this interface, or recovered from down.
-        # In field mode, respect cooldown to avoid hammering the same network.
-        if settings.mode == "field" and net_id is not None:
-            recent = recent_network_scan(net_id, settings.cooldown_seconds)
-            if recent:
-                log.info("skipping scan, network within cooldown",
-                         interface=st.name, network_id=net_id, last_scan=recent["id"])
-                continue
-
+        is_primary = (st.name == primary)
         log.info("triggering scan",
                  interface=st.name, cidr=st.primary_cidr,
-                 gateway=st.gateway_ip, reason="link_up_or_network_change")
-        run_scan(interface=st.name, trigger_reason="link_up", force=False)
-
-    previous.clear()
-    previous.update(seen_now)
+                 gateway=st.gateway_ip, is_primary=is_primary,
+                 reason="due_for_scan")
+        run_scan(
+            interface=st.name,
+            trigger_reason="periodic" if net_id else "link_up",
+            force=False,
+            is_primary=is_primary,
+        )

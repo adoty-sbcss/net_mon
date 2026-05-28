@@ -53,6 +53,20 @@ def get_one(name: str) -> InterfaceState | None:
     return None
 
 
+def primary_interface() -> str | None:
+    """Return the name of the interface that owns the default route.
+
+    This is the box's primary uplink — how it reaches the SFTP server and the
+    internet. Auto-detected (not configured) so it survives NIC renaming
+    across different hardware. Returns None if there's no default route yet.
+    """
+    routes = _run_ip_json(["ip", "-j", "route", "show", "default"]) or []
+    for r in routes:
+        if r.get("dev") and r.get("gateway"):
+            return r["dev"]
+    return None
+
+
 def _default_route_via(iface: str) -> tuple[str | None, str | None]:
     """Find the default gateway IP and MAC for traffic leaving `iface`."""
     routes = _run_ip_json(["ip", "-j", "route", "show", "default"]) or []

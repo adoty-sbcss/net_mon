@@ -38,7 +38,7 @@ def cmd_run() -> None:
     """Run the interface poller and the hourly SFTP uploader."""
     settings = get_settings()
     log.info("collector starting",
-             mode=settings.mode,
+             rescan_interval=settings.rescan_interval,
              poll_interval=settings.poll_interval,
              sftp_enabled=settings.sftp_enabled,
              device=uploader_mod.device_name())

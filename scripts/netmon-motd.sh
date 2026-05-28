@@ -56,8 +56,19 @@ fi
 WIZARD_STATE="not run"
 [ -f /var/lib/netmon/.wizard-done ] && WIZARD_STATE="ok"
 
+# Primary uplink (default-route interface) + how many interfaces are monitored.
+PRIMARY="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
+GW="$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')"
+IFACE_COUNT="$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $2}' \
+    | grep -Ev '^(lo|docker0|br-|veth|virbr|tun|tap)' | sort -u | wc -l)"
+
 printf '\n'
 printf '\033[1;36m NetMon\033[0m  %s\n' "$VERSION"
 [ -n "$IDENTITY" ] && printf '         %s\n' "$IDENTITY"
 printf '         %s  •  wizard: %s  •  last upload: %s\n' "$HEALTH" "$WIZARD_STATE" "$LAST_UP"
+if [ -n "$PRIMARY" ]; then
+    printf '         uplink: %s via %s  •  %s interface(s) monitored\n' "$PRIMARY" "$GW" "$IFACE_COUNT"
+else
+    printf '         \033[1;33muplink: none (no default route)\033[0m\n'
+fi
 printf '\n'

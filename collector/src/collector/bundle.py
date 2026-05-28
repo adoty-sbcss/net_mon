@@ -151,8 +151,8 @@ def _build_summary_md(
     lines.append(f"- **Completed:** {scan.get('completed_at')}")
     lines.append(f"- **Duration:** {scan.get('duration_sec')} seconds")
     lines.append(f"- **Trigger:** {scan.get('trigger_reason')}")
-    lines.append(f"- **Mode:** {scan.get('mode')}")
-    lines.append(f"- **Interface:** {scan.get('interface')}")
+    _role = "primary uplink" if scan.get("is_primary") else "secondary (monitored)"
+    lines.append(f"- **Interface:** {scan.get('interface')} ({_role})")
     lines.append(f"- **Subnet (CIDR):** {scan.get('interface_cidr')}")
     lines.append(f"- **Gateway IP:** {scan.get('gateway_ip')}")
     lines.append(f"- **Gateway MAC:** {scan.get('gateway_mac')}")

@@ -121,14 +121,13 @@ case "${1:-}" in
     snmp)          prompt_snmp_config ;;
     advanced)      prompt_advanced_config ;;
     cadence)       prompt_scan_cadence ;;
-    mode)          prompt_scan_mode ;;
     loglevel|log)  prompt_log_level ;;
     -h|--help|help)
         sed -n '2,15p' "$0" | sed 's/^# //; s/^#//'
         ;;
     *)
         echo "ERROR: unknown section: $1" >&2
-        echo "Try: identity | sftp | snmp | advanced | cadence | mode | loglevel" >&2
+        echo "Try: identity | sftp | snmp | advanced | cadence | loglevel" >&2
         exit 1
         ;;
 esac

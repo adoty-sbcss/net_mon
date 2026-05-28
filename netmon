@@ -69,6 +69,33 @@ pause_or_continue() {
 
 # --- task implementations --------------------------------------------------
 
+cmd_interfaces() {
+    printf '%s== Monitored interfaces ==%s\n' "$C_HEAD" "$C_OFF"
+    local primary
+    primary="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
+    local found=0
+    while read -r iface cidr; do
+        case "$iface" in
+            lo|docker0|br-*|veth*|virbr*|tun*|tap*) continue ;;
+        esac
+        found=1
+        if [[ "$iface" == "$primary" ]]; then
+            printf '  %b%-14s%b %-20s %bPRIMARY uplink%b\n' \
+                "$C_OK" "$iface" "$C_OFF" "$cidr" "$C_OK" "$C_OFF"
+        else
+            printf '  %-14s %-20s secondary (monitored)\n' "$iface" "$cidr"
+        fi
+    done < <(ip -o -4 addr show scope global 2>/dev/null | awk '{print $2, $4}')
+    [[ $found -eq 0 ]] && echo "  (no active interfaces with a usable IP yet)"
+    echo ""
+    if [[ -n "$primary" ]]; then
+        echo "  Default gateway: $(ip route show default | awk '/default/ {print $3; exit}') via $primary"
+    else
+        printf '  %sNo default route — this box has no uplink yet.%s\n' "$C_WARN" "$C_OFF"
+    fi
+    printf '  %sEvery interface listed is scanned on the rescan interval (hourly by default).%s\n' "$C_DIM" "$C_OFF"
+}
+
 cmd_status() {
     printf '%s== Container status ==%s\n' "$C_HEAD" "$C_OFF"
     dc ps
@@ -79,6 +106,8 @@ cmd_status() {
             | sed 's/^/  /' \
             || echo "  (no identity set — run: sudo netmon-wizard identity)"
     fi
+    echo ""
+    cmd_interfaces
     echo ""
     printf '%s== Recent scans ==%s\n' "$C_HEAD" "$C_OFF"
     if require_running 2>/dev/null; then
@@ -294,8 +323,7 @@ Configure (delegates to netmon-wizard):
   identity       Edit district/school/device labels
   sftp           Edit SFTP destination
   snmp           Edit SNMP communities
-  cadence        Edit scan cadence
-  mode           Switch field/monitor mode
+  cadence        Edit scan cadence (rescan interval / capture / poll)
   loglevel       Set log verbosity
 
 System:
@@ -311,6 +339,7 @@ System:
   config-restore Restore /etc/netmon from SFTP backup
 
 Diagnostics:
+  interfaces     List monitored interfaces (primary uplink vs secondary)
   ping [host]    Ping a host from inside the collector
   dig [name]     DNS lookup from inside the collector
 
@@ -327,19 +356,18 @@ submenu_configure() {
             menu_item 1 "Identity (district / school / device)"
             menu_item 2 "SFTP destination"
             menu_item 3 "SNMP communities"
-            menu_item 4 "Scan mode (field / monitor)"
-            menu_item 5 "Scan cadence (capture / cooldown / poll)"
-            menu_item 6 "Log verbosity"
-            menu_item 7 "Show current config (redacted)"
-            menu_item 8 "Re-run full wizard"
+            menu_item 4 "Scan cadence (rescan / capture / poll)"
+            menu_item 5 "Log verbosity"
+            menu_item 6 "Show current config (redacted)"
+            menu_item 7 "Re-run full wizard"
             menu_footer "b" "Back to main menu" "q" "Quit"
             local choice
             choice="$(menu_read)"
         else
             echo ""
             echo "Configure"
-            echo "  1) Identity   2) SFTP   3) SNMP   4) Mode   5) Cadence"
-            echo "  6) Log level  7) Show config   8) Full wizard"
+            echo "  1) Identity   2) SFTP   3) SNMP   4) Cadence"
+            echo "  5) Log level  6) Show config   7) Full wizard"
             echo "  b) Back       q) Quit"
             read -r -p "Choice: " choice || choice="q"
         fi
@@ -347,18 +375,18 @@ submenu_configure() {
             1) cmd_wizard identity ;;
             2) cmd_wizard sftp ;;
             3) cmd_wizard snmp ;;
-            4) cmd_wizard mode ;;
-            5) cmd_wizard cadence ;;
-            6) cmd_wizard loglevel ;;
-            7) cmd_config ;;
-            8) cmd_wizard ;;
+            4) cmd_wizard cadence ;;
+            5) cmd_wizard loglevel ;;
+            6) cmd_config ;;
+            7) cmd_wizard ;;
             b|B) return 0 ;;
             q|Q|exit|quit) return 99 ;;
             *) printf '%s(unknown choice: %s)%s\n' "$C_WARN" "$choice" "$C_OFF" ;;
         esac
         # After any write op, hint that a restart applies the change.
+        # (6 = show config, read-only; no restart needed.)
         case "$choice" in
-            1|2|3|4|5|6|8)
+            1|2|3|4|5|7)
                 echo ""
                 printf '%sNote:%s settings updated. Restart containers (main menu option 8) to apply.\n' \
                     "$C_INFO" "$C_OFF"
@@ -415,23 +443,25 @@ submenu_diagnostics() {
     while true; do
         if [[ $HAVE_LIB -eq 1 ]]; then
             menu_header "Diagnostics"
-            menu_item 1 "Ping a host (from inside collector)"
-            menu_item 2 "DNS lookup (dig)"
-            menu_item 3 "Run collector self-test"
+            menu_item 1 "Monitored interfaces (primary / secondary)"
+            menu_item 2 "Ping a host (from inside collector)"
+            menu_item 3 "DNS lookup (dig)"
+            menu_item 4 "Run collector self-test"
             menu_footer "b" "Back to main menu" "q" "Quit"
             local choice
             choice="$(menu_read)"
         else
             echo ""
             echo "Diagnostics"
-            echo "  1) Ping  2) DNS lookup  3) Self-test"
+            echo "  1) Interfaces  2) Ping  3) DNS lookup  4) Self-test"
             echo "  b) Back  q) Quit"
             read -r -p "Choice: " choice || choice="q"
         fi
         case "$choice" in
-            1) cmd_ping ;;
-            2) cmd_dig ;;
-            3) cmd_selftest ;;
+            1) cmd_interfaces ;;
+            2) cmd_ping ;;
+            3) cmd_dig ;;
+            4) cmd_selftest ;;
             b|B) return 0 ;;
             q|Q|exit|quit) return 99 ;;
             *) printf '%s(unknown choice: %s)%s\n' "$C_WARN" "$choice" "$C_OFF" ;;
@@ -513,8 +543,8 @@ else
         sftp)          cmd_wizard sftp ;;
         snmp)          cmd_wizard snmp ;;
         cadence)       cmd_wizard cadence ;;
-        mode)          cmd_wizard mode ;;
         loglevel|log)  cmd_wizard loglevel ;;
+        interfaces|ifaces) cmd_interfaces ;;
         selftest)      cmd_selftest ;;
         version)       cmd_version ;;
         reboot)        cmd_reboot ;;

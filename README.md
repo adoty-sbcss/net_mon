@@ -147,20 +147,54 @@ Underneath it's still `docker compose ...` — see `netmon` for the exact comman
 
 ---
 
-## 6. Two settings you might want to change
+## 6. How monitoring works (continuous, multi-interface)
 
-The two that matter most are scan mode and capture window. Both are reached from `./netmon` → **Configure ▶** → option 4 (mode) and option 5 (cadence). Or one-shot:
+NetMon continuously monitors **every active network interface** — the wired uplink, an associated Wi-Fi NIC, and (later) VLAN sub-interfaces. There's no "field" vs "monitor" mode anymore; the box always runs continuously.
+
+Each network is re-scanned on the **rescan interval** (default hourly), so there's fresh data to bundle and upload every hour. A newly plugged-in network is scanned within ~30s of link-up; a stable network is re-scanned once the interval elapses.
 
 ```bash
-sudo netmon-wizard mode       # field (one-shot per network) vs monitor (continuous)
-sudo netmon-wizard cadence    # capture seconds / poll interval / cooldown
+sudo netmon-wizard cadence    # rescan interval / capture seconds / poll tick
 ```
 
-After changing, the menu reminds you to restart (`./netmon restart`) to apply.
+`NETMON_RESCAN_INTERVAL=3600` (hourly) is the knob that controls how often each network produces a fresh scan. Lower it for near-continuous monitoring while troubleshooting; raise it to reduce load.
 
-To disable hourly uploads without removing the SFTP creds, edit `/etc/netmon/netmon.env` and set `NETMON_SFTP_ENABLED=false` (or rerun `sudo netmon-wizard sftp` and pick a fresh path — the wizard always re-enables on save).
+### Primary uplink vs secondary connections
 
-**Prefer to hand-edit anyway?** `sudo nano /etc/netmon/netmon.env`, then `./netmon restart`.
+The interface that owns the **default route** is the box's **primary uplink** — it's how the box reaches the SFTP server. It's auto-detected (no config). Everything else is a **secondary monitored** connection. See them all:
+
+```bash
+./netmon interfaces
+```
+
+```
+== Monitored interfaces ==
+  enp0s31f6      10.6.0.12/22         PRIMARY uplink
+  wlan0          192.168.50.40/24     secondary (monitored)
+
+  Default gateway: 10.6.0.1 via enp0s31f6
+```
+
+Each scan is tagged primary/secondary in its bundle so the analysis knows which network is the box's own vs. one it's watching.
+
+### Adding a Wi-Fi network as a second connection
+
+NetMon doesn't manage the Wi-Fi association itself — you connect `wlan0` at the OS level and NetMon auto-detects it and starts scanning it like any wired interface:
+
+```bash
+# Connect the Wi-Fi NIC to a network (persists across reboots)
+sudo nmcli device wifi connect "SSID-NAME" password "wifi-password"
+
+# Confirm it picked up an IP
+ip -br addr show wlan0
+
+# NetMon sees it on the next poll tick — verify:
+./netmon interfaces
+```
+
+That's it — no NetMon config needed. The new network shows up as a secondary monitored connection and gets scanned + bundled + uploaded on the same cadence as the wired uplink.
+
+To disable hourly uploads without removing the SFTP creds, set `NETMON_SFTP_ENABLED=false` in `/etc/netmon/netmon.env` and `./netmon restart`.
 
 ---
 
