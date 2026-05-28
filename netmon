@@ -96,9 +96,30 @@ cmd_interfaces() {
     printf '  %sEvery interface listed is scanned on the rescan interval (hourly by default).%s\n' "$C_DIM" "$C_OFF"
 }
 
+# Warn if the running collector image predates the checked-out collector code.
+# This is the failure that sent uploads to the SFTP root: git was updated but
+# the image was never rebuilt, so the container ran stale code that ignored the
+# identity slugs. Degrades silently (no false warning) if docker/git aren't
+# reachable.
+image_staleness_warning() {
+    local img_iso img_epoch code_epoch
+    img_iso="$(docker image inspect netmon/collector:latest --format '{{.Created}}' 2>/dev/null \
+        || sudo docker image inspect netmon/collector:latest --format '{{.Created}}' 2>/dev/null)"
+    [[ -z "$img_iso" ]] && return 0
+    img_epoch="$(date -d "$img_iso" +%s 2>/dev/null || echo 0)"
+    code_epoch="$(git log -1 --format=%ct -- collector 2>/dev/null || echo 0)"
+    if [[ "$img_epoch" -gt 0 && "$code_epoch" -gt 0 && "$code_epoch" -gt "$img_epoch" ]]; then
+        printf '%s!! collector image is OLDER than the checked-out collector code%s\n' "$C_WARN" "$C_OFF"
+        printf '   The running container is missing recent changes. Rebuild with:\n'
+        printf '     docker compose build collector && docker compose up -d collector\n'
+        printf '   (or let the nightly auto-update handle it)\n'
+    fi
+}
+
 cmd_status() {
     printf '%s== Container status ==%s\n' "$C_HEAD" "$C_OFF"
     dc ps
+    image_staleness_warning
     echo ""
     printf '%s== Identity ==%s\n' "$C_HEAD" "$C_OFF"
     if [[ -f "$NETMON_ENV_FILE" ]]; then

@@ -1,20 +1,27 @@
-"""SNMP polling with multi-community trial and per-device credential cache.
+"""SNMP polling via the net-snmp CLI tools (snmpget / snmpbulkwalk).
 
-Behavior per candidate IP:
+We shell out to net-snmp rather than use a Python SNMP library. Rationale:
+pysnmp's API has churned repeatedly — pysnmp 7.x removed the synchronous
+hlapi (`from pysnmp.hlapi import CommunityData, getCmd, ...`) the collector
+used to rely on, which silently disabled SNMP on every scan. net-snmp's CLI
+is stable, ubiquitous, and matches how the rest of the collector already
+drives proven tools (nmap, tshark, arp-scan, iw).
 
-1. Look up the device in the `snmp_credentials` table.
-   - If we have a cached community, try that first. On success, poll OIDs.
-   - On failure with the cached community, fall through to step 2 and
-     re-trial — the operator may have rotated the string.
-2. Iterate NETMON_SNMP_COMMUNITIES in order. First one that responds wins.
-3. On success, persist the working community to the cache so future scans
-   skip the trial. On total failure, record a failure so backoff kicks in.
+Behavior per candidate IP (unchanged from before):
+1. Look up the device in snmp_credentials. If a community is cached, try it
+   first. If it no longer works, re-trial.
+2. Otherwise trial each configured community (NETMON_SNMP_COMMUNITIES) with a
+   quick sysDescr GET. First to respond wins.
+3. Cache the winning community so future scans skip the trial. On total
+   failure, record it and back off for 24h after enough consecutive misses.
 
-We deliberately keep the candidate list small (gateway + LLDP mgmt IPs by
-default) so a fresh box doesn't take 5 minutes blasting SNMP at every host.
+The candidate set is kept small (gateway + LLDP mgmt IPs + network-vendor
+OUIs — see scan.py::_snmp_candidates) so the trial stays fast.
 """
 from __future__ import annotations
 
+import shutil
+import subprocess
 import time
 from typing import Any
 
@@ -31,26 +38,39 @@ log = structlog.get_logger(__name__)
 
 # After this many consecutive failures, skip the device for a while.
 MAX_FAILURES_BEFORE_BACKOFF = 5
-# Backoff in seconds — we won't re-attempt a device that's hit MAX_FAILURES
-# until at least this much wall-clock time has passed since the last attempt.
 BACKOFF_SECONDS = 24 * 3600  # 24h
 
-# Per-attempt probe budget. Trial is sysDescr only — short and cheap.
-PROBE_TIMEOUT_SEC = 1.5
-PROBE_RETRIES = 0  # we iterate communities ourselves, no need to retry within pysnmp
+# net-snmp -t (timeout secs per try) / -r (retries). Trial is cheap; the full
+# poll gets a slightly longer budget since tables can be large.
+PROBE_TIMEOUT = "1"
+PROBE_RETRIES = "1"
+POLL_TIMEOUT = "3"
+POLL_RETRIES = "1"
 
-# Full poll OID set (after a working community is identified).
-DEFAULT_OIDS: list[dict[str, Any]] = [
-    {"name": "sysDescr",          "oid": "1.3.6.1.2.1.1.1.0"},
-    {"name": "sysName",           "oid": "1.3.6.1.2.1.1.5.0"},
-    {"name": "sysObjectID",       "oid": "1.3.6.1.2.1.1.2.0"},
-    {"name": "sysLocation",       "oid": "1.3.6.1.2.1.1.6.0"},
-    {"name": "sysContact",        "oid": "1.3.6.1.2.1.1.4.0"},
-    {"name": "ifTable",           "oid": "1.3.6.1.2.1.2.2",     "walk": True},
-    {"name": "ipNetToMediaTable", "oid": "1.3.6.1.2.1.4.22",    "walk": True},
-    {"name": "dot1dTpFdbTable",   "oid": "1.3.6.1.2.1.17.4.3",  "walk": True},
-    {"name": "dot1dStpPortTable", "oid": "1.3.6.1.2.1.17.2.15", "walk": True},
+SYSDESCR_OID = "1.3.6.1.2.1.1.1.0"
+
+# (name, oid, is_walk)
+DEFAULT_OIDS: list[tuple[str, str, bool]] = [
+    ("sysDescr",          "1.3.6.1.2.1.1.1.0",  False),
+    ("sysName",           "1.3.6.1.2.1.1.5.0",  False),
+    ("sysObjectID",       "1.3.6.1.2.1.1.2.0",  False),
+    ("sysLocation",       "1.3.6.1.2.1.1.6.0",  False),
+    ("sysContact",        "1.3.6.1.2.1.1.4.0",  False),
+    ("ifTable",           "1.3.6.1.2.1.2.2",    True),
+    ("ipNetToMediaTable", "1.3.6.1.2.1.4.22",   True),
+    ("dot1dTpFdbTable",   "1.3.6.1.2.1.17.4.3", True),
+    ("dot1dStpPortTable", "1.3.6.1.2.1.17.2.15", True),
 ]
+
+# Lines net-snmp emits for absent objects — we skip these when parsing walks.
+_SKIP_MARKERS = (
+    "No Such Object",
+    "No Such Instance",
+    "No more variables",
+    "End of MIB",
+    "Timeout",
+    "No Response",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -59,63 +79,28 @@ DEFAULT_OIDS: list[dict[str, Any]] = [
 
 
 def poll(candidate_ips: list[str]) -> list[dict[str, Any]]:
-    """Try SNMP against each candidate IP. Returns flat list of poll rows."""
+    """Try SNMP against each candidate IP. Returns a flat list of poll rows."""
     settings = get_settings()
     if not settings.snmp_enabled:
         return []
 
     communities = list(settings.snmp_community_list)
-    if not communities:
-        log.info("snmp enabled but no communities configured, skipping")
+    if not communities or not candidate_ips:
         return []
 
-    if not candidate_ips:
+    if shutil.which("snmpget") is None or shutil.which("snmpbulkwalk") is None:
+        log.warning("net-snmp tools not found in container (snmpget/snmpbulkwalk); "
+                    "skipping SNMP — ensure the 'snmp' apt package is installed")
         return []
 
-    # pysnmp import is deferred so the rest of the system still works in
-    # environments where snmp libs aren't installed.
-    try:
-        from pysnmp.hlapi import (
-            CommunityData,
-            ContextData,
-            ObjectIdentity,
-            ObjectType,
-            SnmpEngine,
-            UdpTransportTarget,
-            getCmd,
-            nextCmd,
-        )
-    except Exception as exc:
-        log.warning("pysnmp unavailable, skipping SNMP", error=str(exc))
-        return []
-
-    engine = SnmpEngine()
     out: list[dict[str, Any]] = []
-
     for ip in candidate_ips:
-        community = _select_community(
-            ip, communities,
-            SnmpEngine=SnmpEngine, CommunityData=CommunityData,
-            ContextData=ContextData, ObjectIdentity=ObjectIdentity,
-            ObjectType=ObjectType, UdpTransportTarget=UdpTransportTarget,
-            getCmd=getCmd, engine=engine,
-        )
+        community = _select_community(ip, communities)
         if community is None:
             continue
+        out.extend(_poll_oids(ip, community))
 
-        # We have a working community — do the full poll.
-        rows = _poll_oids(
-            ip, community, DEFAULT_OIDS,
-            CommunityData=CommunityData, ContextData=ContextData,
-            ObjectIdentity=ObjectIdentity, ObjectType=ObjectType,
-            UdpTransportTarget=UdpTransportTarget,
-            getCmd=getCmd, nextCmd=nextCmd, engine=engine,
-        )
-        out.extend(rows)
-
-    log.info("snmp poll complete",
-             candidates=len(candidate_ips),
-             rows=len(out))
+    log.info("snmp poll complete", candidates=len(candidate_ips), rows=len(out))
     return out
 
 
@@ -124,137 +109,104 @@ def poll(candidate_ips: list[str]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def _select_community(
-    ip: str,
-    communities: list[str],
-    *,
-    SnmpEngine, CommunityData, ContextData, ObjectIdentity, ObjectType,
-    UdpTransportTarget, getCmd, engine,
-) -> str | None:
+def _select_community(ip: str, communities: list[str]) -> str | None:
     """Return a community known to work for `ip`, or None if nothing works."""
     cached = get_snmp_credential(ip)
 
-    # Backoff: skip if we've failed too many times recently.
-    if cached and cached.get("community") is None and cached.get("failure_count", 0) >= MAX_FAILURES_BEFORE_BACKOFF:
+    # Backoff: skip devices that have failed too many times recently.
+    if (cached and cached.get("community") is None
+            and cached.get("failure_count", 0) >= MAX_FAILURES_BEFORE_BACKOFF):
         last = cached.get("last_attempt_at")
-        if last is not None:
-            age = time.time() - last.timestamp()
-            if age < BACKOFF_SECONDS:
-                log.debug("snmp backoff active, skipping device", ip=ip,
-                          failures=cached["failure_count"], age_seconds=int(age))
-                return None
+        if last is not None and (time.time() - last.timestamp()) < BACKOFF_SECONDS:
+            log.debug("snmp backoff active, skipping device", ip=ip,
+                      failures=cached["failure_count"])
+            return None
 
-    # 1. Try the cached community first.
+    # 1. Cached community first.
     if cached and cached.get("community"):
-        if _probe(ip, cached["community"],
-                  CommunityData=CommunityData, ContextData=ContextData,
-                  ObjectIdentity=ObjectIdentity, ObjectType=ObjectType,
-                  UdpTransportTarget=UdpTransportTarget,
-                  getCmd=getCmd, engine=engine):
-            log.debug("snmp cache hit", ip=ip, community=cached["community"])
+        if _probe(ip, cached["community"]):
+            log.debug("snmp cache hit", ip=ip)
             record_snmp_success(ip, cached["community"], cached.get("version") or "2c")
-            return cached["community"]
-        else:
-            log.info("snmp cached community no longer works, re-trialing",
-                     ip=ip, community=cached["community"])
+            return str(cached["community"])
+        log.info("snmp cached community no longer works, re-trialing", ip=ip)
 
-    # 2. Trial through the configured list.
+    # 2. Trial the configured list.
     for community in communities:
-        # Skip re-trying the cached one (already failed above).
         if cached and community == cached.get("community"):
-            continue
-        if _probe(ip, community,
-                  CommunityData=CommunityData, ContextData=ContextData,
-                  ObjectIdentity=ObjectIdentity, ObjectType=ObjectType,
-                  UdpTransportTarget=UdpTransportTarget,
-                  getCmd=getCmd, engine=engine):
-            log.info("snmp community matched", ip=ip, community=community)
+            continue  # already failed above
+        if _probe(ip, community):
+            log.info("snmp community matched", ip=ip)
             record_snmp_success(ip, community, "2c")
             return community
 
-    # 3. Nothing worked — remember the failure.
+    # 3. Nothing worked.
     log.info("snmp all communities failed", ip=ip, tried=len(communities))
     record_snmp_failure(ip)
     return None
 
 
-def _probe(
-    ip: str, community: str,
-    *,
-    CommunityData, ContextData, ObjectIdentity, ObjectType,
-    UdpTransportTarget, getCmd, engine,
-) -> bool:
-    """Single short sysDescr GET. True if we get a non-error response."""
-    try:
-        iterator = getCmd(
-            engine,
-            CommunityData(community, mpModel=1),  # v2c
-            UdpTransportTarget((ip, 161),
-                               timeout=PROBE_TIMEOUT_SEC,
-                               retries=PROBE_RETRIES),
-            ContextData(),
-            ObjectType(ObjectIdentity("1.3.6.1.2.1.1.1.0")),  # sysDescr
-        )
-        err_indication, err_status, _err_idx, varbinds = next(iterator)
-        if err_indication or err_status:
-            return False
-        return bool(varbinds)
-    except StopIteration:
+def _probe(ip: str, community: str) -> bool:
+    """Quick sysDescr GET. True if the agent answers with a real value."""
+    rc, out = _run_snmp([
+        "snmpget", "-v2c", "-c", community,
+        "-t", PROBE_TIMEOUT, "-r", PROBE_RETRIES,
+        "-Oqv", ip, SYSDESCR_OID,
+    ])
+    if rc != 0:
         return False
-    except Exception as exc:
-        log.debug("snmp probe exception", ip=ip, error=str(exc))
+    text = out.strip()
+    if not text:
         return False
+    return not any(marker in text for marker in _SKIP_MARKERS)
 
 
 # ---------------------------------------------------------------------------
-# OID polling once we know the community
+# OID polling
 # ---------------------------------------------------------------------------
 
 
-def _poll_oids(
-    ip: str, community: str, oids: list[dict[str, Any]],
-    *,
-    CommunityData, ContextData, ObjectIdentity, ObjectType,
-    UdpTransportTarget, getCmd, nextCmd, engine,
-) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
-    for entry in oids:
-        name = entry.get("name") or entry["oid"]
-        oid = entry["oid"]
-        walk = bool(entry.get("walk"))
-        try:
-            if walk:
-                iterator = nextCmd(
-                    engine,
-                    CommunityData(community, mpModel=1),
-                    UdpTransportTarget((ip, 161), timeout=3, retries=1),
-                    ContextData(),
-                    ObjectType(ObjectIdentity(oid)),
-                    lexicographicMode=False,
-                )
-            else:
-                iterator = getCmd(
-                    engine,
-                    CommunityData(community, mpModel=1),
-                    UdpTransportTarget((ip, 161), timeout=3, retries=1),
-                    ContextData(),
-                    ObjectType(ObjectIdentity(oid)),
-                )
-            for err_indication, err_status, _err_idx, varbinds in iterator:
-                if err_indication or err_status:
-                    log.debug("snmp poll error",
-                              ip=ip, oid=name,
-                              indication=str(err_indication),
-                              status=str(err_status))
-                    break
-                for vb in varbinds:
-                    results.append({
-                        "device_ip": ip,
-                        "oid":       str(vb[0]),
-                        "oid_name":  name,
-                        "value":     str(vb[1]),
-                    })
-        except Exception as exc:
-            log.debug("snmp poll exception", ip=ip, oid=name, error=str(exc))
+def _poll_oids(ip: str, community: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for name, oid, is_walk in DEFAULT_OIDS:
+        tool = "snmpbulkwalk" if is_walk else "snmpget"
+        rc, out = _run_snmp([
+            tool, "-v2c", "-c", community,
+            "-t", POLL_TIMEOUT, "-r", POLL_RETRIES,
+            "-Oqn", ip, oid,   # -O q (no type/'=') n (numeric OIDs) => "<oid> <value>"
+        ])
+        if rc != 0:
             continue
-    return results
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or any(marker in line for marker in _SKIP_MARKERS):
+                continue
+            # -Oqn output is "<numeric-oid> <value>"; value may contain spaces.
+            parts = line.split(" ", 1)
+            if len(parts) != 2:
+                continue
+            oid_str, value = parts[0], parts[1]
+            rows.append({
+                "device_ip": ip,
+                "oid": oid_str,
+                "oid_name": name,
+                "value": value,
+            })
+    return rows
+
+
+def _run_snmp(cmd: list[str]) -> tuple[int, str]:
+    """Run a net-snmp command. Returns (returncode, stdout+stderr).
+
+    Wrong community on SNMPv2c usually yields no response (the agent silently
+    drops it), so a bad community surfaces as a non-zero exit / timeout rather
+    than an auth error.
+    """
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30, check=False,
+        )
+    except FileNotFoundError:
+        return 1, f"{cmd[0]} not found"
+    except subprocess.TimeoutExpired:
+        return 1, "timeout"
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")

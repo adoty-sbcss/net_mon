@@ -15,9 +15,12 @@ dependencies = [
     "structlog>=24.1",
     "pyyaml>=6.0",
     "manuf>=1.1",
-    "pysnmp>=5.0",
     "paramiko>=3.4",
 ]
+# Note: SNMP is handled by shelling out to the net-snmp CLI (snmpget /
+# snmpbulkwalk, installed via the `snmp` apt package in the Dockerfile),
+# not a Python library. pysnmp was removed because its 7.x release dropped
+# the synchronous hlapi API the collector relied on.
 
 [project.optional-dependencies]
 # Tools the CI guard installs. `pip install -e .[dev]` gets you the same
@@ -35,8 +38,8 @@ where = ["src"]
 
 [tool.mypy]
 python_version = "3.11"
-# Third-party libs (psycopg, structlog, pysnmp, paramiko, manuf, ...) ship
-# without type stubs; don't fail on their missing imports.
+# Third-party libs (psycopg, structlog, paramiko, manuf, ...) ship without
+# type stubs; don't fail on their missing imports.
 ignore_missing_imports = true
 # THE important one: check the bodies of functions even when they lack type
 # annotations. Without this, mypy skips most of our code and would NOT have

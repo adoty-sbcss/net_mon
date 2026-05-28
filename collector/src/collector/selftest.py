@@ -90,6 +90,7 @@ def _check_tool_versions() -> CheckResult:
         "arp-scan":  ["arp-scan", "--version"],
         "lldpcli":   ["lldpcli", "-v"],
         "ip":        ["ip", "-V"],
+        "snmpget":   ["snmpget", "--version"],
     }
     missing: list[str] = []
     versions: list[str] = []
