@@ -52,7 +52,7 @@ def cmd_run() -> None:
     # because some failures (e.g. no interface with carrier yet) are normal
     # at boot and resolve once a cable is plugged in.
     selftest_mod.log_results(selftest_mod.run_all())
-    audit("collector_started", mode=settings.mode,
+    audit("collector_started", rescan_interval=settings.rescan_interval,
           sftp_enabled=settings.sftp_enabled,
           device=uploader_mod.device_name())
     uploader_mod.start_in_background()
@@ -65,7 +65,10 @@ def cmd_run() -> None:
 def cmd_scan(interface: str, reason: str) -> None:
     """Run a one-off scan on INTERFACE."""
     wait_for_db()
-    scan_id = run_scan(interface=interface, trigger_reason=reason, force=True)
+    from .discovery import interfaces as iface_mod
+    is_primary = (interface == iface_mod.primary_interface())
+    scan_id = run_scan(interface=interface, trigger_reason=reason, force=True,
+                       is_primary=is_primary)
     if scan_id is None:
         click.echo("scan did not run", err=True)
         sys.exit(2)

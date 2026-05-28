@@ -26,7 +26,8 @@ def _network_id(gateway_mac: str | None, cidr: str | None) -> str | None:
     return hashlib.sha256(f"{gateway_mac or 'no-gw'}|{cidr}".encode()).hexdigest()[:16]
 
 
-def run_scan(*, interface: str, trigger_reason: str, force: bool) -> int | None:
+def run_scan(*, interface: str, trigger_reason: str, force: bool,
+             is_primary: bool = False) -> int | None:
     """Run a single scan against `interface`. Returns the scan id on success."""
     settings = get_settings()
 
@@ -41,7 +42,11 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool) -> int | None:
         return None
 
     net_id = _network_id(state.gateway_mac, state.primary_cidr)
-    if not force and settings.mode == "field" and net_id:
+    # Anti-flap floor: even though the poller already gates on rescan_interval,
+    # refuse to scan the same network twice within cooldown_seconds. Protects
+    # against link flaps and a manual scan colliding with a periodic one.
+    # `force=True` (manual `./netmon scan`) bypasses it.
+    if not force and net_id:
         recent = recent_network_scan(net_id, settings.cooldown_seconds)
         if recent:
             log.info("cooldown active, skipping", network_id=net_id, last_scan=recent["id"])
@@ -54,7 +59,7 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool) -> int | None:
         gateway_ip=state.gateway_ip,
         gateway_mac=state.gateway_mac,
         network_id=net_id,
-        mode=settings.mode,
+        is_primary=is_primary,
     )
     log.info("scan started",
              scan_id=scan_id, interface=state.name,

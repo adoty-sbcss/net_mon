@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -16,9 +15,14 @@ class Settings(BaseSettings):
     postgres_password: str = Field(default="netmon", alias="POSTGRES_PASSWORD")
     postgres_db: str = Field(default="netmon", alias="POSTGRES_DB")
 
-    mode: Literal["field", "monitor"] = Field(default="field", alias="NETMON_MODE")
     capture_seconds: int = Field(default=60, alias="NETMON_CAPTURE_SECONDS")
     poll_interval: int = Field(default=30, alias="NETMON_POLL_INTERVAL")
+    # The poller re-scans any active interface whose network hasn't been
+    # scanned within this window. Covers both link-up (no prior scan) and
+    # periodic re-scan of a stable network. Replaces the old field/monitor mode.
+    rescan_interval: int = Field(default=3600, alias="NETMON_RESCAN_INTERVAL")
+    # Anti-flap floor only: never scan the same network twice within this many
+    # seconds, even if something asks. Much smaller than rescan_interval.
     cooldown_seconds: int = Field(default=300, alias="NETMON_COOLDOWN_SECONDS")
     exclude_ifaces: str = Field(
         default="lo,docker0,br-,veth,virbr,tun,tap",

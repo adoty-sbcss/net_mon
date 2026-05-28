@@ -52,7 +52,7 @@ def insert_scan_run(
     gateway_ip: str | None,
     gateway_mac: str | None,
     network_id: str | None,
-    mode: str,
+    is_primary: bool = False,
 ) -> int:
     s = get_settings()
     with connect() as conn:
@@ -61,14 +61,14 @@ def insert_scan_run(
                 """
                 INSERT INTO scan_runs (
                     trigger_reason, interface, interface_cidr,
-                    gateway_ip, gateway_mac, network_id, mode,
+                    gateway_ip, gateway_mac, network_id, is_primary,
                     district_slug, school_slug, device_slug
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (trigger_reason, interface, interface_cidr, gateway_ip,
-                 gateway_mac, network_id, mode,
+                 gateway_mac, network_id, is_primary,
                  s.district_slug or None,
                  s.school_slug or None,
                  s.device_slug or None),

@@ -15,7 +15,12 @@ CREATE TABLE IF NOT EXISTS scan_runs (
     gateway_mac     MACADDR,
     network_id      TEXT,
     duration_sec    INTEGER,
-    mode            TEXT NOT NULL DEFAULT 'field',
+    -- `mode` is retained for backward compatibility with old rows; field/monitor
+    -- modes were removed in favor of continuous rescan-interval monitoring.
+    mode            TEXT NOT NULL DEFAULT 'continuous',
+    -- True when this interface is the box's own default-route uplink; false
+    -- for secondary networks the box is monitoring (Wi-Fi, VLAN sub-ifaces).
+    is_primary      BOOLEAN NOT NULL DEFAULT FALSE,
     notes           TEXT,
     error           TEXT,
     -- Box identity, populated from NETMON_*_SLUG env vars. Nullable so a
