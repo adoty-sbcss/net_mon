@@ -45,6 +45,28 @@ class Settings(BaseSettings):
     # large fabric. Stops cleanly when the budget is reached.
     snmp_topology_time_budget: int = Field(default=60, alias="NETMON_SNMP_TOPOLOGY_TIME_BUDGET")
 
+    # --- DNS health probes ---
+    # Per scan, query each test name against each resolver (public + DHCP).
+    dns_enabled: bool = Field(default=True, alias="NETMON_DNS_ENABLED")
+    # Comma-separated public resolvers — measures the box's path to upstream DNS.
+    dns_public_resolvers: str = Field(
+        default="1.1.1.1,8.8.8.8,9.9.9.9",
+        alias="NETMON_DNS_PUBLIC_RESOLVERS",
+    )
+    # Comma-separated test names. Keep small; ~4 names × ~5 resolvers/scan.
+    dns_test_names: str = Field(
+        default="google.com,microsoft.com,cloudflare.com,sbcss.k12.ca.us",
+        alias="NETMON_DNS_TEST_NAMES",
+    )
+    # Per-query timeout (seconds). dig +time=N +tries=1.
+    dns_timeout_sec: int = Field(default=2, alias="NETMON_DNS_TIMEOUT_SEC")
+    # Send a unique nonexistent name per scan to catch resolvers that rewrite
+    # NXDOMAIN to an ad/filter page.
+    dns_include_nxdomain_probe: bool = Field(
+        default=True,
+        alias="NETMON_DNS_INCLUDE_NXDOMAIN_PROBE",
+    )
+
     sftp_enabled: bool = Field(default=False, alias="NETMON_SFTP_ENABLED")
     sftp_host: str = Field(default="", alias="NETMON_SFTP_HOST")
     sftp_port: int = Field(default=22, alias="NETMON_SFTP_PORT")

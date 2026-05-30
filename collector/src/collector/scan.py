@@ -9,6 +9,7 @@ import structlog
 from .config import get_settings
 from .db import complete_scan_run, insert_many, insert_scan_run, recent_network_scan
 from .discovery import arp as arp_mod
+from .discovery import dns_health as dns_mod
 from .discovery import interfaces as iface_mod
 from .discovery import lldp as lldp_mod
 from .discovery import nmap as nmap_mod
@@ -146,6 +147,16 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
             except Exception as exc:  # pragma: no cover — defensive
                 log.warning("snmp topology crawl failed", error=str(exc))
 
+        # 7c. DNS health probes. Cheap (~1s of UDP), runs every scan when
+        # enabled. Measures path to public DNS *and* whatever the DHCP/static
+        # config gave us, so we can spot ISP DNS issues and resolver hijacking.
+        dns_results: list[dns_mod.DnsProbeResult] = []
+        if settings.dns_enabled:
+            try:
+                dns_results = dns_mod.probe_all()
+            except Exception as exc:  # pragma: no cover — defensive
+                log.warning("dns probes failed", error=str(exc))
+
         # 8. Persist everything
         _persist(
             ctx,
@@ -157,6 +168,7 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
             nmap_results=nmap_results,
             snmp_results=snmp_results,
             topology=topology,
+            dns_results=dns_results,
         )
 
     except Exception as exc:
@@ -237,6 +249,7 @@ def _persist(
     nmap_results: list[dict[str, Any]],
     snmp_results: list[dict[str, Any]],
     topology: dict[str, Any] | None = None,
+    dns_results: list[dns_mod.DnsProbeResult] | None = None,
 ) -> None:
     # Devices: merge unique by (ip, mac), recording the discovery source.
     seen: dict[tuple[str | None, str | None], dict[str, Any]] = {}
@@ -338,6 +351,26 @@ def _persist(
             topology.get("nodes", []),
             topology.get("edges", []),
         )
+
+    # DNS health probe rows. Per-(resolver, query_name), recorded as one row
+    # each so the dashboard / Claude can group by resolver_source.
+    if dns_results:
+        insert_many("dns_probes", [
+            {
+                "scan_run_id": ctx.scan_id,
+                "resolver_ip": r.resolver_ip,
+                "resolver_source": r.resolver_source,
+                "query_name": r.query_name,
+                "query_type": r.query_type,
+                "expected_status": r.expected_status,
+                "status": r.status,
+                "query_time_ms": r.query_time_ms,
+                "answer_count": r.answer_count,
+                "answers_text": r.answers_text,
+                "error": r.error,
+            }
+            for r in dns_results
+        ])
 
 
 def _looks_like_mac(s: str | None) -> bool:

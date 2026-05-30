@@ -110,9 +110,11 @@ def _scan_payload(scan_id: int) -> dict[str, str]:
     findings = fetch_table_for_scan("findings", scan_id)
     topo_nodes = fetch_table_for_scan("topology_nodes", scan_id)
     topo_edges = fetch_table_for_scan("topology_edges", scan_id)
+    dns = fetch_table_for_scan("dns_probes", scan_id)
 
     return {
-        "summary.md": _build_summary_md(scan, devices, neighbors, arp, dhcp, stp, traffic, snmp, findings),
+        "summary.md": _build_summary_md(scan, devices, neighbors, arp, dhcp, stp,
+                                        traffic, snmp, findings, dns),
         "findings.json": _jsonify(findings),
         "topology.json": json.dumps(_build_topology(scan, devices, neighbors, arp),
                                     indent=2, default=_default),
@@ -127,6 +129,8 @@ def _scan_payload(scan_id: int) -> dict[str, str]:
                                    indent=2, default=_default),
         "timeline.json": json.dumps(_build_timeline(dhcp, stp),
                                     indent=2, default=_default),
+        "dns_health.json": json.dumps(_build_dns_health(dns),
+                                      indent=2, default=_default),
         "raw/scan.json": _jsonify(scan),
         "raw/lldp-neighbors.json": _jsonify(neighbors),
         "raw/arp-table.json": _jsonify(arp),
@@ -136,6 +140,7 @@ def _scan_payload(scan_id: int) -> dict[str, str]:
         "raw/snmp-topology-nodes.json": _jsonify(topo_nodes),
         "raw/snmp-topology-edges.json": _jsonify(topo_edges),
         "raw/traffic-stats.json": _jsonify(traffic),
+        "raw/dns-probes.json": _jsonify(dns),
     }
 
 
@@ -154,6 +159,7 @@ def _build_summary_md(
     traffic: list[dict[str, Any]],
     snmp: list[dict[str, Any]],
     findings: list[dict[str, Any]],
+    dns: list[dict[str, Any]],
 ) -> str:
     lines = []
     lines.append(f"# NetMon scan #{scan['id']}")
@@ -178,6 +184,7 @@ def _build_summary_md(
     lines.append(f"- DHCP messages observed: **{len(dhcp)}**")
     lines.append(f"- STP events: **{len(stp)}**")
     lines.append(f"- SNMP rows: **{len(snmp)}**")
+    lines.append(f"- DNS probes: **{len(dns)}**")
     lines.append(f"- Pre-built findings: **{len(findings)}**")
     lines.append("")
 
@@ -212,6 +219,22 @@ def _build_summary_md(
         lines.append(f"- Multicast: {mp:,} ({mp_pct:.2f}% of capture, {mpps:.2f} pps)")
         lines.append(f"- RX packets (kernel-accepted): {rxp:,} ({t.get('rx_bytes', 0):,} bytes)")
         lines.append(f"- RX errors: {t.get('rx_errors', 0):,}  /  RX dropped: {t.get('rx_dropped', 0):,}")
+        lines.append("")
+
+    if dns:
+        # Per-resolver rollup: mean latency, status mix, NXDOMAIN-rewrite flag.
+        agg = _aggregate_dns(dns)
+        lines.append("## DNS health")
+        lines.append("")
+        lines.append("| Resolver | Source | Probes | OK | Errors | Mean ms | NXDOMAIN rewrite? |")
+        lines.append("|---|---|---:|---:|---:|---:|---|")
+        for row in agg:
+            lines.append(
+                f"| {row['resolver_ip']} | {row['resolver_source']} | "
+                f"{row['probes']} | {row['ok']} | {row['errors']} | "
+                f"{row['mean_ms']:.0f} | "
+                f"{'YES' if row['nxdomain_rewrite'] else 'no'} |"
+            )
         lines.append("")
 
     if dhcp:
@@ -383,6 +406,60 @@ def _build_metrics(traffic: list[dict[str, Any]], dhcp: list[dict[str, Any]],
         "multicast_pct_of_observed": round((100 * mp / total), 4) if total else 0.0,
         "dhcp_count": len(dhcp),
         "stp_event_count": len(stp),
+    }
+
+
+def _aggregate_dns(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-resolver rollup over a scan's dns_probes rows.
+
+    NXDOMAIN-rewrite detection: any probe with expected_status='NXDOMAIN' that
+    came back as NOERROR with answers is a likely ad/filter rewrite — the
+    name was a random ".invalid" the resolver couldn't possibly know.
+    """
+    by_resolver: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in rows:
+        key = (str(r.get("resolver_ip") or ""), str(r.get("resolver_source") or ""))
+        entry = by_resolver.setdefault(key, {
+            "resolver_ip": key[0],
+            "resolver_source": key[1],
+            "probes": 0,
+            "ok": 0,
+            "errors": 0,
+            "latencies": [],
+            "nxdomain_rewrite": False,
+        })
+        entry["probes"] += 1
+        status = r.get("status") or ""
+        if status == "NOERROR":
+            entry["ok"] += 1
+        elif status == "NXDOMAIN":
+            # NXDOMAIN itself is a valid answer; not counted as error.
+            pass
+        else:
+            entry["errors"] += 1
+        qt = r.get("query_time_ms")
+        if isinstance(qt, int):
+            entry["latencies"].append(qt)
+        if (r.get("expected_status") == "NXDOMAIN"
+                and status == "NOERROR"
+                and (r.get("answer_count") or 0) > 0):
+            entry["nxdomain_rewrite"] = True
+
+    out: list[dict[str, Any]] = []
+    for entry in by_resolver.values():
+        latencies = entry.pop("latencies")
+        entry["mean_ms"] = (sum(latencies) / len(latencies)) if latencies else 0.0
+        out.append(entry)
+    out.sort(key=lambda e: (e["resolver_source"], e["resolver_ip"]))
+    return out
+
+
+def _build_dns_health(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Structured DNS health payload for dns_health.json in the bundle."""
+    return {
+        "probe_count": len(rows),
+        "by_resolver": _aggregate_dns(rows),
+        "probes": rows,
     }
 
 

@@ -91,6 +91,7 @@ def _check_tool_versions() -> CheckResult:
         "lldpcli":   ["lldpcli", "-v"],
         "ip":        ["ip", "-V"],
         "snmpget":   ["snmpget", "--version"],
+        "dig":       ["dig", "-v"],
     }
     missing: list[str] = []
     versions: list[str] = []

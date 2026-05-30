@@ -20,8 +20,11 @@ files into a Claude conversation, then send the prompt below.
 - **metrics.json** — Interface counter deltas and broadcast/multicast
   rates over the capture window.
 - **timeline.json** — Ordered events captured during the scan.
+- **dns_health.json** — Per-resolver DNS probe results: status, latency,
+  answers. Includes a unique NXDOMAIN probe to detect resolvers that
+  rewrite bogus names to an ad/filter page.
 - **raw/** — Underlying tool outputs (lldp neighbors, arp table, dhcp
-  observations, stp events, snmp polls, interface state).
+  observations, stp events, snmp polls, dns probes, interface state).
 
 ## Prompt — paste this into Claude
 
@@ -59,11 +62,22 @@ files into a Claude conversation, then send the prompt below.
 >      (present in `topology_nodes` with `source: 'lldp'` but no mgmt_ips
 >      that responded to a community). These are visibility gaps worth
 >      fixing.
-> 5. Rank findings by severity and confidence. Tell me which are
+> 5. Walk `dns_health.json` if present:
+>    - Per `by_resolver`, compare mean latency between `public` and
+>      `dhcp` resolvers — a DHCP-assigned resolver that's much slower
+>      than the public ones is a likely user-pain culprit.
+>    - Flag any `nxdomain_rewrite: true` resolver — that's the ISP/DNS
+>      filter rewriting NXDOMAIN to an ad/portal page.
+>    - Diff the `answers_text` for the same `query_name` across
+>      resolvers. Disagreement is split-horizon DNS, hijacking, or a
+>      misconfigured internal zone.
+>    - Surface high `errors` counts (SERVFAIL/TIMEOUT) per resolver
+>      and call out which.
+> 6. Rank findings by severity and confidence. Tell me which are
 >    *definite* from the evidence and which are *suggestive*.
-> 6. For each finding, cite the file and field in the bundle that
+> 7. For each finding, cite the file and field in the bundle that
 >    supports it.
-> 7. End with a short list of follow-up checks I should run on the
+> 8. End with a short list of follow-up checks I should run on the
 >    physical network or with elevated tooling (SNMP, switch CLI, packet
 >    capture targets).
 >
@@ -95,9 +109,9 @@ to the configured SFTP server at the top of the hour.
 - **README.md** — This file. Use the prompt below.
 - **scans/scan_<id>/** — Per-scan data. Each folder contains:
   - `summary.md`, `findings.json`, `topology.json`, `devices.csv`,
-    `metrics.json`, `timeline.json`
+    `metrics.json`, `timeline.json`, `dns_health.json`
   - `raw/` — underlying tool outputs (LLDP, ARP, DHCP, STP, SNMP,
-    nmap, interface state)
+    nmap, DNS probes, interface state)
 
 ## Prompt — paste this into Claude
 
@@ -128,9 +142,17 @@ to the configured SFTP server at the top of the hour.
 >      native VLAN)
 >    - **Unusual hosts** (vendor OUI mismatches, unexpected devices)
 >    - **Interface health** (high error/drop counts, asymmetric flow)
-> 5. Rank findings by severity and confidence (definite vs.
+> 5. Walk each scan's `dns_health.json`:
+>    - Compare per-resolver mean latency. Flag DHCP-assigned resolvers
+>      noticeably slower than the public ones (1.1.1.1/8.8.8.8/9.9.9.9).
+>    - Flag `nxdomain_rewrite: true` — ISP/filter is rewriting NXDOMAIN.
+>    - Diff `answers_text` for the same `query_name` across resolvers;
+>      disagreement is split-horizon or hijacking.
+>    - Track DNS error rates across the hour. A resolver going from
+>      clean to SERVFAIL/TIMEOUT mid-hour is a real incident.
+> 6. Rank findings by severity and confidence (definite vs.
 >    suggestive). Cite the scan id and file that supports each finding.
-> 6. End with a short list of follow-up checks (SNMP polls, switch
+> 7. End with a short list of follow-up checks (SNMP polls, switch
 >    CLI, longer captures, specific MACs to track).
 >
 > If a scan is missing data or looks truncated, say so.

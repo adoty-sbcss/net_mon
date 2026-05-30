@@ -169,7 +169,7 @@ def fetch_table_for_scan(table: str, scan_id: int) -> list[dict[str, Any]]:
     allowed = {
         "devices", "neighbors", "arp_entries", "dhcp_observations",
         "stp_events", "traffic_stats", "snmp_polls", "findings",
-        "topology_nodes", "topology_edges",
+        "topology_nodes", "topology_edges", "dns_probes",
     }
     if table not in allowed:
         raise ValueError(f"table {table!r} is not allowed")
@@ -377,6 +377,7 @@ def insert_many(table: str, rows: list[dict[str, Any]]) -> None:
     allowed = {
         "devices", "neighbors", "arp_entries", "dhcp_observations",
         "stp_events", "traffic_stats", "snmp_polls", "findings",
+        "dns_probes",
     }
     if table not in allowed:
         raise ValueError(f"table {table!r} is not allowed")

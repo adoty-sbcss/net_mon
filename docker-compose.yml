@@ -77,6 +77,13 @@ services:
       # at local-time minute 0 and filenames use the box's wall clock.
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
+      # Host's DNS config for the DNS health probes. Both files are mounted
+      # read-only; the collector reads them at scan time to discover which
+      # resolvers the host is using (DHCP-assigned or static). On Ubuntu the
+      # systemd-resolved variant lists the real upstreams; /etc/resolv.conf
+      # often just points at 127.0.0.53 (the stub).
+      - /etc/resolv.conf:/etc/host-resolv.conf:ro
+      - /run/systemd/resolve/resolv.conf:/etc/host-systemd-resolv.conf:ro
     command: ["run"]
 
 volumes:
