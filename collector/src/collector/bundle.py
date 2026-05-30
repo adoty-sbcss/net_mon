@@ -108,12 +108,20 @@ def _scan_payload(scan_id: int) -> dict[str, str]:
     traffic = fetch_table_for_scan("traffic_stats", scan_id)
     snmp = fetch_table_for_scan("snmp_polls", scan_id)
     findings = fetch_table_for_scan("findings", scan_id)
+    topo_nodes = fetch_table_for_scan("topology_nodes", scan_id)
+    topo_edges = fetch_table_for_scan("topology_edges", scan_id)
 
     return {
         "summary.md": _build_summary_md(scan, devices, neighbors, arp, dhcp, stp, traffic, snmp, findings),
         "findings.json": _jsonify(findings),
         "topology.json": json.dumps(_build_topology(scan, devices, neighbors, arp),
                                     indent=2, default=_default),
+        # SNMP-discovered fabric topology — separate file from the local-only
+        # topology.json above. Present only when topology crawl is enabled
+        # AND it surfaced anything; an empty crawl still ships an empty file
+        # so a missing one means "feature off."
+        "snmp_topology.json": json.dumps({"nodes": topo_nodes, "edges": topo_edges},
+                                         indent=2, default=_default),
         "devices.csv": _devices_csv(devices),
         "metrics.json": json.dumps(_build_metrics(traffic, dhcp, stp),
                                    indent=2, default=_default),
@@ -125,6 +133,8 @@ def _scan_payload(scan_id: int) -> dict[str, str]:
         "raw/dhcp-observed.json": _jsonify(dhcp),
         "raw/stp-events.json": _jsonify(stp),
         "raw/snmp-polls.json": _jsonify(snmp),
+        "raw/snmp-topology-nodes.json": _jsonify(topo_nodes),
+        "raw/snmp-topology-edges.json": _jsonify(topo_edges),
         "raw/traffic-stats.json": _jsonify(traffic),
     }
 

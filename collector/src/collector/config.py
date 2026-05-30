@@ -35,6 +35,16 @@ class Settings(BaseSettings):
     # to get a response for a given device gets cached in snmp_credentials.
     snmp_communities: str = Field(default="", alias="NETMON_SNMP_COMMUNITIES")
 
+    # SNMP topology crawl (Path B). Off by default — turn on once SNMP is
+    # working against your switches and you want fabric topology in bundles.
+    snmp_topology_enabled: bool = Field(default=False, alias="NETMON_SNMP_TOPOLOGY_ENABLED")
+    # Max hops from a seed device. 5 covers most school-district fabrics
+    # without going wild on internet-facing gear.
+    snmp_topology_max_depth: int = Field(default=5, alias="NETMON_SNMP_TOPOLOGY_MAX_DEPTH")
+    # Wall-clock cap per scan so the crawl can't blow scan duration on a
+    # large fabric. Stops cleanly when the budget is reached.
+    snmp_topology_time_budget: int = Field(default=60, alias="NETMON_SNMP_TOPOLOGY_TIME_BUDGET")
+
     sftp_enabled: bool = Field(default=False, alias="NETMON_SFTP_ENABLED")
     sftp_host: str = Field(default="", alias="NETMON_SFTP_HOST")
     sftp_port: int = Field(default=22, alias="NETMON_SFTP_PORT")

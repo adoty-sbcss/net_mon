@@ -169,6 +169,7 @@ def fetch_table_for_scan(table: str, scan_id: int) -> list[dict[str, Any]]:
     allowed = {
         "devices", "neighbors", "arp_entries", "dhcp_observations",
         "stp_events", "traffic_stats", "snmp_polls", "findings",
+        "topology_nodes", "topology_edges",
     }
     if table not in allowed:
         raise ValueError(f"table {table!r} is not allowed")
@@ -320,6 +321,53 @@ def list_uploaded_bundles_older_than(days: int) -> list[dict[str, Any]]:
                 (str(days),),
             )
             return list(cur.fetchall())
+
+
+def insert_topology(scan_run_id: int, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> None:
+    """Persist topology crawl output. Each node/edge is stamped with scan_run_id."""
+    if not nodes and not edges:
+        return
+    with connect() as conn:
+        with conn.cursor() as cur:
+            for n in nodes:
+                cur.execute(
+                    """
+                    INSERT INTO topology_nodes
+                        (scan_run_id, chassis_id, system_name, system_description,
+                         mgmt_ips, discovered_via_ip, source)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        scan_run_id,
+                        n.get("chassis_id"),
+                        n.get("system_name"),
+                        n.get("system_description"),
+                        n.get("mgmt_ips") or None,
+                        n.get("discovered_via_ip"),
+                        n.get("source") or "snmp",
+                    ),
+                )
+            for e in edges:
+                cur.execute(
+                    """
+                    INSERT INTO topology_edges
+                        (scan_run_id, local_chassis_id, local_port_id, local_port_desc,
+                         remote_chassis_id, remote_port_id, remote_port_desc,
+                         via, discovered_via_ip)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        scan_run_id,
+                        e.get("local_chassis_id"),
+                        e.get("local_port_id"),
+                        e.get("local_port_desc"),
+                        e.get("remote_chassis_id"),
+                        e.get("remote_port_id"),
+                        e.get("remote_port_desc"),
+                        e.get("via") or "lldp",
+                        e.get("discovered_via_ip"),
+                    ),
+                )
 
 
 def insert_many(table: str, rows: list[dict[str, Any]]) -> None:

@@ -48,11 +48,22 @@ files into a Claude conversation, then send the prompt below.
 >    - **Unusual hosts** (vendor OUI mismatches, unexpected device types,
 >      management addresses that shouldn't be on this VLAN)
 >    - **Interface health** (high error/drop rates, asymmetric traffic)
-> 4. Rank findings by severity and confidence. Tell me which are
+> 4. If `snmp_topology.json` is non-empty, walk it:
+>    - Sketch the L2 fabric from the `edges` array (which switch ports
+>      connect to which). Identify the apparent core/distribution/access
+>      tiers if you can.
+>    - Flag any node whose `system_description` indicates **EOL firmware,
+>      management on an unexpected subnet, or a vendor that shouldn't be
+>      in this network** (e.g., a consumer switch in a school MDF).
+>    - Note any **switches that LLDP says exist but SNMP couldn't reach**
+>      (present in `topology_nodes` with `source: 'lldp'` but no mgmt_ips
+>      that responded to a community). These are visibility gaps worth
+>      fixing.
+> 5. Rank findings by severity and confidence. Tell me which are
 >    *definite* from the evidence and which are *suggestive*.
-> 5. For each finding, cite the file and field in the bundle that
+> 6. For each finding, cite the file and field in the bundle that
 >    supports it.
-> 6. End with a short list of follow-up checks I should run on the
+> 7. End with a short list of follow-up checks I should run on the
 >    physical network or with elevated tooling (SNMP, switch CLI, packet
 >    capture targets).
 >

@@ -25,9 +25,19 @@ class CaptureResult:
 
 # Display filter for the relevant control-plane traffic. We capture everything
 # matching and let post-processing pull out DHCP/STP/etc.
+#
+# DHCP DORA visibility note: on a switched port without SPAN/mirror we will
+# only see DHCP messages that are broadcast on this VLAN (Discover, often
+# Request) — unicast Offer/Ack the server sends directly to a client get
+# forwarded only to that client's port. Wireshark sometimes labels the layer
+# `bootp` (2.x) and sometimes `dhcp` (3.x+), so accept both protocol names
+# AND fall back to raw UDP 67/68 so we never miss a frame we *can* see due
+# to a dissector mismatch.
 CAPTURE_FILTER = (
-    "stp or cdp or lldp or bootp or arp or "
-    "(eth.dst == ff:ff:ff:ff:ff:ff) or (eth.dst[0] & 0x01 == 0x01)"
+    "stp or cdp or lldp "
+    "or bootp or dhcp or udp.port == 67 or udp.port == 68 "
+    "or arp "
+    "or (eth.dst == ff:ff:ff:ff:ff:ff) or (eth.dst[0] & 0x01 == 0x01)"
 )
 
 

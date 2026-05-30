@@ -169,6 +169,40 @@ CREATE INDEX IF NOT EXISTS idx_bundle_uploads_pending
     ON bundle_uploads(uploaded_at)
     WHERE uploaded_at IS NULL;
 
+-- SNMP-discovered topology (see migration 0006).
+CREATE TABLE IF NOT EXISTS topology_nodes (
+    id                  SERIAL PRIMARY KEY,
+    scan_run_id         INTEGER NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
+    chassis_id          TEXT NOT NULL,
+    system_name         TEXT,
+    system_description  TEXT,
+    mgmt_ips            TEXT[],
+    discovered_via_ip   INET,
+    source              TEXT NOT NULL,
+    capabilities        TEXT[],
+    extra               JSONB NOT NULL DEFAULT '{}'::jsonb,
+    discovered_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_topology_nodes_scan    ON topology_nodes(scan_run_id);
+CREATE INDEX IF NOT EXISTS idx_topology_nodes_chassis ON topology_nodes(chassis_id);
+
+CREATE TABLE IF NOT EXISTS topology_edges (
+    id                  SERIAL PRIMARY KEY,
+    scan_run_id         INTEGER NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
+    local_chassis_id    TEXT NOT NULL,
+    local_port_id       TEXT,
+    local_port_desc     TEXT,
+    remote_chassis_id   TEXT NOT NULL,
+    remote_port_id      TEXT,
+    remote_port_desc    TEXT,
+    via                 TEXT NOT NULL,
+    discovered_via_ip   INET,
+    extra               JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_topology_edges_scan    ON topology_edges(scan_run_id);
+CREATE INDEX IF NOT EXISTS idx_topology_edges_local   ON topology_edges(local_chassis_id);
+CREATE INDEX IF NOT EXISTS idx_topology_edges_remote  ON topology_edges(remote_chassis_id);
+
 CREATE TABLE IF NOT EXISTS findings (
     id          SERIAL PRIMARY KEY,
     scan_run_id INTEGER NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,

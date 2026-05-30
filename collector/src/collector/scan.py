@@ -113,15 +113,38 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
 
         # 7. Optional SNMP polling
         snmp_results: list[dict[str, Any]] = []
+        snmp_candidates_list: list[str] = []
         if settings.snmp_enabled:
             try:
-                candidates = _snmp_candidates(state.gateway_ip, lldp_neighbors,
-                                              arp_results, nmap_results)
-                log.info("snmp candidate set", count=len(candidates), ips=candidates)
-                snmp_results = snmp_mod.poll(candidates)
+                snmp_candidates_list = _snmp_candidates(state.gateway_ip, lldp_neighbors,
+                                                       arp_results, nmap_results)
+                log.info("snmp candidate set", count=len(snmp_candidates_list),
+                         ips=snmp_candidates_list)
+                snmp_results = snmp_mod.poll(snmp_candidates_list)
                 ctx.raw_outputs["snmp"] = snmp_results
             except Exception as exc:  # pragma: no cover — defensive
                 log.warning("snmp poll failed", error=str(exc))
+
+        # 7b. Optional SNMP topology crawl. Reuses the same candidate IPs as
+        # seeds (gateway + LLDP mgmt IPs + network-vendor OUIs) and the same
+        # community list. Off by default — flip NETMON_SNMP_TOPOLOGY_ENABLED.
+        topology: dict[str, Any] | None = None
+        if settings.snmp_enabled and settings.snmp_topology_enabled and snmp_candidates_list:
+            try:
+                from .discovery import snmp_topology as topo_mod
+                topology = topo_mod.crawl(
+                    seed_ips=snmp_candidates_list,
+                    communities=list(settings.snmp_community_list),
+                    max_depth=settings.snmp_topology_max_depth,
+                    time_budget_sec=settings.snmp_topology_time_budget,
+                )
+                ctx.raw_outputs["snmp_topology"] = topology
+                log.info("snmp topology",
+                         nodes=len(topology.get("nodes", [])),
+                         edges=len(topology.get("edges", [])),
+                         stats=topology.get("stats"))
+            except Exception as exc:  # pragma: no cover — defensive
+                log.warning("snmp topology crawl failed", error=str(exc))
 
         # 8. Persist everything
         _persist(
@@ -133,6 +156,7 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
             arp_results=arp_results,
             nmap_results=nmap_results,
             snmp_results=snmp_results,
+            topology=topology,
         )
 
     except Exception as exc:
@@ -212,6 +236,7 @@ def _persist(
     arp_results: list[dict[str, Any]],
     nmap_results: list[dict[str, Any]],
     snmp_results: list[dict[str, Any]],
+    topology: dict[str, Any] | None = None,
 ) -> None:
     # Devices: merge unique by (ip, mac), recording the discovery source.
     seen: dict[tuple[str | None, str | None], dict[str, Any]] = {}
@@ -303,6 +328,16 @@ def _persist(
         "tshark_total_packets": cap_results.total_packets,
     }
     insert_many("traffic_stats", [bucket])
+
+    # Topology crawl results, if any. Persisted as nodes + edges so they
+    # land in the bundle alongside the per-scan tables.
+    if topology and (topology.get("nodes") or topology.get("edges")):
+        from .db import insert_topology
+        insert_topology(
+            ctx.scan_id,
+            topology.get("nodes", []),
+            topology.get("edges", []),
+        )
 
 
 def _looks_like_mac(s: str | None) -> bool:
