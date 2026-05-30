@@ -89,6 +89,11 @@ CREATE TABLE IF NOT EXISTS dhcp_observations (
     subnet_mask  TEXT,
     router       INET,
     dns_servers  TEXT,
+    -- Device-fingerprint options from client DISCOVER/REQUEST (opt 60/55/12),
+    -- used by the dashboard to classify endpoints that don't speak SNMP.
+    vendor_class_id TEXT,           -- option 60, e.g. "MSFT 5.0", "ArubaAP"
+    param_req_list  TEXT,           -- option 55, e.g. "1,3,6,15,31,33,43"
+    client_hostname TEXT,           -- option 12
     seen_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_dhcp_scan ON dhcp_observations(scan_run_id);

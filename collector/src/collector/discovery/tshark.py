@@ -196,6 +196,38 @@ def _parse_dhcp(body: dict[str, Any], eth: dict[str, Any]) -> dict[str, Any] | N
         "bootp_option_domain_name_server",
     )
 
+    # --- Device-fingerprint options (present on client DISCOVER/REQUEST/INFORM).
+    # These let the dashboard classify endpoints that never speak SNMP
+    # (printers, PCs, phones, IoT). The triplet is the classic DHCP fingerprint.
+    #
+    # Option 60 — vendor class id: often self-describing, e.g. "MSFT 5.0"
+    # (Windows), "android-dhcp-13", "Hewlett-Packard JetDirect", "ArubaAP".
+    vendor_class_id = _dhcp_field(
+        body,
+        "dhcp_dhcp_option_vendor_class_id",
+        "dhcp_option_vendor_class_id",
+        "bootp_bootp_option_vendor_class_id",
+        "bootp_option_vendor_class_id",
+    )
+    # Option 55 — parameter request list: the ordered list of option codes the
+    # client asks for. Order + membership is highly OS-specific (this is what
+    # Fingerbank keys on). Comes back as a list of ints; join into "1,3,6,15".
+    param_req_list = _dhcp_list(
+        body,
+        "dhcp_dhcp_option_request_list_item",
+        "dhcp_option_request_list_item",
+        "bootp_bootp_option_request_list_item",
+        "bootp_option_request_list_item",
+    )
+    # Option 12 — hostname the client advertises (e.g. "HPB8CA3A", "iPhone").
+    client_hostname = _dhcp_field(
+        body,
+        "dhcp_dhcp_option_hostname",
+        "dhcp_option_hostname",
+        "bootp_bootp_option_hostname",
+        "bootp_option_hostname",
+    )
+
     server_mac = _scalar(eth.get("eth_eth_src"))
 
     # OFFER/ACK/NAK come from the server side; for those, server_mac is meaningful.
@@ -215,6 +247,11 @@ def _parse_dhcp(body: dict[str, Any], eth: dict[str, Any]) -> dict[str, Any] | N
         "subnet_mask": subnet,
         "router": router,
         "dns_servers": dns,
+        # Fingerprint fields — meaningful only on client-originated messages;
+        # OFFER/ACK from the server carry none, which is fine (stored NULL).
+        "vendor_class_id": vendor_class_id,
+        "param_req_list": param_req_list,
+        "client_hostname": client_hostname,
     }
 
 
@@ -225,6 +262,24 @@ def _dhcp_field(body: dict[str, Any], *candidates: str) -> Any:
             v = _scalar(body[key])
             if v not in (None, ""):
                 return v
+    return None
+
+
+def _dhcp_list(body: dict[str, Any], *candidates: str) -> str | None:
+    """Return a comma-joined string of ALL values for the first present option.
+
+    Unlike `_dhcp_field`, this keeps every element rather than just the first —
+    used for option 55 (parameter request list), where the ordered set of
+    requested option codes is the fingerprint. ek format gives a list; a
+    single-item option may arrive as a bare scalar, so handle both.
+    """
+    for key in candidates:
+        if key in body:
+            v = body[key]
+            items = v if isinstance(v, list) else [v]
+            cleaned = [str(x) for x in items if x not in (None, "")]
+            if cleaned:
+                return ",".join(cleaned)
     return None
 
 
