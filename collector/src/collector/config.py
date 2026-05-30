@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     # Comma-separated list of v2c communities to try, in order. The first one
     # to get a response for a given device gets cached in snmp_credentials.
     snmp_communities: str = Field(default="", alias="NETMON_SNMP_COMMUNITIES")
+    # By default SNMP only polls likely network gear (gateway + LLDP mgmt IPs
+    # + network-vendor OUIs) to keep scans fast. Turn this on to also poll
+    # every discovered host so printers / PCs / IoT get classified via SNMP
+    # (Printer-MIB, Host-Resources, etc.). Costs a community trial per host.
+    snmp_poll_all_hosts: bool = Field(default=False, alias="NETMON_SNMP_POLL_ALL_HOSTS")
 
     # SNMP topology crawl (Path B). Off by default — turn on once SNMP is
     # working against your switches and you want fabric topology in bundles.

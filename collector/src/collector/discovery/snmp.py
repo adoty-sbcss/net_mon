@@ -63,9 +63,10 @@ SYSDESCR_OID = "1.3.6.1.2.1.1.1.0"
 DEFAULT_OIDS: list[tuple[str, str, bool]] = [
     ("sysDescr",            "1.3.6.1.2.1.1.1.0",       False),
     ("sysName",             "1.3.6.1.2.1.1.5.0",       False),
-    ("sysObjectID",         "1.3.6.1.2.1.1.2.0",       False),
+    ("sysObjectID",         "1.3.6.1.2.1.1.2.0",       False),  # primary vendor+model key
     ("sysLocation",         "1.3.6.1.2.1.1.6.0",       False),
     ("sysContact",          "1.3.6.1.2.1.1.4.0",       False),
+    ("sysServices",         "1.3.6.1.2.1.1.7.0",       False),  # layer bitmask: L2=2 L3=4 L7=64
     ("ifTable",             "1.3.6.1.2.1.2.2",         True),   # carries ifDescr
     ("ifName",              "1.3.6.1.2.1.31.1.1.1.1",  True),   # ifXTable: ifIndex -> port name
     ("ipNetToMediaTable",   "1.3.6.1.2.1.4.22",        True),
@@ -73,6 +74,30 @@ DEFAULT_OIDS: list[tuple[str, str, bool]] = [
     ("dot1dBasePortIfIndex","1.3.6.1.2.1.17.1.4.1.2",  True),   # bridge port -> ifIndex
     ("dot1qTpFdbPort",      "1.3.6.1.2.1.17.7.1.2.2",  True),   # Q-BRIDGE per-VLAN MAC -> bridge port
     ("dot1dStpPortTable",   "1.3.6.1.2.1.17.2.15",     True),
+
+    # --- Device classification / inventory (vendor-neutral) --------------
+    # The dashboard maps these to a device class (switch / router / AP /
+    # printer / computer / phone / ...). sysObjectID + sysServices above are
+    # the cheap primary signal; the tables below add hardware model + serial
+    # and a type hint that works across vendors.
+    #
+    # ENTITY-MIB (RFC 4133) — physical entity inventory. A responsive agent
+    # returns "No Such Object" fast when these are absent, so polling them on
+    # gear that lacks the MIB is cheap (no timeout). entPhysicalClass is an
+    # enum: chassis(3) module(9) port(10) powerSupply(6) sensor(8) ...
+    ("entPhysicalDescr",     "1.3.6.1.2.1.47.1.1.1.1.2",  True),
+    ("entPhysicalClass",     "1.3.6.1.2.1.47.1.1.1.1.5",  True),
+    ("entPhysicalName",      "1.3.6.1.2.1.47.1.1.1.1.7",  True),
+    ("entPhysicalSerialNum", "1.3.6.1.2.1.47.1.1.1.1.11", True),
+    ("entPhysicalModelName", "1.3.6.1.2.1.47.1.1.1.1.13", True),
+    # HOST-RESOURCES-MIB (RFC 2790) — present on general-purpose OSes
+    # (PCs/servers) and many printers. hrDeviceType enum: processor(3)
+    # network(4) printer(5) diskStorage(2) ... A box exposing processor/disk
+    # rows is a computer; a printer row plus Printer-MIB below confirms print.
+    ("hrDeviceType",         "1.3.6.1.2.1.25.3.2.1.2",    True),
+    ("hrDeviceDescr",        "1.3.6.1.2.1.25.3.2.1.3",    True),
+    # PRINTER-MIB (RFC 3805) — if prtGeneralPrinterName answers, it's a printer.
+    ("prtGeneralPrinterName","1.3.6.1.2.1.43.5.1.1.16",   True),
 ]
 
 # Lines net-snmp emits for absent objects — we skip these when parsing walks.

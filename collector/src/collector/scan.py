@@ -117,8 +117,9 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
         snmp_candidates_list: list[str] = []
         if settings.snmp_enabled:
             try:
-                snmp_candidates_list = _snmp_candidates(state.gateway_ip, lldp_neighbors,
-                                                       arp_results, nmap_results)
+                snmp_candidates_list = _snmp_candidates(
+                    state.gateway_ip, lldp_neighbors, arp_results, nmap_results,
+                    include_all_hosts=settings.snmp_poll_all_hosts)
                 log.info("snmp candidate set", count=len(snmp_candidates_list),
                          ips=snmp_candidates_list)
                 snmp_results = snmp_mod.poll(snmp_candidates_list)
@@ -198,17 +199,24 @@ def _snmp_candidates(
     lldp_neighbors: list[dict[str, Any]],
     arp_results: list[dict[str, Any]],
     nmap_results: list[dict[str, Any]],
+    *,
+    include_all_hosts: bool = False,
 ) -> list[str]:
-    """Narrow set of IPs likely to actually speak SNMP.
+    """Set of IPs to try SNMP against.
 
-    Includes:
+    Default (narrow) includes:
       * The default gateway (almost always a router with SNMP).
       * Any LLDP/CDP-discovered management IPs (switches, APs).
       * Any ARP/nmap entry whose vendor OUI looks like a network vendor.
 
-    Deliberately excludes random hosts (laptops, phones, printers, IoT).
-    A trial with N communities × T timeout against 50 hosts can easily eat
+    Deliberately excludes random hosts (laptops, phones, printers, IoT):
+    a trial with N communities × T timeout against 50 hosts can easily eat
     minutes; narrowing the set keeps scans fast.
+
+    When `include_all_hosts` is set (NETMON_SNMP_POLL_ALL_HOSTS), every
+    discovered ARP/nmap host is added too, so printers / PCs / IoT get
+    classified via SNMP (Printer-MIB, Host-Resources). Per-device community
+    caching + 24h backoff keep the repeat cost down after the first scan.
     """
     ips: list[str] = []
     seen: set[str] = set()
@@ -230,10 +238,10 @@ def _snmp_candidates(
         return any(hint in v for hint in _NETWORK_VENDOR_HINTS)
 
     for r in arp_results:
-        if looks_like_network_gear(r.get("vendor")):
+        if include_all_hosts or looks_like_network_gear(r.get("vendor")):
             add(r.get("ip"))
     for r in nmap_results:
-        if looks_like_network_gear(r.get("vendor")):
+        if include_all_hosts or looks_like_network_gear(r.get("vendor")):
             add(r.get("ip"))
     return ips
 
