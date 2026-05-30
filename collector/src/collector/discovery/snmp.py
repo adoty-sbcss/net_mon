@@ -50,16 +50,29 @@ POLL_RETRIES = "1"
 SYSDESCR_OID = "1.3.6.1.2.1.1.1.0"
 
 # (name, oid, is_walk)
+#
+# The bridge OIDs below exist so the dashboard can map a host (IP+MAC) to the
+# physical switch access port it lives on. The join chain is:
+#   host MAC --[dot1dTpFdbTable.dot1dTpFdbPort]--> bridge port number
+#            --[dot1dBasePortIfIndex]-----------> ifIndex
+#            --[ifName / ifTable.ifDescr]--------> "GigabitEthernet1/0/12"
+# dot1dTpFdbTable and ifTable (which carries ifDescr) already cover two legs;
+# dot1dBasePortIfIndex and ifName supply the missing translation steps.
+# dot1qTpFdbPort is the Q-BRIDGE per-VLAN FDB for switches that expose it
+# (its index embeds the VLAN, unlike the classic per-VLAN-community dot1d FDB).
 DEFAULT_OIDS: list[tuple[str, str, bool]] = [
-    ("sysDescr",          "1.3.6.1.2.1.1.1.0",  False),
-    ("sysName",           "1.3.6.1.2.1.1.5.0",  False),
-    ("sysObjectID",       "1.3.6.1.2.1.1.2.0",  False),
-    ("sysLocation",       "1.3.6.1.2.1.1.6.0",  False),
-    ("sysContact",        "1.3.6.1.2.1.1.4.0",  False),
-    ("ifTable",           "1.3.6.1.2.1.2.2",    True),
-    ("ipNetToMediaTable", "1.3.6.1.2.1.4.22",   True),
-    ("dot1dTpFdbTable",   "1.3.6.1.2.1.17.4.3", True),
-    ("dot1dStpPortTable", "1.3.6.1.2.1.17.2.15", True),
+    ("sysDescr",            "1.3.6.1.2.1.1.1.0",       False),
+    ("sysName",             "1.3.6.1.2.1.1.5.0",       False),
+    ("sysObjectID",         "1.3.6.1.2.1.1.2.0",       False),
+    ("sysLocation",         "1.3.6.1.2.1.1.6.0",       False),
+    ("sysContact",          "1.3.6.1.2.1.1.4.0",       False),
+    ("ifTable",             "1.3.6.1.2.1.2.2",         True),   # carries ifDescr
+    ("ifName",              "1.3.6.1.2.1.31.1.1.1.1",  True),   # ifXTable: ifIndex -> port name
+    ("ipNetToMediaTable",   "1.3.6.1.2.1.4.22",        True),
+    ("dot1dTpFdbTable",     "1.3.6.1.2.1.17.4.3",      True),   # MAC -> bridge port (dot1dTpFdbPort)
+    ("dot1dBasePortIfIndex","1.3.6.1.2.1.17.1.4.1.2",  True),   # bridge port -> ifIndex
+    ("dot1qTpFdbPort",      "1.3.6.1.2.1.17.7.1.2.2",  True),   # Q-BRIDGE per-VLAN MAC -> bridge port
+    ("dot1dStpPortTable",   "1.3.6.1.2.1.17.2.15",     True),
 ]
 
 # Lines net-snmp emits for absent objects — we skip these when parsing walks.
