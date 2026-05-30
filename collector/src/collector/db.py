@@ -334,8 +334,8 @@ def insert_topology(scan_run_id: int, nodes: list[dict[str, Any]], edges: list[d
                     """
                     INSERT INTO topology_nodes
                         (scan_run_id, chassis_id, system_name, system_description,
-                         mgmt_ips, discovered_via_ip, source)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                         mgmt_ips, discovered_via_ip, source, capabilities)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         scan_run_id,
@@ -345,6 +345,7 @@ def insert_topology(scan_run_id: int, nodes: list[dict[str, Any]], edges: list[d
                         n.get("mgmt_ips") or None,
                         n.get("discovered_via_ip"),
                         n.get("source") or "snmp",
+                        n.get("capabilities") or None,
                     ),
                 )
             for e in edges:

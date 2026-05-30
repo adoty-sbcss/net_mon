@@ -17,7 +17,7 @@ Inputs (per call):
 Output:
     {
       "nodes": [{chassis_id, system_name, system_description, mgmt_ips,
-                 discovered_via_ip, source}, ...],
+                 discovered_via_ip, source, capabilities}, ...],
       "edges": [{local_chassis_id, local_port_id, local_port_desc,
                  remote_chassis_id, remote_port_id, remote_port_desc,
                  via ('lldp'|'cdp'), discovered_via_ip}, ...],
@@ -56,6 +56,15 @@ SYS_NAME  = "1.3.6.1.2.1.1.5.0"
 LLDP_LOC_CHASSIS_ID_SUBTYPE = "1.0.8802.1.1.2.1.3.1.0"
 LLDP_LOC_CHASSIS_ID         = "1.0.8802.1.1.2.1.3.2.0"
 LLDP_LOC_SYS_NAME           = "1.0.8802.1.1.2.1.3.3.0"
+LLDP_LOC_SYS_CAP_ENABLED    = "1.0.8802.1.1.2.1.3.6.0"   # lldpLocSysCapEnabled
+
+# IEEE 802.1AB system-capability bitmap (LldpSystemCapabilitiesMap). The octet
+# string is a BITS field: bit 0 is the MSB of the first octet. Tagging a node
+# bridge/router/wlan-ap/telephone is a strong, vendor-neutral device-class hint.
+_LLDP_CAP_BITS = (
+    "other", "repeater", "bridge", "wlan-ap", "router",
+    "telephone", "docsis", "station", "cvlan", "svlan", "two-port-mac-relay",
+)
 
 LLDP_REM_TABLE   = "1.0.8802.1.1.2.1.4.1.1"      # lldpRemTable rows
 LLDP_REM_MAN_TBL = "1.0.8802.1.1.2.1.4.2.1"      # lldpRemManAddrTable rows
@@ -145,6 +154,7 @@ def crawl(
             # any edges discovered from elsewhere have somewhere to land.
             local_chassis = f"ip:{ip}"
 
+        local_caps = _decode_lldp_caps(_snmp_get(ip, community, LLDP_LOC_SYS_CAP_ENABLED))
         node = nodes.setdefault(local_chassis, {
             "chassis_id":         local_chassis,
             "system_name":        sys_name,
@@ -152,9 +162,13 @@ def crawl(
             "mgmt_ips":           [],
             "discovered_via_ip":  ip,
             "source":             "snmp",
+            "capabilities":       local_caps,
         })
         if ip not in node["mgmt_ips"]:
             node["mgmt_ips"].append(ip)
+        # Fill caps if the node was first seen as an LLDP remote (no local poll).
+        if local_caps and not node.get("capabilities"):
+            node["capabilities"] = local_caps
 
         # --- LLDP remote table -------------------------------------------
         rem_rows = _snmp_walk(ip, community, LLDP_REM_TABLE)
@@ -172,6 +186,7 @@ def crawl(
                 continue
             mgmt_ips = rem_mgmt_by_idx.get(idx, [])
 
+            rem_caps = _decode_lldp_caps(row.get("capabilities_enabled"))
             n = nodes.setdefault(chassis_norm, {
                 "chassis_id":         chassis_norm,
                 "system_name":        _strip_quotes(row.get("sys_name")),
@@ -179,10 +194,13 @@ def crawl(
                 "mgmt_ips":           [],
                 "discovered_via_ip":  ip,
                 "source":             "lldp",
+                "capabilities":       rem_caps,
             })
             for mip in mgmt_ips:
                 if mip not in n["mgmt_ips"]:
                     n["mgmt_ips"].append(mip)
+            if rem_caps and not n.get("capabilities"):
+                n["capabilities"] = rem_caps
 
             edges.append({
                 "local_chassis_id":  local_chassis,
@@ -218,6 +236,7 @@ def crawl(
                 "mgmt_ips":           [mgmt_ip] if mgmt_ip else [],
                 "discovered_via_ip":  ip,
                 "source":             "cdp",
+                "capabilities":       None,   # CDP caps not decoded (LLDP only)
             })
             if mgmt_ip and mgmt_ip not in n["mgmt_ips"]:
                 n["mgmt_ips"].append(mgmt_ip)
@@ -373,6 +392,36 @@ def _normalize_cdp_address(raw: str | None) -> str | None:
     if v.count(".") == 3:
         return v
     return None
+
+
+def _decode_lldp_caps(raw: str | None) -> list[str] | None:
+    """Decode an LLDP system-capabilities octet string into a list of tags.
+
+    net-snmp renders the 1-2 byte BITS field as hex — "28 00", "0x2800", or
+    similar. Bit 0 is the MSB of the first octet (e.g. bridge=bit2=0x2000,
+    router=bit4=0x0800, so a bridge+router reads 0x2800 -> ['bridge','router']).
+    """
+    if raw is None:
+        return None
+    v = _strip_quotes(raw) or ""
+    cleaned = v.replace(" ", "").replace(":", "").lower()
+    if cleaned.startswith("0x"):
+        cleaned = cleaned[2:]
+    if not cleaned or any(c not in "0123456789abcdef" for c in cleaned):
+        return None
+    if len(cleaned) % 2:
+        cleaned = "0" + cleaned
+    try:
+        data = bytes.fromhex(cleaned)
+    except ValueError:
+        return None
+    bits_total = len(data) * 8
+    value = int.from_bytes(data, "big")
+    caps = [
+        name for i, name in enumerate(_LLDP_CAP_BITS)
+        if i < bits_total and value & (1 << (bits_total - 1 - i))
+    ]
+    return caps or None
 
 
 # ---------------------------------------------------------------------------
