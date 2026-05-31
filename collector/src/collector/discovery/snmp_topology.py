@@ -66,6 +66,24 @@ _LLDP_CAP_BITS = (
     "telephone", "docsis", "station", "cvlan", "svlan", "two-port-mac-relay",
 )
 
+# CISCO-CDP-MIB cdpCacheCapabilities — a 4-byte bitmask. Unlike the LLDP BITS
+# field above, this is LSB-first: bit 0 (0x01) is router, bit 3 (0x08) switch,
+# etc. "switch" and "host" have no LLDP equivalent and are useful extra hints
+# (a CDP neighbor advertising "host" is an endpoint, not infrastructure).
+_CDP_CAP_BITS = (
+    "router",               # 0x001
+    "bridge",               # 0x002 transparent bridge
+    "source-route-bridge",  # 0x004
+    "switch",               # 0x008
+    "host",                 # 0x010
+    "igmp",                 # 0x020
+    "repeater",             # 0x040
+    "telephone",            # 0x080 VoIP phone
+    "remotely-managed",     # 0x100
+    "cvta",                 # 0x200
+    "two-port-mac-relay",   # 0x400
+)
+
 LLDP_REM_TABLE   = "1.0.8802.1.1.2.1.4.1.1"      # lldpRemTable rows
 LLDP_REM_MAN_TBL = "1.0.8802.1.1.2.1.4.2.1"      # lldpRemManAddrTable rows
 
@@ -89,6 +107,7 @@ CDP_CACHE_COLS = {
     "6":  "device_id",       # cdpCacheDeviceId
     "7":  "device_port",     # cdpCacheDevicePort
     "8":  "platform",        # cdpCachePlatform
+    "9":  "cap_raw",         # cdpCacheCapabilities (4-byte bitmap)
 }
 
 
@@ -228,6 +247,7 @@ def crawl(
             # CDP doesn't give us a chassis MAC; use device-id as the key.
             chassis_key = f"cdp:{device_id}"
             mgmt_ip = _normalize_cdp_address(row.get("address"))
+            cdp_caps = _decode_cdp_caps(row.get("cap_raw"))
 
             n = nodes.setdefault(chassis_key, {
                 "chassis_id":         chassis_key,
@@ -236,10 +256,12 @@ def crawl(
                 "mgmt_ips":           [mgmt_ip] if mgmt_ip else [],
                 "discovered_via_ip":  ip,
                 "source":             "cdp",
-                "capabilities":       None,   # CDP caps not decoded (LLDP only)
+                "capabilities":       cdp_caps,
             })
             if mgmt_ip and mgmt_ip not in n["mgmt_ips"]:
                 n["mgmt_ips"].append(mgmt_ip)
+            if cdp_caps and not n.get("capabilities"):
+                n["capabilities"] = cdp_caps
 
             edges.append({
                 "local_chassis_id":  local_chassis,
@@ -420,6 +442,32 @@ def _decode_lldp_caps(raw: str | None) -> list[str] | None:
     caps = [
         name for i, name in enumerate(_LLDP_CAP_BITS)
         if i < bits_total and value & (1 << (bits_total - 1 - i))
+    ]
+    return caps or None
+
+
+def _decode_cdp_caps(raw: str | None) -> list[str] | None:
+    """Decode a CISCO-CDP-MIB cdpCacheCapabilities octet string into tags.
+
+    net-snmp renders the 4-byte field as hex ("00 00 00 28", "0x00000028").
+    The bitmask is LSB-first (router=0x01, switch=0x08, host=0x10, ...), so
+    0x28 = switch+igmp -> ['switch', 'igmp'].
+    """
+    if raw is None:
+        return None
+    v = _strip_quotes(raw) or ""
+    cleaned = v.replace(" ", "").replace(":", "").lower()
+    if cleaned.startswith("0x"):
+        cleaned = cleaned[2:]
+    if not cleaned or any(c not in "0123456789abcdef" for c in cleaned):
+        return None
+    try:
+        value = int(cleaned, 16)
+    except ValueError:
+        return None
+    caps = [
+        name for i, name in enumerate(_CDP_CAP_BITS)
+        if value & (1 << i)
     ]
     return caps or None
 
