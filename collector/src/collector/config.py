@@ -103,6 +103,11 @@ class Settings(BaseSettings):
     # to the one-time token generated on the sensor's page in the dashboard.
     dashboard_url: str = Field(default="", alias="NETMON_DASHBOARD_URL")
     enroll_token: str = Field(default="", alias="NETMON_ENROLL_TOKEN")
+    # Shared bootstrap key for AUTO-enrollment: if enroll_token is empty but this
+    # + dashboard_url + identity slugs are set, the box self-registers on its
+    # first check-in and writes its issued token back to netmon.env. Same key on
+    # every box; baked into setup so techs don't copy per-sensor tokens.
+    bootstrap_key: str = Field(default="", alias="NETMON_BOOTSTRAP_KEY")
 
     bundle_dir: Path = Field(default=Path("/var/lib/netmon/bundles"), alias="NETMON_BUNDLE_DIR")
 

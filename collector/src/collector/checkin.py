@@ -32,21 +32,16 @@ log = structlog.get_logger(__name__)
 
 ENV_FILE = Path("/etc/netmon/netmon.env")
 APPLIED_VERSION_FILE = Path("/var/lib/netmon/applied-config-version")
+TOKEN_FILE = Path("/var/lib/netmon/enroll-token")
 EXIT_CONFIG_CHANGED = 10
 
 
-def _post(url: str, token: str, body: dict) -> dict | None:
+def _post(url: str, token: str | None, body: dict) -> dict | None:
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-    )
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=25) as resp:
             raw = resp.read().decode("utf-8") or "{}"
@@ -144,13 +139,62 @@ def _run_command(command: str) -> tuple[str, dict]:
         return "failed", {"error": str(exc)}
 
 
+def _store_token(token: str) -> None:
+    try:
+        TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TOKEN_FILE.write_text(token)
+        TOKEN_FILE.chmod(0o600)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not store enroll token", error=str(exc))
+
+
+def _current_token(settings) -> str:
+    """Token from env (manual enroll) else the auto-enroll state file."""
+    if settings.enroll_token:
+        return settings.enroll_token
+    try:
+        return TOKEN_FILE.read_text().strip()
+    except Exception:
+        return ""
+
+
+def _auto_enroll(settings, url: str) -> str:
+    """Self-register with the shared bootstrap key; return the issued token or ''."""
+    if not settings.bootstrap_key:
+        return ""
+    d, s, dev = settings.district_slug, settings.school_slug, settings.device_slug
+    if not (d and s and dev):
+        log.warning("auto-enroll skipped: identity slugs (district/school/device) not set")
+        return ""
+    resp = _post(
+        f"{url}/api/sensor/enroll",
+        None,
+        {"bootstrapKey": settings.bootstrap_key, "district": d, "school": s, "device": dev},
+    )
+    token = (resp or {}).get("token") if isinstance(resp, dict) else None
+    if not token:
+        log.warning("auto-enroll failed (dashboard refused the bootstrap key or was unreachable)")
+        return ""
+    _store_token(token)
+    log.info("auto-enrolled with dashboard; per-sensor token stored")
+    audit("dashboard_auto_enrolled", district=d, school=s, device=dev)
+    return token
+
+
 def run_checkin() -> int:
     settings = get_settings()
     url = (settings.dashboard_url or "").rstrip("/")
-    token = settings.enroll_token or ""
-    if not url or not token:
-        log.info("checkin skipped: NETMON_DASHBOARD_URL / NETMON_ENROLL_TOKEN not set")
+    if not url:
+        log.info("checkin skipped: NETMON_DASHBOARD_URL not set")
         return 0
+
+    token = _current_token(settings)
+    if not token:
+        token = _auto_enroll(settings, url)
+        if not token:
+            log.info("checkin skipped: not enrolled (set NETMON_ENROLL_TOKEN, or "
+                     "NETMON_BOOTSTRAP_KEY + identity slugs for auto-enroll)")
+            return 0
 
     wait_for_db()
     applied = _read_applied_version()
