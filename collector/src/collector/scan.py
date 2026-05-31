@@ -332,6 +332,23 @@ def _persist(
                     "source": "lldp",
                     "extra": "{}",
                 }
+
+    # Backfill hostnames from DHCP option 12 (the name a client advertises in its
+    # DISCOVER/REQUEST). This works even when the site has no reverse-DNS (PTR)
+    # records — which is the common case for client subnets — so endpoints that
+    # nmap couldn't name still get a hostname. Matched by MAC, case-insensitive.
+    dhcp_hostnames: dict[str, str] = {}
+    for d in cap_results.dhcp:
+        mac = (d.get("client_mac") or "").lower()
+        hn = d.get("client_hostname")
+        if mac and hn and mac not in dhcp_hostnames:
+            dhcp_hostnames[mac] = hn
+    if dhcp_hostnames:
+        for dev in seen.values():
+            mac = (dev.get("mac") or "").lower()
+            if mac and not dev.get("hostname") and mac in dhcp_hostnames:
+                dev["hostname"] = dhcp_hostnames[mac]
+
     insert_many("devices", list(seen.values()))
 
     insert_many("neighbors", [
