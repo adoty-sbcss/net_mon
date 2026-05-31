@@ -21,6 +21,7 @@ UNITS=(
     "netmon-deep-refresh"
     "netmon-watchdog"
     "netmon-config-backup"
+    "netmon-checkin"
 )
 
 # Legacy unit names from before the App_Mon → NetMon rename. We disable
@@ -75,6 +76,7 @@ for unit in "${UNITS[@]}"; do
         netmon-deep-refresh)   script="$REPO_DIR/scripts/weekly-deep-refresh.sh" ;;
         netmon-watchdog)       script="$REPO_DIR/scripts/netmon-watchdog.sh" ;;
         netmon-config-backup)  script="$REPO_DIR/scripts/netmon-config-backup.sh" ;;
+        netmon-checkin)        script="$REPO_DIR/scripts/netmon-checkin.sh" ;;
         *) echo "ERROR: no script mapping for unit $unit" >&2; exit 1 ;;
     esac
     if [[ ! -x "$script" ]]; then

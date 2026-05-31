@@ -207,6 +207,18 @@ def cmd_config_backup() -> None:
         sys.exit(2)
 
 
+@cli.command("checkin")
+def cmd_checkin() -> None:
+    """Check in with the dashboard: fetch desired config + run queued commands.
+
+    Outbound HTTPS only. Exits 10 if config changed (the host wrapper restarts
+    the collector so the new config takes effect); 0 otherwise; 1 on error.
+    """
+    from . import checkin as checkin_mod
+
+    sys.exit(checkin_mod.run_checkin())
+
+
 @cli.command("config-list")
 def cmd_config_list() -> None:
     """List available config backups on the SFTP server for this box."""

@@ -97,6 +97,13 @@ class Settings(BaseSettings):
     school_slug: str = Field(default="", alias="NETMON_SCHOOL_SLUG")
     device_slug: str = Field(default="", alias="NETMON_DEVICE_SLUG")
 
+    # --- Dashboard control plane (outbound check-in; no inbound connectivity) ---
+    # When both are set, `python -m collector checkin` polls the dashboard for
+    # desired config + queued commands and reports results. Set NETMON_ENROLL_TOKEN
+    # to the one-time token generated on the sensor's page in the dashboard.
+    dashboard_url: str = Field(default="", alias="NETMON_DASHBOARD_URL")
+    enroll_token: str = Field(default="", alias="NETMON_ENROLL_TOKEN")
+
     bundle_dir: Path = Field(default=Path("/var/lib/netmon/bundles"), alias="NETMON_BUNDLE_DIR")
 
     @property
