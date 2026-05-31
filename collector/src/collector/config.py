@@ -46,9 +46,19 @@ class Settings(BaseSettings):
     # Max hops from a seed device. 5 covers most school-district fabrics
     # without going wild on internet-facing gear.
     snmp_topology_max_depth: int = Field(default=5, alias="NETMON_SNMP_TOPOLOGY_MAX_DEPTH")
-    # Wall-clock cap per scan so the crawl can't blow scan duration on a
-    # large fabric. Stops cleanly when the budget is reached.
-    snmp_topology_time_budget: int = Field(default=60, alias="NETMON_SNMP_TOPOLOGY_TIME_BUDGET")
+    # Wall-clock cap per crawl so it can't blow scan duration on a large
+    # fabric. Stops cleanly when the budget is reached. Because the crawl is
+    # interval-gated (see below) it runs at most ~weekly by default, so we can
+    # afford a generous budget to "really crawl" without slowing hourly scans.
+    snmp_topology_time_budget: int = Field(default=300, alias="NETMON_SNMP_TOPOLOGY_TIME_BUDGET")
+    # How often to actually run the crawl, per monitored network. Topology
+    # changes slowly (it's physical cabling + switch config), so rediscovering
+    # it every hourly scan is wasted compute. Default 7 days; the crawl runs
+    # only if the last one for this network was longer ago than this. A manual
+    # `./netmon scan` (force=True) always crawls, giving an on-demand override.
+    # Set to 0 to crawl on every scan (the old behavior).
+    snmp_topology_interval: int = Field(default=7 * 24 * 3600,
+                                        alias="NETMON_SNMP_TOPOLOGY_INTERVAL")
 
     # --- DNS health probes ---
     # Per scan, query each test name against each resolver (public + DHCP).

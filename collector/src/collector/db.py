@@ -121,6 +121,29 @@ def recent_network_scan(network_id: str, within_seconds: int) -> dict[str, Any] 
             return cur.fetchone()
 
 
+def last_topology_crawl(network_id: str) -> Any | None:
+    """Return the started_at of the most recent scan on this network that
+    actually produced topology rows, or None if we've never crawled it.
+
+    Used to gate the (expensive) SNMP topology crawl to a slow cadence:
+    topology is physical cabling + switch config, so it changes far slower
+    than the hourly host inventory and doesn't need rediscovery every scan.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT max(sr.started_at) AS last_at
+                  FROM topology_nodes tn
+                  JOIN scan_runs sr ON sr.id = tn.scan_run_id
+                 WHERE sr.network_id = %s
+                """,
+                (network_id,),
+            )
+            row = cur.fetchone()
+            return row["last_at"] if row else None
+
+
 def list_scan_runs_in_window(start, end) -> list[dict[str, Any]]:
     """Scans whose completed_at falls in [start, end). Times must be tz-aware."""
     with connect() as conn:

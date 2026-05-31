@@ -7,7 +7,13 @@ from typing import Any
 import structlog
 
 from .config import get_settings
-from .db import complete_scan_run, insert_many, insert_scan_run, recent_network_scan
+from .db import (
+    complete_scan_run,
+    insert_many,
+    insert_scan_run,
+    last_topology_crawl,
+    recent_network_scan,
+)
 from .discovery import arp as arp_mod
 from .discovery import dns_health as dns_mod
 from .discovery import interfaces as iface_mod
@@ -25,6 +31,25 @@ def _network_id(gateway_mac: str | None, cidr: str | None) -> str | None:
     if not cidr:
         return None
     return hashlib.sha256(f"{gateway_mac or 'no-gw'}|{cidr}".encode()).hexdigest()[:16]
+
+
+def _topology_due(net_id: str | None, interval_sec: int) -> bool:
+    """Whether an SNMP topology crawl is due for this network.
+
+    True if interval is disabled (<=0), the network is unknown, we've never
+    crawled it, or the last crawl was longer ago than interval_sec.
+    """
+    if interval_sec <= 0 or not net_id:
+        return True
+    last = last_topology_crawl(net_id)
+    if last is None:
+        return True
+    age = time.time() - last.timestamp()
+    if age < interval_sec:
+        log.info("topology crawl not due, skipping",
+                 network_id=net_id, age_sec=int(age), interval_sec=interval_sec)
+        return False
+    return True
 
 
 def run_scan(*, interface: str, trigger_reason: str, force: bool,
@@ -130,8 +155,15 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
         # 7b. Optional SNMP topology crawl. Reuses the same candidate IPs as
         # seeds (gateway + LLDP mgmt IPs + network-vendor OUIs) and the same
         # community list. Off by default — flip NETMON_SNMP_TOPOLOGY_ENABLED.
+        #
+        # Interval-gated: topology (physical cabling + switch config) changes
+        # far slower than the hourly host inventory, so we crawl at most once
+        # per snmp_topology_interval per network. A manual `./netmon scan`
+        # (force=True) always crawls — an on-demand "rediscover now" override.
         topology: dict[str, Any] | None = None
-        if settings.snmp_enabled and settings.snmp_topology_enabled and snmp_candidates_list:
+        topology_due = force or _topology_due(net_id, settings.snmp_topology_interval)
+        if (settings.snmp_enabled and settings.snmp_topology_enabled
+                and snmp_candidates_list and topology_due):
             try:
                 from .discovery import snmp_topology as topo_mod
                 topology = topo_mod.crawl(
