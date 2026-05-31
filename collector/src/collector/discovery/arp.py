@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from functools import lru_cache
@@ -9,13 +10,37 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
+# A current Wireshark OUI table fetched at image-build time (see Dockerfile).
+# The `manuf` PyPI package bundles a years-old table, which leaves ~a third of
+# real (globally-unique) OUIs unresolved on a typical fleet. We prefer this
+# freshly-baked copy when present and fall back to the bundled one if the
+# build-time download was skipped/unavailable. Runtime stays air-gapped — the
+# file ships inside the image, nothing is fetched on the box.
+_FRESH_OUI_DB = "/usr/share/netmon/manuf"
+
 
 @lru_cache(maxsize=1)
 def _oui_lookup():
     try:
         from manuf import manuf
-        return manuf.MacParser()
     except Exception as exc:  # pragma: no cover — manuf is optional at runtime
+        log.warning("OUI lookup unavailable", error=str(exc))
+        return None
+
+    # Prefer the freshly-baked table; if it's missing or the (older) parser
+    # chokes on its format, fall back to manuf's bundled table so we never
+    # lose vendor lookup entirely.
+    if os.path.exists(_FRESH_OUI_DB) and os.path.getsize(_FRESH_OUI_DB) > 0:
+        try:
+            parser = manuf.MacParser(manuf_name=_FRESH_OUI_DB)
+            log.info("OUI lookup using fresh manuf db", path=_FRESH_OUI_DB)
+            return parser
+        except Exception as exc:
+            log.warning("fresh OUI db unusable, falling back to bundled",
+                        error=str(exc))
+    try:
+        return manuf.MacParser()
+    except Exception as exc:  # pragma: no cover
         log.warning("OUI lookup unavailable", error=str(exc))
         return None
 

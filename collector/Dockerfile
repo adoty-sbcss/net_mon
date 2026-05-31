@@ -21,9 +21,23 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         dnsutils \
         snmp \
         ca-certificates \
+        curl \
         tini \
         procps \
     && rm -rf /var/lib/apt/lists/*
+
+# Refresh the OUI (MAC vendor) table at build time. The `manuf` PyPI package
+# bundles a years-old table that leaves ~a third of real OUIs unresolved; this
+# bakes a current Wireshark manuf file into the image so vendor classification
+# is accurate. Build-time only — the runtime box never reaches out (air-gapped
+# preference). Non-fatal: if the download fails (offline build, URL change),
+# arp.py falls back to manuf's bundled table, so the image still builds.
+RUN mkdir -p /usr/share/netmon \
+    && (curl -fsSL --retry 3 --max-time 60 \
+            -o /usr/share/netmon/manuf \
+            https://www.wireshark.org/download/automated/data/manuf \
+        && echo "OUI table refreshed: $(wc -l < /usr/share/netmon/manuf) entries" \
+        || echo "WARN: OUI refresh failed; falling back to bundled manuf table")
 
 # tshark needs to run as non-root in many environments, but inside this
 # container we are root and capture from the host network namespace — fine.
