@@ -40,6 +40,7 @@ cd "$REPO_DIR"
 . "$LIB_DIR/identity.sh"
 . "$LIB_DIR/sftp.sh"
 . "$LIB_DIR/snmp.sh"
+. "$LIB_DIR/dashboard.sh"
 . "$LIB_DIR/advanced.sh"
 
 WIZARD_SENTINEL="${NETMON_VAR_DIR}/.wizard-done"
@@ -60,7 +61,7 @@ ${C_HEAD}╔══════════════════════�
 
 This walks you through the settings the box needs to start collecting
 and uploading. You can re-run any time with:  sudo netmon-wizard
-Per-section runs:  sudo netmon-wizard identity | sftp | snmp | advanced
+Per-section runs:  sudo netmon-wizard identity | sftp | snmp | dashboard | advanced
 
 Press Enter at any prompt to keep the current value (shown in brackets).
 
@@ -92,6 +93,7 @@ run_full() {
     print_banner
     run_essentials
     prompt_snmp_config
+    prompt_dashboard_config
 
     echo ""
     if prompt_yesno "Set up advanced options now (scan mode, cadence, log level)?" "N"; then
@@ -119,6 +121,7 @@ case "${1:-}" in
     identity)      prompt_identity_config ;;
     sftp)          prompt_sftp_config "$(current_value NETMON_DEVICE)" ;;
     snmp)          prompt_snmp_config ;;
+    dashboard)     prompt_dashboard_config ;;
     advanced)      prompt_advanced_config ;;
     cadence)       prompt_scan_cadence ;;
     loglevel|log)  prompt_log_level ;;
