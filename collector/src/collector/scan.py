@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from typing import Any
 
@@ -19,6 +20,7 @@ from .discovery import dns_health as dns_mod
 from .discovery import interfaces as iface_mod
 from .discovery import lldp as lldp_mod
 from .discovery import nmap as nmap_mod
+from .discovery import rdns as rdns_mod
 from .discovery import snmp as snmp_mod
 from .discovery import tshark as tshark_mod
 from .logging_setup import audit
@@ -348,6 +350,34 @@ def _persist(
             mac = (dev.get("mac") or "").lower()
             if mac and not dev.get("hostname") and mac in dhcp_hostnames:
                 dev["hostname"] = dhcp_hostnames[mac]
+
+    # Reverse DNS (PTR) for anything still unnamed, querying the LOCAL site
+    # resolvers (DHCP-assigned DNS + gateway) — nmap only used the container's
+    # resolver, which is usually public DNS with no internal records.
+    settings = get_settings()
+    if settings.rdns_enabled:
+        resolvers: list[str] = []
+        for d in cap_results.dhcp:
+            ds = d.get("dns_servers")
+            if ds:
+                resolvers += [x for x in re.split(r"[\s,]+", str(ds)) if x]
+        if ctx.gateway_ip:
+            resolvers.append(ctx.gateway_ip)
+        # de-dup, preserve order
+        _seenr: set[str] = set()
+        resolvers = [r for r in resolvers if not (r in _seenr or _seenr.add(r))]
+        need = [
+            dev["ip"]
+            for dev in seen.values()
+            if dev.get("ip") and not dev.get("hostname")
+        ]
+        if need and resolvers:
+            ptr = rdns_mod.resolve_ptr(need, resolvers, timeout=settings.rdns_timeout_sec)
+            for dev in seen.values():
+                ip = dev.get("ip")
+                if ip and not dev.get("hostname") and ip in ptr:
+                    dev["hostname"] = ptr[ip]
+                    dev["source"] = (dev.get("source") or "") + "+rdns"
 
     insert_many("devices", list(seen.values()))
 

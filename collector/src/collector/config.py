@@ -60,6 +60,14 @@ class Settings(BaseSettings):
     snmp_topology_interval: int = Field(default=7 * 24 * 3600,
                                         alias="NETMON_SNMP_TOPOLOGY_INTERVAL")
 
+    # --- Reverse DNS (PTR) enrichment ---
+    # After discovery, look up PTR records for devices that still have no
+    # hostname, querying the LOCAL site resolver(s) (DHCP-assigned DNS + gateway)
+    # rather than only nmap's container resolver — which is often public DNS with
+    # no internal records. Fills internal hostnames nmap can't.
+    rdns_enabled: bool = Field(default=True, alias="NETMON_RDNS_ENABLED")
+    rdns_timeout_sec: int = Field(default=2, alias="NETMON_RDNS_TIMEOUT_SEC")
+
     # --- DNS health probes ---
     # Per scan, query each test name against each resolver (public + DHCP).
     dns_enabled: bool = Field(default=True, alias="NETMON_DNS_ENABLED")

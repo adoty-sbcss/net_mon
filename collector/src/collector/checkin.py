@@ -94,14 +94,64 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_SNMP_ENABLED"] = "true" if data.get("snmp_enabled") else "false"
     if data.get("rescan_interval"):
         mapping["NETMON_RESCAN_INTERVAL"] = str(int(data["rescan_interval"]))
+    # SFTP upload destination (pushed from the dashboard).
+    if "sftp_enabled" in data:
+        mapping["NETMON_SFTP_ENABLED"] = "true" if data.get("sftp_enabled") else "false"
+    if "sftp_host" in data:
+        mapping["NETMON_SFTP_HOST"] = str(data.get("sftp_host") or "")
+    if data.get("sftp_port"):
+        mapping["NETMON_SFTP_PORT"] = str(int(data["sftp_port"]))
+    if "sftp_user" in data:
+        mapping["NETMON_SFTP_USER"] = str(data.get("sftp_user") or "")
+    if data.get("sftp_password"):  # only overwrite when a value is provided
+        mapping["NETMON_SFTP_PASSWORD"] = str(data["sftp_password"])
+    if "sftp_remote_path" in data:
+        mapping["NETMON_SFTP_REMOTE_PATH"] = str(data.get("sftp_remote_path") or "/")
     if mapping:
         _update_env_file(ENV_FILE, mapping)
         log.info("applied desired config", keys=list(mapping))
 
 
+def _local_net() -> tuple[str | None, str | None, str | None]:
+    """Best-effort (primary_ip, interface, cidr) for the box to report at check-in."""
+    try:
+        from .discovery import interfaces as iface_mod
+
+        name = iface_mod.primary_interface()
+        if not name:
+            return (None, None, None)
+        st = iface_mod.get_one(name)
+        addrs = list(getattr(st, "ipv4_addrs", None) or [])
+        cidr = addrs[0] if addrs else None
+        ip = cidr.split("/")[0] if cidr else None
+        return (ip, name, cidr)
+    except Exception:
+        return (None, None, None)
+
+
+def _collect_logs(lines: int = 250) -> tuple[str, dict]:
+    """Return the tail of the collector + audit logs for the dashboard to show."""
+    from .logging_setup import LOG_DIR
+
+    out: dict[str, str] = {}
+    for fname in ("collector.log", "audit.log"):
+        p = LOG_DIR / fname
+        try:
+            tail = p.read_text(errors="replace").splitlines()[-lines:]
+            text = "\n".join(tail)
+            out[fname] = text[-20000:]  # cap size stored in the result
+        except FileNotFoundError:
+            out[fname] = "(no file)"
+        except Exception as exc:  # noqa: BLE001
+            out[fname] = f"(could not read: {exc})"
+    return "done", out
+
+
 def _run_command(command: str) -> tuple[str, dict]:
     """Execute a queued command. Returns (status, result)."""
     try:
+        if command == "collect-logs":
+            return _collect_logs()
         if command == "run-scan":
             from .discovery import interfaces as iface_mod
             from .scan import run_scan
@@ -198,10 +248,17 @@ def run_checkin() -> int:
 
     wait_for_db()
     applied = _read_applied_version()
+    local_ip, iface, cidr = _local_net()
     resp = _post(
         f"{url}/api/sensor/checkin",
         token,
-        {"agentVersion": __version__, "configVersion": applied},
+        {
+            "agentVersion": __version__,
+            "configVersion": applied,
+            "localIp": local_ip,
+            "interface": iface,
+            "interfaceCidr": cidr,
+        },
     )
     if resp is None:
         return 1
