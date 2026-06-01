@@ -68,6 +68,15 @@ class Settings(BaseSettings):
     rdns_enabled: bool = Field(default=True, alias="NETMON_RDNS_ENABLED")
     rdns_timeout_sec: int = Field(default=2, alias="NETMON_RDNS_TIMEOUT_SEC")
 
+    # --- Network-device reachability (ping + traceroute + SNMP-response) ---
+    # Each scan, probe the infrastructure candidate set (gateway + LLDP mgmt IPs
+    # + network-vendor OUIs) so the dashboard can show which switches are out
+    # there and which answer SNMP vs. only ping. Cheap; traceroute is skipped
+    # gracefully if the binary is missing.
+    reachability_enabled: bool = Field(default=True, alias="NETMON_REACHABILITY_ENABLED")
+    reachability_traceroute: bool = Field(default=True, alias="NETMON_REACHABILITY_TRACEROUTE")
+    reachability_max_hops: int = Field(default=10, alias="NETMON_REACHABILITY_MAX_HOPS")
+
     # --- DNS health probes ---
     # Per scan, query each test name against each resolver (public + DHCP).
     dns_enabled: bool = Field(default=True, alias="NETMON_DNS_ENABLED")

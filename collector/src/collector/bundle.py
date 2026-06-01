@@ -111,10 +111,11 @@ def _scan_payload(scan_id: int) -> dict[str, str]:
     topo_nodes = fetch_table_for_scan("topology_nodes", scan_id)
     topo_edges = fetch_table_for_scan("topology_edges", scan_id)
     dns = fetch_table_for_scan("dns_probes", scan_id)
+    reachability = fetch_table_for_scan("network_reachability", scan_id)
 
     return {
         "summary.md": _build_summary_md(scan, devices, neighbors, arp, dhcp, stp,
-                                        traffic, snmp, findings, dns),
+                                        traffic, snmp, findings, dns, reachability),
         "findings.json": _jsonify(findings),
         "topology.json": json.dumps(_build_topology(scan, devices, neighbors, arp),
                                     indent=2, default=_default),
@@ -131,6 +132,12 @@ def _scan_payload(scan_id: int) -> dict[str, str]:
                                     indent=2, default=_default),
         "dns_health.json": json.dumps(_build_dns_health(dns),
                                       indent=2, default=_default),
+        # Network-device reachability: per infrastructure candidate, ping +
+        # SNMP-response + traceroute. The dashboard renders this as the
+        # "switches out there / SNMP reachability" view.
+        "net_reachability.json": json.dumps({"devices": reachability},
+                                            indent=2, default=_default),
+        "raw/net-reachability.json": _jsonify(reachability),
         "raw/scan.json": _jsonify(scan),
         "raw/lldp-neighbors.json": _jsonify(neighbors),
         "raw/arp-table.json": _jsonify(arp),
@@ -160,6 +167,7 @@ def _build_summary_md(
     snmp: list[dict[str, Any]],
     findings: list[dict[str, Any]],
     dns: list[dict[str, Any]],
+    reachability: list[dict[str, Any]] | None = None,
 ) -> str:
     lines = []
     lines.append(f"# NetMon scan #{scan['id']}")
@@ -196,6 +204,32 @@ def _build_summary_md(
                 f"- `{n.get('local_port')}` ← **{n.get('system_name') or n.get('chassis_id')}** "
                 f"port `{n.get('port_id')}` "
                 f"({n.get('protocol')}, vlan={n.get('vlan_id')}, mgmt={n.get('mgmt_ip')})"
+            )
+        lines.append("")
+
+    if reachability:
+        snmp_ok = [r for r in reachability if r.get("snmp_responded")]
+        ping_only = [r for r in reachability
+                     if r.get("ping_alive") and not r.get("snmp_responded")]
+        dead = [r for r in reachability if not r.get("ping_alive")]
+        lines.append("## Network device reachability")
+        lines.append("")
+        lines.append(f"- Infrastructure candidates probed: **{len(reachability)}**")
+        lines.append(f"- Answered SNMP: **{len(snmp_ok)}**")
+        lines.append(f"- Ping-only (SNMP not answering — ACL or SNMP off): **{len(ping_only)}**")
+        lines.append(f"- Unreachable (no ping): **{len(dead)}**")
+        lines.append("")
+        lines.append("| IP | Host | Vendor | Ping | RTT ms | SNMP | Hops |")
+        lines.append("|---|---|---|---|---:|---|---:|")
+        for r in reachability:
+            ping = "up" if r.get("ping_alive") else "down"
+            snmpv = "yes" if r.get("snmp_responded") else "no"
+            rtt = r.get("ping_rtt_ms")
+            hops = r.get("traceroute_hops")
+            lines.append(
+                f"| {r.get('ip')} | {r.get('hostname') or '-'} | {r.get('vendor') or '-'} "
+                f"| {ping} | {f'{rtt:.1f}' if isinstance(rtt, (int, float)) else '-'} "
+                f"| {snmpv} | {hops if hops is not None else '-'} |"
             )
         lines.append("")
 

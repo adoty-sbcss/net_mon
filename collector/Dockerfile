@@ -10,7 +10,7 @@ ENV PYTHONUNBUFFERED=1 \
 # - nmap: -sn host discovery
 # - tshark: control-plane capture
 # - iproute2: ip / ss
-# - iputils-ping, dnsutils: ad-hoc checks
+# - iputils-ping, traceroute, dnsutils: reachability probes + ad-hoc checks
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         lldpd \
         arp-scan \
@@ -18,6 +18,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         tshark \
         iproute2 \
         iputils-ping \
+        traceroute \
         dnsutils \
         snmp \
         ca-certificates \

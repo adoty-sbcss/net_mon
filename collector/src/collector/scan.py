@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from typing import Any
@@ -10,6 +11,7 @@ import structlog
 from .config import get_settings
 from .db import (
     complete_scan_run,
+    get_snmp_credential,
     insert_many,
     insert_scan_run,
     last_topology_crawl,
@@ -21,6 +23,7 @@ from .discovery import interfaces as iface_mod
 from .discovery import lldp as lldp_mod
 from .discovery import nmap as nmap_mod
 from .discovery import rdns as rdns_mod
+from .discovery import reachability as reach_mod
 from .discovery import snmp as snmp_mod
 from .discovery import tshark as tshark_mod
 from .logging_setup import audit
@@ -139,16 +142,19 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
         else:
             nmap_results = []
 
+        # Infrastructure candidate set (gateway + LLDP mgmt IPs + network-vendor
+        # OUIs). Computed unconditionally — reused by SNMP polling, topology
+        # seeds, AND the reachability probe (which runs even when SNMP is off).
+        snmp_candidates_list = _snmp_candidates(
+            state.gateway_ip, lldp_neighbors, arp_results, nmap_results,
+            include_all_hosts=settings.snmp_poll_all_hosts)
+        log.info("network device candidate set", count=len(snmp_candidates_list),
+                 ips=snmp_candidates_list)
+
         # 7. Optional SNMP polling
         snmp_results: list[dict[str, Any]] = []
-        snmp_candidates_list: list[str] = []
-        if settings.snmp_enabled:
+        if settings.snmp_enabled and snmp_candidates_list:
             try:
-                snmp_candidates_list = _snmp_candidates(
-                    state.gateway_ip, lldp_neighbors, arp_results, nmap_results,
-                    include_all_hosts=settings.snmp_poll_all_hosts)
-                log.info("snmp candidate set", count=len(snmp_candidates_list),
-                         ips=snmp_candidates_list)
                 snmp_results = snmp_mod.poll(snmp_candidates_list)
                 ctx.raw_outputs["snmp"] = snmp_results
             except Exception as exc:  # pragma: no cover — defensive
@@ -192,6 +198,23 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
             except Exception as exc:  # pragma: no cover — defensive
                 log.warning("dns probes failed", error=str(exc))
 
+        # 7d. Network-device reachability — ping + traceroute + SNMP-response for
+        # the infrastructure candidate set. Surfaces which switches are out there
+        # and which answer SNMP vs. only ping (the common ACL/SNMP-off case).
+        reachability: list[dict[str, Any]] = []
+        if settings.reachability_enabled and snmp_candidates_list:
+            try:
+                reachability = _probe_reachability(
+                    snmp_candidates_list, state.gateway_ip, lldp_neighbors,
+                    arp_results, nmap_results, snmp_results,
+                )
+                ctx.raw_outputs["reachability"] = reachability
+                log.info("reachability probe", count=len(reachability),
+                         snmp_ok=sum(1 for r in reachability if r.get("snmp_responded")),
+                         ping_ok=sum(1 for r in reachability if r.get("ping_alive")))
+            except Exception as exc:  # pragma: no cover — defensive
+                log.warning("reachability probe failed", error=str(exc))
+
         # 8. Persist everything
         _persist(
             ctx,
@@ -204,6 +227,7 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
             snmp_results=snmp_results,
             topology=topology,
             dns_results=dns_results,
+            reachability=reachability,
         )
 
     except Exception as exc:
@@ -280,6 +304,61 @@ def _snmp_candidates(
     return ips
 
 
+def _probe_reachability(
+    candidate_ips: list[str],
+    gateway_ip: str | None,
+    lldp_neighbors: list[dict[str, Any]],
+    arp_results: list[dict[str, Any]],
+    nmap_results: list[dict[str, Any]],
+    snmp_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build reachability targets from the candidate set + per-IP metadata, then
+    ping/traceroute them. SNMP-responded is derived from this scan's poll rows
+    plus the cached credential (a known-working community)."""
+    settings = get_settings()
+
+    # ip -> (hostname, vendor) from this scan's discovery, best-effort.
+    meta: dict[str, dict[str, Any]] = {}
+    for r in arp_results + nmap_results:
+        ip = r.get("ip")
+        if ip and ip not in meta:
+            meta[ip] = {"hostname": r.get("hostname"), "vendor": r.get("vendor")}
+    lldp_mgmt: set[str] = set()
+    for n in lldp_neighbors:
+        ip = n.get("mgmt_ip")
+        if ip:
+            lldp_mgmt.add(ip)
+            meta.setdefault(ip, {"hostname": n.get("system_name"), "vendor": None})
+
+    snmp_ok = {p.get("device_ip") for p in snmp_results}
+
+    targets: list[dict[str, Any]] = []
+    for ip in candidate_ips:
+        cred = get_snmp_credential(ip)
+        responded = (ip in snmp_ok) or bool(cred and cred.get("community"))
+        if ip == gateway_ip:
+            source = "gateway"
+        elif ip in lldp_mgmt:
+            source = "lldp"
+        else:
+            source = "oui"
+        m = meta.get(ip, {})
+        targets.append({
+            "ip": ip,
+            "hostname": m.get("hostname"),
+            "vendor": m.get("vendor"),
+            "source": source,
+            "snmp_responded": responded,
+            "snmp_version": (cred or {}).get("version") if responded else None,
+        })
+
+    return reach_mod.probe(
+        targets,
+        traceroute=settings.reachability_traceroute,
+        max_hops=settings.reachability_max_hops,
+    )
+
+
 def _persist(
     ctx: ScanContext,
     *,
@@ -292,6 +371,7 @@ def _persist(
     snmp_results: list[dict[str, Any]],
     topology: dict[str, Any] | None = None,
     dns_results: list[dns_mod.DnsProbeResult] | None = None,
+    reachability: list[dict[str, Any]] | None = None,
 ) -> None:
     # Devices: merge unique by (ip, mac), recording the discovery source.
     seen: dict[tuple[str | None, str | None], dict[str, Any]] = {}
@@ -457,6 +537,26 @@ def _persist(
                 "error": r.error,
             }
             for r in dns_results
+        ])
+
+    # Network-device reachability rows (ping + traceroute + SNMP-response).
+    if reachability:
+        insert_many("network_reachability", [
+            {
+                "scan_run_id": ctx.scan_id,
+                "ip": r.get("ip"),
+                "hostname": r.get("hostname"),
+                "vendor": r.get("vendor"),
+                "source": r.get("source"),
+                "ping_alive": r.get("ping_alive"),
+                "ping_rtt_ms": r.get("ping_rtt_ms"),
+                "ping_loss_pct": r.get("ping_loss_pct"),
+                "snmp_responded": r.get("snmp_responded"),
+                "snmp_version": r.get("snmp_version"),
+                "traceroute_hops": r.get("traceroute_hops"),
+                "traceroute_path": json.dumps(r.get("traceroute_path") or []),
+            }
+            for r in reachability
         ])
 
 
