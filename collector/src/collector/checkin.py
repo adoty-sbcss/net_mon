@@ -258,6 +258,16 @@ def run_checkin() -> int:
             "localIp": local_ip,
             "interface": iface,
             "interfaceCidr": cidr,
+            # Actual config the box is running, so the dashboard can show ground
+            # truth (not just what it pushed). The SFTP password is NEVER reported.
+            "currentConfig": {
+                "snmp_enabled": settings.snmp_enabled,
+                "snmp_communities": settings.snmp_communities,
+                "sftp_enabled": settings.sftp_enabled,
+                "sftp_host": settings.sftp_host,
+                "sftp_port": settings.sftp_port,
+                "sftp_user": settings.sftp_user,
+            },
         },
     )
     if resp is None:
