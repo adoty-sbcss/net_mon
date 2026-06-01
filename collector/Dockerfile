@@ -19,6 +19,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         iproute2 \
         iputils-ping \
         traceroute \
+        iperf3 \
         dnsutils \
         snmp \
         ca-certificates \

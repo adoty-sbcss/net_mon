@@ -107,6 +107,21 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_SFTP_PASSWORD"] = str(data["sftp_password"])
     if "sftp_remote_path" in data:
         mapping["NETMON_SFTP_REMOTE_PATH"] = str(data.get("sftp_remote_path") or "/")
+    # iperf3 schedule/params (#10) pushed from the dashboard.
+    if "iperf_enabled" in data:
+        mapping["NETMON_IPERF_ENABLED"] = "true" if data.get("iperf_enabled") else "false"
+    if "iperf_server" in data:
+        mapping["NETMON_IPERF_SERVER"] = str(data.get("iperf_server") or "")
+    if data.get("iperf_port"):
+        mapping["NETMON_IPERF_PORT"] = str(int(data["iperf_port"]))
+    if data.get("iperf_schedule_sec"):
+        mapping["NETMON_IPERF_SCHEDULE_SEC"] = str(int(data["iperf_schedule_sec"]))
+    if data.get("iperf_duration"):
+        mapping["NETMON_IPERF_DURATION"] = str(int(data["iperf_duration"]))
+    if "iperf_direction" in data:
+        mapping["NETMON_IPERF_DIRECTION"] = str(data.get("iperf_direction") or "down")
+    if "iperf_protocol" in data:
+        mapping["NETMON_IPERF_PROTOCOL"] = str(data.get("iperf_protocol") or "tcp")
     if mapping:
         _update_env_file(ENV_FILE, mapping)
         log.info("applied desired config", keys=list(mapping))
@@ -231,6 +246,83 @@ def _auto_enroll(settings, url: str) -> str:
     return token
 
 
+IPERF_LAST_FILE = Path("/var/lib/netmon/iperf-last-run")
+
+
+def _report_iperf(url: str, token: str | None, res: dict, trigger: str) -> None:
+    """POST an iperf result to the dashboard (best-effort)."""
+    from datetime import datetime, timezone
+
+    _post(
+        f"{url}/api/sensor/iperf-result",
+        token,
+        {
+            "trigger": trigger,
+            "serverHost": res.get("server"),
+            "serverPort": res.get("port"),
+            "protocol": res.get("protocol"),
+            "direction": res.get("direction"),
+            "durationSec": res.get("duration"),
+            "throughputMbps": res.get("throughput_mbps"),
+            "retransmits": res.get("retransmits"),
+            "jitterMs": res.get("jitter_ms"),
+            "lossPct": res.get("loss_pct"),
+            "ok": res.get("ok", False),
+            "error": res.get("error"),
+            "raw": res.get("raw"),
+            "startedAt": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def _run_iperf_command(url: str, token: str | None, args: dict, trigger: str) -> tuple[str, dict]:
+    """On-demand iperf run from the command queue; reports the full result and
+    returns a short command-status summary."""
+    from .iperf import run_iperf
+
+    res = run_iperf(
+        server=str(args.get("server") or ""),
+        port=int(args.get("port") or 5201),
+        protocol=str(args.get("protocol") or "tcp"),
+        direction=str(args.get("direction") or "down"),
+        duration=int(args.get("duration") or 10),
+    )
+    _report_iperf(url, token, res, trigger)
+    if res.get("ok"):
+        return "done", {"throughput_mbps": res.get("throughput_mbps")}
+    return "failed", {"error": res.get("error")}
+
+
+def _maybe_scheduled_iperf(url: str, token: str | None, settings) -> None:
+    """Run a scheduled iperf test if enabled and the interval has elapsed."""
+    import time
+
+    if not settings.iperf_enabled or not settings.iperf_server:
+        return
+    now = time.time()
+    try:
+        last = float(IPERF_LAST_FILE.read_text().strip())
+    except Exception:
+        last = 0.0
+    if now - last < max(300, settings.iperf_schedule_sec):
+        return
+    from .iperf import run_iperf
+
+    res = run_iperf(
+        server=settings.iperf_server,
+        port=settings.iperf_port,
+        protocol=settings.iperf_protocol,
+        direction=settings.iperf_direction,
+        duration=settings.iperf_duration,
+    )
+    _report_iperf(url, token, res, "scheduled")
+    try:
+        IPERF_LAST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        IPERF_LAST_FILE.write_text(str(now))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not persist iperf last-run", error=str(exc))
+
+
 def run_checkin() -> int:
     settings = get_settings()
     url = (settings.dashboard_url or "").rstrip("/")
@@ -288,12 +380,18 @@ def run_checkin() -> int:
         cid = cmd.get("id")
         name = cmd.get("command")
         log.info("running queued command", id=cid, command=name)
-        status, result = _run_command(str(name))
+        if name == "iperf":
+            status, result = _run_iperf_command(url, token, cmd.get("args") or {}, "manual")
+        else:
+            status, result = _run_command(str(name))
         audit("dashboard_command_ran", id=cid, command=name, status=status)
         _post(
             f"{url}/api/sensor/result",
             token,
             {"commandId": cid, "status": status, "result": result, "configVersion": applied},
         )
+
+    # Scheduled iperf piggybacks on the check-in cadence (runs if due).
+    _maybe_scheduled_iperf(url, token, settings)
 
     return EXIT_CONFIG_CHANGED if config_changed else 0

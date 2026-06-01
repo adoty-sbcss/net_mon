@@ -107,6 +107,15 @@ class Settings(BaseSettings):
     sftp_remote_path: str = Field(default="/", alias="NETMON_SFTP_REMOTE_PATH")
     device_name: str = Field(default="", alias="NETMON_DEVICE_NAME")
 
+    # iperf3 throughput testing (#10). Pushed from the dashboard via desired_config.
+    iperf_enabled: bool = Field(default=False, alias="NETMON_IPERF_ENABLED")
+    iperf_server: str = Field(default="", alias="NETMON_IPERF_SERVER")
+    iperf_port: int = Field(default=5201, alias="NETMON_IPERF_PORT")
+    iperf_schedule_sec: int = Field(default=3600, alias="NETMON_IPERF_SCHEDULE_SEC")
+    iperf_duration: int = Field(default=10, alias="NETMON_IPERF_DURATION")
+    iperf_direction: str = Field(default="down", alias="NETMON_IPERF_DIRECTION")
+    iperf_protocol: str = Field(default="tcp", alias="NETMON_IPERF_PROTOCOL")
+
     # Box identity (set by the first-boot wizard; empty on pre-wizard installs).
     # Used to tag scan_runs rows and, in a future phase, to drive the
     # hierarchical SFTP path and bundle filenames.
