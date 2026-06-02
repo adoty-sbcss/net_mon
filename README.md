@@ -33,6 +33,21 @@ cd NetMon
 
 That's it. `setup.sh` is **safe to re-run** any time — it skips steps that are already done, so it's also how you reinstall things.
 
+### Minimal-touch enrollment (recommended for a fleet)
+
+The dashboard URL and the shared enrollment **bootstrap key** are identical on every box, so you can bake them in and let the technician type *only the site identity*. Before running `setup.sh`, drop a provisioning file in the cloned repo:
+
+```bash
+cp config/provisioning.env.example config/provisioning.env
+# paste the URL + key the dashboard shows under
+#   Settings → SFTP ingestion → Sensor auto-enrollment
+$EDITOR config/provisioning.env
+```
+
+On first run the wizard pre-fills the dashboard URL and bootstrap key from this file, so the tech just presses **Enter** to accept them. The box then **self-enrolls** on its first check-in (presenting the key + its identity), is issued its own per-sensor token, and appears under **Sensors** in the dashboard — no token copying. The dashboard's enrollment page generates this exact snippet for you.
+
+> **Security:** the bootstrap key is a shared secret and this repo is public, so `config/provisioning.env` is git-ignored — never commit it. Distribute it out-of-band (config-management, a golden image, or your own secure channel), and rotate it from the dashboard if it leaks. See [lib/provisioning.sh](lib/provisioning.sh).
+
 ### The first-boot wizard
 
 `setup.sh` invokes `netmon-wizard` which walks you through:
@@ -40,6 +55,9 @@ That's it. `setup.sh` is **safe to re-run** any time — it skips steps that are
 **Essentials** (always asked):
 - **Identity** — district, school, and device/location label (e.g. "Library IDF"). These tag every scan and organize uploads on the SFTP server into `<district>/<school>/<device>/` folders.
 - **SFTP destination** — host, port, user, password (silent), remote path.
+
+**Dashboard enrollment** (asked next):
+- **Dashboard URL** and **bootstrap key** — pre-filled if you created `config/provisioning.env` (above), so just press Enter. Leave the URL blank to run an SFTP-only box with no dashboard.
 
 **Then** the wizard asks "Set up advanced options now?" — say yes only if you want to override defaults for:
 - SNMP communities (if you have read strings for switches/routers)
@@ -55,6 +73,7 @@ sudo netmon-wizard               # full re-run (current values shown as defaults
 sudo netmon-wizard identity      # just district / school / device
 sudo netmon-wizard sftp          # just SFTP destination
 sudo netmon-wizard snmp          # just SNMP communities
+sudo netmon-wizard dashboard     # just dashboard URL + enrollment bootstrap key
 sudo netmon-wizard advanced      # mode / cadence / log level
 ```
 

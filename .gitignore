@@ -7,6 +7,11 @@ bundles/
 logs/
 config/snmp.yaml
 
+# Site provisioning defaults — contains the shared enrollment bootstrap key
+# (a secret). This repo is public; never commit the real file. Only the
+# *.example template is tracked. See lib/provisioning.sh.
+config/provisioning.env
+
 **/__pycache__/
 *.pyc
 .venv/

@@ -36,6 +36,7 @@ cd "$REPO_DIR"
 . "$LIB_DIR/common.sh"
 . "$LIB_DIR/paths.sh"
 . "$LIB_DIR/envfile.sh"
+. "$LIB_DIR/provisioning.sh"
 . "$LIB_DIR/validate.sh"
 . "$LIB_DIR/identity.sh"
 . "$LIB_DIR/sftp.sh"
@@ -51,6 +52,11 @@ ensure_paths
 # Seed netmon.env from the repo template on the very first run so the prompts
 # show sensible defaults instead of blank lines.
 seed_env_from_example "$REPO_DIR/.env.example"
+
+# Overlay any site provisioning defaults (dashboard URL, bootstrap key, and
+# optionally shared SFTP fields) so they appear pre-filled at the prompts.
+# Only fills keys that are still empty — never clobbers an operator's value.
+seed_env_from_provisioning
 
 print_banner() {
     cat <<EOF
