@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     # every discovered host so printers / PCs / IoT get classified via SNMP
     # (Printer-MIB, Host-Resources, etc.). Costs a community trial per host.
     snmp_poll_all_hosts: bool = Field(default=False, alias="NETMON_SNMP_POLL_ALL_HOSTS")
+    # Explicit extra SNMP target IPs beyond the auto-discovered candidate set,
+    # pushed from the dashboard equipment registry (devices the operator marked
+    # monitor=SNMP) so registered gear is always polled even when the OUI/heuristic
+    # candidate selection would miss it. Comma-separated.
+    snmp_extra_targets: str = Field(default="", alias="NETMON_SNMP_EXTRA_TARGETS")
 
     # SNMP topology crawl (Path B). Off by default — turn on once SNMP is
     # working against your switches and you want fabric topology in bundles.
@@ -152,6 +157,10 @@ class Settings(BaseSettings):
     @property
     def snmp_community_list(self) -> tuple[str, ...]:
         return tuple(s.strip() for s in self.snmp_communities.split(",") if s.strip())
+
+    @property
+    def snmp_extra_target_list(self) -> tuple[str, ...]:
+        return tuple(s.strip() for s in self.snmp_extra_targets.split(",") if s.strip())
 
 
 _settings: Settings | None = None

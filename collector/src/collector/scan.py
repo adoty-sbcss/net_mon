@@ -301,6 +301,10 @@ def _snmp_candidates(
     for r in nmap_results:
         if include_all_hosts or looks_like_network_gear(r.get("vendor")):
             add(r.get("ip"))
+    # Operator-registered SNMP targets pushed from the dashboard registry — always
+    # polled even if the OUI/heuristic selection above would miss them.
+    for ip in get_settings().snmp_extra_target_list:
+        add(ip)
     return ips
 
 
