@@ -33,11 +33,16 @@ rc=$?
 while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done <<< "$out"
 
 if [ "$rc" = "10" ]; then
-    log "config changed; restarting collector"
-    if "${DC[@]}" restart collector >/dev/null 2>&1; then
-        log "collector restarted"
+    # MUST recreate, not restart: the collector reads its config from the
+    # process environment that compose injects from env_file at CREATE time.
+    # `docker compose restart` reuses the existing container, so a rewritten
+    # netmon.env is NOT picked up. `up -d --force-recreate` rebuilds the
+    # container with the new environment.
+    log "config changed; recreating collector to load new env"
+    if "${DC[@]}" up -d --force-recreate collector >/dev/null 2>&1; then
+        log "collector recreated"
     else
-        log "collector restart FAILED"
+        log "collector recreate FAILED"
     fi
     exit 0
 elif [ "$rc" = "0" ]; then
