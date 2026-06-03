@@ -65,8 +65,15 @@ services:
         max-size: "10m"
         max-file: "5"
     volumes:
-      - /var/lib/netmon/bundles:/var/lib/netmon/bundles
-      - /etc/netmon:/etc/netmon:ro
+      # Full state dir (not just bundles/) so the enrollment token, applied-
+      # config version, and iperf last-run survive a container rebuild —
+      # otherwise every recreate wipes the token and forces re-enrollment.
+      - /var/lib/netmon:/var/lib/netmon
+      # MUST be read-write: the dashboard control-plane check-in rewrites
+      # netmon.env in place to apply pushed config (SNMP targets/communities,
+      # SFTP, iperf). A read-only mount makes every check-in crash with
+      # "Read-only file system" and silently disables config push.
+      - /etc/netmon:/etc/netmon
       # Persistent rotated logs on the host. See logging_setup.py.
       - /var/log/netmon:/var/log/netmon
       # Schema migrations applied by the collector on startup. Mounted (not

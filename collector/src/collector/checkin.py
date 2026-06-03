@@ -253,7 +253,7 @@ IPERF_LAST_FILE = Path("/var/lib/netmon/iperf-last-run")
 
 def _report_iperf(url: str, token: str | None, res: dict, trigger: str) -> None:
     """POST an iperf result to the dashboard (best-effort)."""
-    from datetime import datetime, timezone
+    from datetime import UTC, datetime
 
     _post(
         f"{url}/api/sensor/iperf-result",
@@ -272,7 +272,7 @@ def _report_iperf(url: str, token: str | None, res: dict, trigger: str) -> None:
             "ok": res.get("ok", False),
             "error": res.get("error"),
             "raw": res.get("raw"),
-            "startedAt": datetime.now(timezone.utc).isoformat(),
+            "startedAt": datetime.now(UTC).isoformat(),
         },
     )
 
@@ -372,11 +372,19 @@ def run_checkin() -> int:
     if isinstance(cfg, dict):
         version = cfg.get("version")
         if isinstance(version, int) and version != applied:
-            _apply_config(cfg.get("data") or {})
-            _write_applied_version(version)
-            applied = version
-            config_changed = True
-            audit("dashboard_config_applied", version=version)
+            # Don't let a config-apply failure (e.g. a read-only env file) abort
+            # the whole check-in — command dispatch and reporting must still run.
+            # Leave applied-version unbumped so the next check-in retries.
+            try:
+                _apply_config(cfg.get("data") or {})
+                _write_applied_version(version)
+                applied = version
+                config_changed = True
+                audit("dashboard_config_applied", version=version)
+            except Exception as exc:  # noqa: BLE001
+                log.error("failed to apply pushed config; will retry next check-in",
+                          version=version, error=str(exc))
+                audit("dashboard_config_apply_failed", version=version, error=str(exc))
 
     for cmd in resp.get("commands") or []:
         cid = cmd.get("id")
