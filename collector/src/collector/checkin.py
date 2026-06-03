@@ -4,12 +4,17 @@ The box NEVER accepts inbound connections. On a timer it POSTs to the dashboard
 with its enrollment token, reports its agent + applied-config version, then:
   - applies any newer desired config (SNMP strings, scan interval) by rewriting
     /etc/netmon/netmon.env — which takes effect on the next collector restart;
-  - runs any queued commands (run-scan / upload-now / config-backup) and reports
-    each result back.
+  - runs any queued commands (run-scan / upload-now / config-backup / update)
+    and reports each result back.
 
-Returns exit code 10 when config changed so the host wrapper can restart the
-collector container (the watchdog auto-rolls-back a bad restart). HTTP uses the
-stdlib only — no new dependency.
+Exit codes the host wrapper (netmon-checkin.sh) acts on:
+  10 — config changed: recreate the collector so it loads the new env.
+  11 — a dashboard "update" command was queued: the agent can't rebuild itself
+       (it runs inside the container being replaced), so the host runs the code
+       update afterwards. 11 also implies the config-recreate of 10, so a config
+       push + update in the same cycle both take effect.
+The watchdog/auto-update machinery auto-rolls-back a bad restart or update.
+HTTP uses the stdlib only — no new dependency.
 """
 from __future__ import annotations
 
@@ -34,6 +39,7 @@ ENV_FILE = Path("/etc/netmon/netmon.env")
 APPLIED_VERSION_FILE = Path("/var/lib/netmon/applied-config-version")
 TOKEN_FILE = Path("/var/lib/netmon/enroll-token")
 EXIT_CONFIG_CHANGED = 10
+EXIT_UPDATE_REQUESTED = 11
 
 
 def _post(url: str, token: str | None, body: dict) -> dict | None:
@@ -389,12 +395,24 @@ def run_checkin() -> int:
                           version=version, error=str(exc))
                 audit("dashboard_config_apply_failed", version=version, error=str(exc))
 
+    update_requested = False
     for cmd in resp.get("commands") or []:
         cid = cmd.get("id")
         name = cmd.get("command")
         log.info("running queued command", id=cid, command=name)
         if name == "iperf":
             status, result = _run_iperf_command(url, token, cmd.get("args") or {}, "manual")
+        elif name in ("update", "self-update", "update-now"):
+            # The agent runs INSIDE the container an update replaces, so it can't
+            # rebuild itself. Acknowledge here; the host check-in wrapper runs the
+            # code update after we exit (EXIT_UPDATE_REQUESTED). The dashboard
+            # confirms success on the next check-in when agentVersion changes (or
+            # a rollback leaves the old version).
+            update_requested = True
+            status, result = "scheduled", {
+                "note": "host will run auto-update after this check-in",
+                "fromVersion": __version__,
+            }
         else:
             status, result = _run_command(str(name))
         audit("dashboard_command_ran", id=cid, command=name, status=status)
@@ -407,4 +425,6 @@ def run_checkin() -> int:
     # Scheduled iperf piggybacks on the check-in cadence (runs if due).
     _maybe_scheduled_iperf(url, token, settings)
 
+    if update_requested:
+        return EXIT_UPDATE_REQUESTED
     return EXIT_CONFIG_CHANGED if config_changed else 0

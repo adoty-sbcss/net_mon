@@ -26,7 +26,7 @@ Ordered so foundations land before the things that depend on them. Status reflec
 
 **Parallel track A — Operator UX** — write-capable `./netmon` menu (foundation) → scheduled scans/quiet hours → self-diagnostic wizard → support-bundle export.
 
-**Parallel track B — Fleet/Azure** (control-plane already underway) — ⭐ remote code update ("force update on next check-in") → heartbeat → per-box version/health view → cross-site MAC correlation (needs Phase 0) → org-wide search.
+**Parallel track B — Fleet/Azure** (control-plane already underway) — ⭐ remote code update (collector ✅; dashboard UI next) → sensor self-health telemetry (⭐ requested) → heartbeat → per-box version/health view → cross-site MAC correlation (needs Phase 0) → org-wide search.
 
 **Parallel track C — Multi-VLAN trunk ingestion** ⭐ flagged priority — monitor many VLANs from one sensor over an 802.1Q trunk, wizard-driven. Independent of the inventory chain; see *Multi-network & VLAN* below for the full scoped spec.
 
@@ -164,14 +164,13 @@ Ordered so foundations land before the things that depend on them. Status reflec
 
 - [x] **Remote config push** (suggested) ✅ **SHIPPED** (collector side) — check-in pulls desired-config and rewrites `/etc/netmon/netmon.env` in place, then recreates the collector to apply it. SNMP targets/communities, SFTP, and iperf are already pushed this way. Central UI to author the config lives in the Azure dashboard repo.
 
-- [ ] **Remote code update — "force update on next check-in"** ⭐ *priority* (suggested)
-  Config push exists but **code push doesn't**: today a new release reaches a box only via the nightly ~03:00 timer ([netmon-update.timer](systemd/netmon-update.timer)) or someone SSHing in to run `./netmon update`. Close the gap — let the dashboard queue an `update` command per-sensor (or fleet-wide) that the box honors on its **next check-in (≤10 min)**, turning a ~22h wait into minutes with no site visit.
-  Design (deliberately reuses every existing safety net):
-  - The in-container check-in agent ([checkin.py](collector/src/collector/checkin.py)) **can't rebuild itself** (it's running inside the very container being replaced), so it hands off to the host. On seeing the `update` command it returns a new exit code — e.g. `EXIT_UPDATE_REQUESTED = 11` — and the host wrapper ([netmon-checkin.sh](scripts/netmon-checkin.sh)), which already branches on exit `10` to recreate the collector, runs [auto-update.sh](scripts/auto-update.sh). That inherits pull → rebuild → migrate → 2-min healthcheck → **auto-rollback** for free.
-  - **Result is asynchronous:** the agent reports "update acknowledged" on this check-in; the dashboard confirms success on the *next* check-in when the reported `agentVersion`/SHA changes (or a rollback shows the old SHA). Surface per-box state: pending → updating → done / rolled-back.
-  - **Stagger fleet-wide rollouts** — canary one box, watch it go healthy, then release the rest (or a random spread), so the whole fleet doesn't pull + rebuild against GitHub at the same instant. Dashboard offers "update this box" and "update all."
-  - Requires the host check-in timer to run `auto-update.sh` with privilege (passwordless sudo / root), same as the nightly updater already does.
-  This is the natural completion of the control-plane: config push (done) + **code push (this)**. Pairs with the per-box version/health view below.
+- [~] **Remote code update — "force update on next check-in"** ⭐ *priority* — 🚧 **collector side SHIPPED; dashboard UI pending**
+  Config push existed but **code push didn't**: a release reached a box only via the nightly ~03:00 timer ([netmon-update.timer](systemd/netmon-update.timer)) or someone SSHing in to run `./netmon update`. Now the dashboard can queue an `update` command that the box honors on its **next check-in (≤10 min)** — a ~22h wait becomes minutes, no site visit.
+  - **Collector side ✅ shipped:** the in-container check-in agent ([checkin.py](collector/src/collector/checkin.py)) can't rebuild itself, so on an `update`/`self-update`/`update-now` command it acknowledges ("scheduled") and returns `EXIT_UPDATE_REQUESTED = 11`. The host wrapper ([netmon-checkin.sh](scripts/netmon-checkin.sh)) on exit 11 recreates the collector (applies any config pushed the same cycle) then triggers **netmon-update.service** — inheriting git pull → rebuild → migrate → 2-min healthcheck → **auto-rollback** for free.
+  - **Dashboard side ⏳ pending** (netmon-dashboard): queue the `update` command on a sensor (and an "update all" with a staggered/canary rollout), and surface per-box state pending → updating → done / rolled-back (confirmed on the next check-in when the reported `agentVersion` changes). Command-queue + result plumbing already exists from the iperf/run-scan work.
+  - **Bootstrapping note:** a box only gains this ability *after* it pulls this commit (one more normal auto-update); remote-update works on every release after that.
+  - Requires the check-in timer user to have passwordless sudo / root to start `netmon-update.service` — same privilege the nightly updater already uses.
+  This completes the control-plane: config push ✅ + **code push ✅ (collector)**. Pairs with the per-box version/health view below.
 
 - [ ] **Fleet-wide SFTP credential rotation** (suggested)
   Today desired-config (incl. SFTP host/user/password) is pushed **per sensor** ([sensor-actions.ts](../netmon-dashboard/src/lib/admin/sensor-actions.ts) `saveSensorConfigAction`). Rotating the shared SFTP creds across the fleet means editing every sensor by hand. Want a one-click "set SFTP for all sensors" bulk action that bumps each box's config version, plus a rollout view keyed on the already-reported `reportedSftpUser`/`reportedConfigVersion` so you can watch every box flip to the new creds before retiring the old Azure SFTP local user. Grace-period playbook: add a second SFTP local user → bulk-push new creds → confirm all reported → delete old user. (Owner working through it manually for now.)

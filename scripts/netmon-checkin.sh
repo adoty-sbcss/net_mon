@@ -45,6 +45,37 @@ if [ "$rc" = "10" ]; then
         log "collector recreate FAILED"
     fi
     exit 0
+elif [ "$rc" = "11" ]; then
+    # Dashboard queued an "update". 11 implies the config-recreate of 10, so
+    # first apply any config pushed this cycle, then hand the CODE update to
+    # netmon-update.service — which has the privileges, the 30-min timeout, and
+    # the post-update healthcheck + auto-rollback. We must NOT run the update
+    # inline: it rebuilds the very stack our `compose exec ... checkin` just used.
+    log "dashboard requested update; recreating collector, then triggering auto-update"
+    if "${DC[@]}" up -d --force-recreate collector >/dev/null 2>&1; then
+        log "collector recreated (any pushed config applied)"
+    else
+        log "collector recreate FAILED"
+    fi
+    if systemctl list-unit-files netmon-update.service 2>/dev/null | grep -q netmon-update; then
+        if [ "$(id -u)" = "0" ]; then
+            START_UPDATE=(systemctl start --no-block netmon-update.service)
+        else
+            START_UPDATE=(sudo systemctl start --no-block netmon-update.service)
+        fi
+        if "${START_UPDATE[@]}"; then
+            log "netmon-update.service started (git pull + rebuild + healthcheck/rollback)"
+        else
+            log "could not start netmon-update.service; running auto-update.sh inline"
+            "$REPO_DIR/scripts/auto-update.sh" 2>&1 \
+                | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done || true
+        fi
+    else
+        log "netmon-update.service not installed; running auto-update.sh inline"
+        "$REPO_DIR/scripts/auto-update.sh" 2>&1 \
+            | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done || true
+    fi
+    exit 0
 elif [ "$rc" = "0" ]; then
     log "check-in ok"
     exit 0
