@@ -182,6 +182,12 @@ Ordered so foundations land before the things that depend on them. Status reflec
 - [ ] **Per-box version + health view** (suggested)
   Which boxes are on which git SHA, last successful upload, last reboot, lynis score trend.
 
+- [ ] **Sensor self-health telemetry** (CPU / RAM / disk / OS) ⭐ *requested*
+  Report each sensor's **own** vitals (distinct from the network it watches) so the dashboard sensor page shows box health at a glance: CPU utilization + load average, RAM used/total, disk used/free (root + `/var/lib/netmon`), OS + kernel version, uptime / last boot, and on a Pi the CPU temp. Optional: per-container (collector/postgres) health + restart counts.
+  - **Source — pure stdlib, no deps:** read `/proc/stat` (CPU), `/proc/meminfo` (RAM), `os.statvfs` (disk), `/etc/os-release` + `os.uname()` (OS/kernel), `/proc/uptime` (uptime), `/sys/class/thermal/*/temp` (Pi temp). `selftest.py` already reports disk space, so the precedent exists — generalize it into a `host_metrics()` helper.
+  - **Transport — piggyback the existing check-in** ([checkin.py](collector/src/collector/checkin.py)): add a `hostMetrics` object to the ~10-min check-in POST. No new inbound path, no new timer; the dashboard already receives `agentVersion`/`localIp` there.
+  - **Dashboard:** store latest on the sensor row + a small time-series for trend; render gauges (CPU/RAM/disk) + OS/uptime on the sensor page; threshold to yellow/red. Feeds the [[Heartbeat per box]] and [[Per-box version + health view]] items above — same family — and gives a clean hook for low-disk / high-CPU **alerts** later.
+
 - [ ] **Org-wide search and reporting** (suggested)
   "Find every printer in the district" / "every device on EOL Windows" / "every site missing a heartbeat >24h."
 
