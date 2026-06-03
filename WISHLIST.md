@@ -26,7 +26,7 @@ Ordered so foundations land before the things that depend on them. Status reflec
 
 **Parallel track A — Operator UX** — write-capable `./netmon` menu (foundation) → scheduled scans/quiet hours → self-diagnostic wizard → support-bundle export.
 
-**Parallel track B — Fleet/Azure** (control-plane already underway) — ⭐ remote code update (collector ✅; dashboard UI next) → sensor self-health telemetry (⭐ requested) → heartbeat → per-box version/health view → cross-site MAC correlation (needs Phase 0) → org-wide search.
+**Parallel track B — Fleet/Azure** (control-plane already underway) — ✅ remote code update · ✅ sensor self-health (+ heartbeat + per-box version/health view) · ✅ fleet SFTP rotation — *all deployed 2026-06-03*. Remaining: cross-site MAC correlation (needs Phase 0) → org-wide search.
 
 **Parallel track C — Multi-VLAN trunk ingestion** ⭐ flagged priority — monitor many VLANs from one sensor over an 802.1Q trunk, wizard-driven. Independent of the inventory chain; see *Multi-network & VLAN* below for the full scoped spec.
 
@@ -164,7 +164,7 @@ Ordered so foundations land before the things that depend on them. Status reflec
 
 - [x] **Remote config push** (suggested) ✅ **SHIPPED** (collector side) — check-in pulls desired-config and rewrites `/etc/netmon/netmon.env` in place, then recreates the collector to apply it. SNMP targets/communities, SFTP, and iperf are already pushed this way. Central UI to author the config lives in the Azure dashboard repo.
 
-- [~] **Remote code update — "force update on next check-in"** ⭐ *priority* — 🚧 **collector side SHIPPED; dashboard UI pending**
+- [x] **Remote code update — "force update on next check-in"** ⭐ *priority* — ✅ **SHIPPED 2026-06-03 (collector + dashboard, deployed)** — "Update now" per sensor + fleet "Update all" on `/sensors`; box pulls/rebuilds on next check-in with healthcheck+rollback. *Bootstrapping: a box gains it after one normal update.*
   Config push existed but **code push didn't**: a release reached a box only via the nightly ~03:00 timer ([netmon-update.timer](systemd/netmon-update.timer)) or someone SSHing in to run `./netmon update`. Now the dashboard can queue an `update` command that the box honors on its **next check-in (≤10 min)** — a ~22h wait becomes minutes, no site visit.
   - **Collector side ✅ shipped:** the in-container check-in agent ([checkin.py](collector/src/collector/checkin.py)) can't rebuild itself, so on an `update`/`self-update`/`update-now` command it acknowledges ("scheduled") and returns `EXIT_UPDATE_REQUESTED = 11`. The host wrapper ([netmon-checkin.sh](scripts/netmon-checkin.sh)) on exit 11 recreates the collector (applies any config pushed the same cycle) then triggers **netmon-update.service** — inheriting git pull → rebuild → migrate → 2-min healthcheck → **auto-rollback** for free.
   - **Dashboard side ⏳ pending** (netmon-dashboard): queue the `update` command on a sensor (and an "update all" with a staggered/canary rollout), and surface per-box state pending → updating → done / rolled-back (confirmed on the next check-in when the reported `agentVersion` changes). Command-queue + result plumbing already exists from the iperf/run-scan work.
@@ -172,7 +172,7 @@ Ordered so foundations land before the things that depend on them. Status reflec
   - Requires the check-in timer user to have passwordless sudo / root to start `netmon-update.service` — same privilege the nightly updater already uses.
   This completes the control-plane: config push ✅ + **code push ✅ (collector)**. Pairs with the per-box version/health view below.
 
-- [ ] **Fleet-wide SFTP credential rotation** (suggested)
+- [x] **Fleet-wide SFTP credential rotation** (suggested) — ✅ **SHIPPED 2026-06-03 (dashboard, deployed)** — `/sensors/sftp`: bulk-push one SFTP destination to every box (merged into each config, version bumped) + a rollout table keyed on reported SFTP user/host + reported-vs-desired version so you confirm every box flipped before retiring the old account.
   Today desired-config (incl. SFTP host/user/password) is pushed **per sensor** ([sensor-actions.ts](../netmon-dashboard/src/lib/admin/sensor-actions.ts) `saveSensorConfigAction`). Rotating the shared SFTP creds across the fleet means editing every sensor by hand. Want a one-click "set SFTP for all sensors" bulk action that bumps each box's config version, plus a rollout view keyed on the already-reported `reportedSftpUser`/`reportedConfigVersion` so you can watch every box flip to the new creds before retiring the old Azure SFTP local user. Grace-period playbook: add a second SFTP local user → bulk-push new creds → confirm all reported → delete old user. (Owner working through it manually for now.)
 
 - [ ] **Cross-site device correlation** (suggested)
@@ -181,7 +181,7 @@ Ordered so foundations land before the things that depend on them. Status reflec
 - [ ] **Per-box version + health view** (suggested)
   Which boxes are on which git SHA, last successful upload, last reboot, lynis score trend.
 
-- [~] **Sensor self-health telemetry** (CPU / RAM / disk / OS) ⭐ *requested* — 🚧 **collector side SHIPPED; dashboard render pending**
+- [x] **Sensor self-health telemetry** (CPU / RAM / disk / OS) ⭐ *requested* — ✅ **SHIPPED 2026-06-03 (collector + dashboard, deployed)** — box reports hostMetrics on check-in; dashboard sensor page shows CPU/RAM/disk gauges + OS/kernel/uptime + online/stale/offline heartbeat. Also covers **Heartbeat per box** and most of **Per-box version + health view** (agent version on `/sensors`).
   Report each sensor's **own** vitals (distinct from the network it watches) so the dashboard sensor page shows box health at a glance: CPU utilization + load average, RAM used/total, disk used/free, OS + kernel version, uptime / last boot, and on a Pi the CPU temp.
   - **Collector side ✅ shipped:** [host_metrics.py](collector/src/collector/host_metrics.py) reads `/proc/stat` (CPU), `/proc/meminfo` (RAM), `os.statvfs(/var/lib/netmon)` (disk), host `/etc/os-release` (bind-mounted) + `os.uname()` (OS/kernel), `/proc/uptime`, `/sys/class/thermal` (Pi temp); resilient per-field. [checkin.py](collector/src/collector/checkin.py) reports it as a `hostMetrics` object on the ~10-min check-in (no new inbound path/timer). docker-compose mounts the host os-release so the distro is the box's, not the image's.
   - **Dashboard side ⏳ pending** (netmon-dashboard): store latest `hostMetrics` + `lastCheckinAt` on the sensor row (+ small time-series for trend); render gauges (CPU/RAM/disk) + OS/uptime/version on the sensor page; threshold to green/yellow/red. This is also the data behind **Heartbeat per box** and **Per-box version + health view** (same family) and the hook for low-disk / high-CPU **alerts** later.
