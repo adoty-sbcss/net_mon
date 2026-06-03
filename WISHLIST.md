@@ -12,9 +12,9 @@ Ordered so foundations land before the things that depend on them. Status reflec
 
 **Phase 0 — Data foundation** · ✅ `inventory_devices` keystone shipped 2026-06-03. The MAC-keyed cross-scan inventory the rest of Discovery/Security/Fleet hangs off.
 
-**Phase 1 — Inventory enrichment** (cheap; data largely already captured) → next up
-1. DHCP fingerprinting (opt 55) — data already in `dhcp_observations`; just classify → `inventory_devices.device_class`.
-2. mDNS/Bonjour + SSDP/UPnP discovery — one new `discovery/` module; huge in K-12.
+**Phase 1 — Inventory enrichment**
+1. ✅ DHCP fingerprinting (opt 55) — **done dashboard-side** (`netmon-dashboard` `47d016d`); collector already ships the raw options. On-box classifier is now an air-gapped-only optional follow-on.
+2. mDNS/Bonjour + SSDP/UPnP discovery — one new `discovery/` module; huge in K-12. **← real next-up collector work.**
 
 **Phase 2 — History-dependent** (needs the inventory over time)
 3. Change detection per switch port (inventory + LLDP).
@@ -72,8 +72,9 @@ Ordered so foundations land before the things that depend on them. Status reflec
 - [ ] **mDNS / Bonjour + SSDP / UPnP discovery** (suggested)
   Catches Apple printers, AirPlay receivers, Chromecasts, Sonos, IP cameras — most of which barely show up in ARP/nmap. Huge in K-12.
 
-- [ ] **DHCP fingerprinting (option 55)** (suggested) — ⚠️ **data already captured; classifier pending**
-  Options 55/60/12 are already extracted into `dhcp_observations` ([init.sql](db/init.sql)). Remaining work: match the param-request-list against a Fingerbank-style DB and write the result into `inventory_devices.device_class`. This is **Phase 1** now that the inventory keystone exists. Identifies OS and device class even when OUI is generic.
+- [x] **DHCP fingerprinting (option 55)** (suggested) ✅ **SHIPPED — dashboard-side**
+  Done in the **dashboard ingest pipeline**, not the collector: `netmon-dashboard` commit `47d016d` ("feat(ingest): DHCP fingerprint → device type + hostname") classifies on ingest from the options the collector already ships. The collector's job here is just *capturing* the raw fingerprint fields (options 55/60/12 in `dhcp_observations`, [init.sql](db/init.sql)) — which it already does. So for any **connected** site, devices get classified centrally.
+  - *Optional collector-side follow-on (air-gapped only):* sites that never upload to the dashboard get no classification, so an **on-box** Fingerbank-style classifier writing `inventory_devices.device_class` would still add value for air-gapped bundles. Low priority — connected sites are covered. The empty `device_class` column already exists for it.
 
 - [ ] **IPv6 discovery** (suggested)
   ND / RA capture + IPv6 host enumeration. Today's collector is IPv4-only.
