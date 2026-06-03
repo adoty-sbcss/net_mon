@@ -13,6 +13,10 @@ Inputs (per call):
     communities  — list of SNMP v2c read communities to trial. Same list
                    discovery/snmp.py uses; per-device winners are cached
                    in snmp_credentials so a second pass costs nothing extra.
+    exclude_ips  — management IPs to skip entirely: never polled and never
+                   recursed THROUGH, so the crawl stays inside the intended
+                   boundary. Pushed from the dashboard when an operator purges
+                   a device from inventory (NETMON_SNMP_EXCLUDE).
 
 Output:
     {
@@ -122,6 +126,7 @@ def crawl(
     *,
     max_depth: int = 5,
     time_budget_sec: int = 60,
+    exclude_ips: set[str] | None = None,
 ) -> dict[str, Any]:
     """Recursively SNMP-walk LLDP/CDP tables outward from `seed_ips`."""
     if not seed_ips or not communities:
@@ -138,10 +143,14 @@ def crawl(
     started = time.monotonic()
     deadline = started + time_budget_sec
 
+    # Operator-excluded management IPs (purged from inventory): never poll them
+    # and never recurse THROUGH them, so the crawl stops at the boundary.
+    exclude = {ip.strip() for ip in (exclude_ips or set()) if ip and ip.strip()}
+
     nodes: dict[str, dict[str, Any]] = {}
     edges: list[dict[str, Any]] = []
     visited_ips: set[str] = set()
-    queue: list[tuple[str, int]] = [(ip, 0) for ip in seed_ips]
+    queue: list[tuple[str, int]] = [(ip, 0) for ip in seed_ips if ip not in exclude]
     budget_exhausted = False
 
     while queue:
@@ -151,6 +160,8 @@ def crawl(
             break
 
         ip, depth = queue.pop(0)
+        if ip in exclude:
+            continue
         if ip in visited_ips:
             continue
         visited_ips.add(ip)
@@ -232,9 +243,9 @@ def crawl(
                 "discovered_via_ip": ip,
             })
 
-            # Recurse via management IPs.
+            # Recurse via management IPs (never into excluded devices).
             for mip in mgmt_ips:
-                if mip and mip not in visited_ips:
+                if mip and mip not in visited_ips and mip not in exclude:
                     queue.append((mip, depth + 1))
 
         # --- CDP cache table (Cisco) -------------------------------------
@@ -273,7 +284,7 @@ def crawl(
                 "via":               "cdp",
                 "discovered_via_ip": ip,
             })
-            if mgmt_ip and mgmt_ip not in visited_ips:
+            if mgmt_ip and mgmt_ip not in visited_ips and mgmt_ip not in exclude:
                 queue.append((mgmt_ip, depth + 1))
 
     elapsed = time.monotonic() - started

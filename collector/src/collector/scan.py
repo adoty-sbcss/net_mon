@@ -180,6 +180,7 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
                     communities=list(settings.snmp_community_list),
                     max_depth=settings.snmp_topology_max_depth,
                     time_budget_sec=settings.snmp_topology_time_budget,
+                    exclude_ips=set(settings.snmp_exclude_list),
                 )
                 ctx.raw_outputs["snmp_topology"] = topology
                 log.info("snmp topology",

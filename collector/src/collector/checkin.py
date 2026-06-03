@@ -94,6 +94,8 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_SNMP_ENABLED"] = "true" if data.get("snmp_enabled") else "false"
     if "snmp_targets" in data:
         mapping["NETMON_SNMP_EXTRA_TARGETS"] = str(data.get("snmp_targets") or "")
+    if "snmp_exclude" in data:
+        mapping["NETMON_SNMP_EXCLUDE"] = str(data.get("snmp_exclude") or "")
     if data.get("rescan_interval"):
         mapping["NETMON_RESCAN_INTERVAL"] = str(int(data["rescan_interval"]))
     # SFTP upload destination (pushed from the dashboard).
@@ -357,6 +359,7 @@ def run_checkin() -> int:
             "currentConfig": {
                 "snmp_enabled": settings.snmp_enabled,
                 "snmp_communities": settings.snmp_communities,
+                "snmp_exclude": settings.snmp_exclude,
                 "sftp_enabled": settings.sftp_enabled,
                 "sftp_host": settings.sftp_host,
                 "sftp_port": settings.sftp_port,

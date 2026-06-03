@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     # monitor=SNMP) so registered gear is always polled even when the OUI/heuristic
     # candidate selection would miss it. Comma-separated.
     snmp_extra_targets: str = Field(default="", alias="NETMON_SNMP_EXTRA_TARGETS")
+    # Management IPs the SNMP topology crawl must NEVER poll or recurse THROUGH —
+    # pushed from the dashboard when an operator purges/excludes a device (e.g. a
+    # switch the crawl reached outside the school boundary). This is how an admin
+    # stops the box from re-discovering gear they removed from inventory.
+    # Comma-separated.
+    snmp_exclude: str = Field(default="", alias="NETMON_SNMP_EXCLUDE")
 
     # SNMP topology crawl (Path B). Off by default — turn on once SNMP is
     # working against your switches and you want fabric topology in bundles.
@@ -181,6 +187,10 @@ class Settings(BaseSettings):
     @property
     def snmp_extra_target_list(self) -> tuple[str, ...]:
         return tuple(s.strip() for s in self.snmp_extra_targets.split(",") if s.strip())
+
+    @property
+    def snmp_exclude_list(self) -> tuple[str, ...]:
+        return tuple(s.strip() for s in self.snmp_exclude.split(",") if s.strip())
 
 
 _settings: Settings | None = None
