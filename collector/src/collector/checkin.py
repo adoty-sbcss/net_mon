@@ -1,7 +1,8 @@
 """Outbound dashboard check-in (control plane).
 
 The box NEVER accepts inbound connections. On a timer it POSTs to the dashboard
-with its enrollment token, reports its agent + applied-config version, then:
+with its enrollment token, reports its agent + applied-config version + self-health
+metrics (CPU/RAM/disk/OS/uptime), then:
   - applies any newer desired config (SNMP strings, scan interval) by rewriting
     /etc/netmon/netmon.env — which takes effect on the next collector restart;
   - runs any queued commands (run-scan / upload-now / config-backup / update)
@@ -28,6 +29,7 @@ import structlog
 
 from . import __version__
 from . import config_backup as config_backup_mod
+from . import host_metrics as host_metrics_mod
 from . import uploader as uploader_mod
 from .config import get_settings
 from .db import list_scan_runs, wait_for_db
@@ -360,6 +362,9 @@ def run_checkin() -> int:
             "localIp": local_ip,
             "interface": iface,
             "interfaceCidr": cidr,
+            # Sensor self-health (CPU/RAM/disk/OS/uptime) for the dashboard's
+            # per-box health view + heartbeat. Best-effort: {} if collection fails.
+            "hostMetrics": host_metrics_mod.collect(),
             # Actual config the box is running, so the dashboard can show ground
             # truth (not just what it pushed). The SFTP password is NEVER reported.
             "currentConfig": {

@@ -91,6 +91,11 @@ services:
       # often just points at 127.0.0.53 (the stub).
       - /etc/resolv.conf:/etc/host-resolv.conf:ro
       - /run/systemd/resolve/resolv.conf:/etc/host-systemd-resolv.conf:ro
+      # Host's OS release so the self-health check-in reports the box's real
+      # distro (e.g. Ubuntu 24.04), not the collector image's base (Debian).
+      # See host_metrics.py. Read-only; absent on a not-yet-recreated box, in
+      # which case host_metrics falls back to the container's /etc/os-release.
+      - /etc/os-release:/etc/host-os-release:ro
     command: ["run"]
 
 volumes:

@@ -38,6 +38,10 @@ where = ["src"]
 
 [tool.mypy]
 python_version = "3.11"
+# The collector only ever runs on Linux (Docker on Ubuntu). Pin the platform so
+# Linux-only stdlib (os.statvfs / getloadavg / uname) type-checks the same on a
+# Windows dev box as it does in Linux CI.
+platform = "linux"
 # Third-party libs (psycopg, structlog, paramiko, manuf, ...) ship without
 # type stubs; don't fail on their missing imports.
 ignore_missing_imports = true
