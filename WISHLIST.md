@@ -6,6 +6,32 @@ Items tagged `(suggested)` were added during the wishlist drafting session and a
 
 ---
 
+## Build order (scaffolding) — reviewed 2026-06-03
+
+Ordered so foundations land before the things that depend on them. Status reflects a code audit, not just intentions.
+
+**Phase 0 — Data foundation** · ✅ `inventory_devices` keystone shipped 2026-06-03. The MAC-keyed cross-scan inventory the rest of Discovery/Security/Fleet hangs off.
+
+**Phase 1 — Inventory enrichment** (cheap; data largely already captured) → next up
+1. DHCP fingerprinting (opt 55) — data already in `dhcp_observations`; just classify → `inventory_devices.device_class`.
+2. mDNS/Bonjour + SSDP/UPnP discovery — one new `discovery/` module; huge in K-12.
+
+**Phase 2 — History-dependent** (needs the inventory over time)
+3. Change detection per switch port (inventory + LLDP).
+4. AD/LDAP cross-reference.
+
+**Phase 3 — Visual payoff** — Full network map (HTML + static SVG). Topology data already extracted; mostly a rendering layer.
+
+**Phase 4 — Security/vuln** — CVE match → TLS/cipher/SMBv1/EOL → default-cred check (opt-in) → threat-intel.
+
+**Parallel track A — Operator UX** — write-capable `./netmon` menu (foundation) → scheduled scans/quiet hours → self-diagnostic wizard → support-bundle export.
+
+**Parallel track B — Fleet/Azure** (control-plane already underway) — heartbeat → per-box version/health view → cross-site MAC correlation (needs Phase 0) → org-wide search.
+
+**Already shipped** (de-scoped from the lists below, kept for context): SNMP topology crawl, DNS health, reachability ping/traceroute, iperf3, remote config push, check-in/auto-enroll, OUI vendor table, LLDP/CDP capability tags.
+
+---
+
 ## Multi-network & VLAN
 
 - [ ] **Multiple networks on one trunk cable**
@@ -27,14 +53,14 @@ Items tagged `(suggested)` were added during the wishlist drafting session and a
 
 ## Discovery & inventory
 
-- [ ] **Persistent device inventory** — printers, IoT, AV, computers, etc.
-  Cross-scan persistence keyed on MAC: vendor (OUI), device class, first seen, last seen, where seen. Foundation for the items below.
+- [x] **Persistent device inventory** — printers, IoT, AV, computers, etc. ✅ **SHIPPED 2026-06-03**
+  Cross-scan persistence keyed on MAC: `inventory_devices` table ([db/migrations/0010_add_inventory_devices.sql](db/migrations/0010_add_inventory_devices.sql)) with first/last seen, times seen, last known IP/hostname/vendor/location, and box identity. Upserted each scan in [scan.py](collector/src/collector/scan.py) `_persist`; surfaced as `inventory.csv`/`inventory.json` at the hourly-bundle root. The `device_class` column ships empty on purpose — it's the hook the two enrichment items below attach to. Foundation for everything in this section + cross-site correlation.
 
 - [ ] **mDNS / Bonjour + SSDP / UPnP discovery** (suggested)
   Catches Apple printers, AirPlay receivers, Chromecasts, Sonos, IP cameras — most of which barely show up in ARP/nmap. Huge in K-12.
 
-- [ ] **DHCP fingerprinting (option 55)** (suggested)
-  Already capturing DHCP via tshark — extract option 55 and match against a Fingerbank-style DB. Identifies OS and device class even when OUI is generic.
+- [ ] **DHCP fingerprinting (option 55)** (suggested) — ⚠️ **data already captured; classifier pending**
+  Options 55/60/12 are already extracted into `dhcp_observations` ([init.sql](db/init.sql)). Remaining work: match the param-request-list against a Fingerbank-style DB and write the result into `inventory_devices.device_class`. This is **Phase 1** now that the inventory keystone exists. Identifies OS and device class even when OUI is generic.
 
 - [ ] **IPv6 discovery** (suggested)
   ND / RA capture + IPv6 host enumeration. Today's collector is IPv4-only.
@@ -45,7 +71,7 @@ Items tagged `(suggested)` were added during the wishlist drafting session and a
 - [ ] **AD / LDAP cross-reference** (suggested)
   Compare discovered hostnames against AD computer accounts: flag domain-joined devices that aren't on the wire (decommissioned?) and devices on the wire that aren't in AD (BYOD / rogue).
 
-- [ ] **Crawling outside Layer 3 gateways**
+- [x] **Crawling outside Layer 3 gateways** ✅ **SHIPPED** — [snmp_topology.py](collector/src/collector/discovery/snmp_topology.py), interval-gated (~weekly per network), seeds from the same candidate set as SNMP polling. Output ships as `snmp_topology.json` in the bundle. Remaining polish would be deeper multi-hop route-table walking, but the core crawl is in.
   Use SNMP on the gateway to walk routing tables (ipRouteTable / ipCidrRouteTable) and ARP caches (ipNetToMediaTable) → discover other subnets the box can't reach directly. Hop from there to the next router by walking its tables. Builds an org-wide picture from one collector. Needs read-only SNMP on the routers. Pairs with the visual map below.
 
 - [ ] **Full network map (visual)**
@@ -70,11 +96,10 @@ Items tagged `(suggested)` were added during the wishlist drafting session and a
 
 ## Diagnostics & performance
 
-- [ ] **Off-network performance testing**
-  Path quality (jitter, loss, MTR-style hop-by-hop) to a configurable list of targets — ISP gateway, district HQ, Google, Microsoft 365, instructional platforms.
+- [ ] **Off-network performance testing** — ⚠️ **partially shipped**
+  Done: per-candidate ping + traceroute + SNMP-response ([reachability.py](collector/src/collector/discovery/reachability.py)) and site-to-site iperf3 throughput ([iperf.py](collector/src/collector/iperf.py)). Remaining: jitter/loss + MTR-style hop-by-hop to a *configurable target list* (ISP gateway, district HQ, Google, M365, instructional platforms).
 
-- [ ] **DNS resolution health** (suggested)
-  Latency, recursion behavior, server availability, NXDOMAIN rate. Common K-12 complaint — "internet is slow" usually means DNS.
+- [x] **DNS resolution health** (suggested) ✅ **SHIPPED** — [dns_health.py](collector/src/collector/discovery/dns_health.py) + `dns_probes` table + `dns_health.json` in the bundle. Per-resolver latency, status mix, and an NXDOMAIN-rewrite probe (catches ISP/filter ad-page rewrites). Common K-12 complaint — "internet is slow" usually means DNS.
 
 - [ ] **VoIP / multicast path quality** (suggested)
   Synthetic jitter/loss test + IGMP membership / multicast routing check. Schools care: phones over IP, PA systems, streaming bell schedules.
@@ -82,8 +107,7 @@ Items tagged `(suggested)` were added during the wishlist drafting session and a
 - [ ] **Speed / duplex mismatch detection** (suggested)
   `ethtool` on the active interface + compare against LLDP neighbor's advertised settings. Cheap fix for a common silent performance killer.
 
-- [ ] **Site-to-site bandwidth via iperf3** (suggested)
-  Two NetMon boxes can iperf each other. Lets you measure WAN throughput between schools without buying a separate tool.
+- [x] **Site-to-site bandwidth via iperf3** (suggested) ✅ **SHIPPED** — [iperf.py](collector/src/collector/iperf.py), scheduled + on-demand, config pushed from the dashboard. Two NetMon boxes can iperf each other. Lets you measure WAN throughput between schools without buying a separate tool.
 
 ## Deployment, hardening & operator UX
 
@@ -118,14 +142,16 @@ Items tagged `(suggested)` were added during the wishlist drafting session and a
 
 > This is the big one — central collector + dashboard on Azure. Items below are seeds; expand as you scope the platform.
 
-- [ ] **Central collector + dashboard**
-  Aggregate bundles from every deployed NetMon box; org-wide topology, inventory, alerts.
+- [ ] **Central collector + dashboard** — 🚧 **in progress** (separate Azure repo)
+  Outbound check-in control-plane already built on the collector side ([checkin.py](collector/src/collector/checkin.py)): auto-enroll with a shared bootstrap key, report config/health, pull desired-config + queued commands. Aggregate bundles from every deployed NetMon box; org-wide topology, inventory, alerts.
 
 - [ ] **Heartbeat per box** (suggested)
   Each box drops `<device>_heartbeat.txt` in the SFTP path every 15min. Dashboard shows green/yellow/red per site without needing inbound connectivity to the box.
 
-- [ ] **Remote config push** (suggested)
-  Central UI to update an `.env` for one or all boxes; box pulls and applies on the next maintenance window. Avoids site visits for routine changes.
+- [x] **Remote config push** (suggested) ✅ **SHIPPED** (collector side) — check-in pulls desired-config and rewrites `/etc/netmon/netmon.env` in place, then recreates the collector to apply it. SNMP targets/communities, SFTP, and iperf are already pushed this way. Central UI to author the config lives in the Azure dashboard repo.
+
+- [ ] **Fleet-wide SFTP credential rotation** (suggested)
+  Today desired-config (incl. SFTP host/user/password) is pushed **per sensor** ([sensor-actions.ts](../netmon-dashboard/src/lib/admin/sensor-actions.ts) `saveSensorConfigAction`). Rotating the shared SFTP creds across the fleet means editing every sensor by hand. Want a one-click "set SFTP for all sensors" bulk action that bumps each box's config version, plus a rollout view keyed on the already-reported `reportedSftpUser`/`reportedConfigVersion` so you can watch every box flip to the new creds before retiring the old Azure SFTP local user. Grace-period playbook: add a second SFTP local user → bulk-push new creds → confirm all reported → delete old user. (Owner working through it manually for now.)
 
 - [ ] **Cross-site device correlation** (suggested)
   Same MAC seen at School A then School B → loaned-out / stolen / BYOD pattern.
