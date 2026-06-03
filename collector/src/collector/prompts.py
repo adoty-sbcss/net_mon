@@ -114,9 +114,10 @@ to the configured SFTP server at the top of the hour.
   brand-new devices from long-known ones.
 - **scans/scan_<id>/** — Per-scan data. Each folder contains:
   - `summary.md`, `findings.json`, `topology.json`, `devices.csv`,
-    `metrics.json`, `timeline.json`, `dns_health.json`
+    `metrics.json`, `timeline.json`, `dns_health.json`,
+    `service_discovery.json`
   - `raw/` — underlying tool outputs (LLDP, ARP, DHCP, STP, SNMP,
-    nmap, DNS probes, interface state)
+    nmap, DNS probes, mDNS/SSDP service discovery, interface state)
 
 ## Prompt — paste this into Claude
 
@@ -133,7 +134,11 @@ to the configured SFTP server at the top of the hour.
 > 3. Cross-reference `inventory.csv` (the box's lifetime device list).
 >    Call out devices first seen in the last 24h (`first_seen_at`), and
 >    note any whose `vendor` / `device_class` looks out of place for the
->    network they're on (`last_network_id`).
+>    network they're on (`last_network_id`). Also check each scan's
+>    `service_discovery.json` (mDNS/SSDP): these are AirPrint printers,
+>    Apple TV/AirPlay, Chromecasts, Sonos, Rokus, cameras and UPnP media
+>    devices — flag any `device_hint` that's unexpected for the segment
+>    (e.g. a Chromecast/camera on a staff or server VLAN).
 > 4. Compare scans across the hour. Flag anything that changed:
 >    - Devices appearing or disappearing
 >    - MAC/IP bindings shifting

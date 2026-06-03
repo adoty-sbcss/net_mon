@@ -21,6 +21,7 @@ from .discovery import arp as arp_mod
 from .discovery import dns_health as dns_mod
 from .discovery import interfaces as iface_mod
 from .discovery import lldp as lldp_mod
+from .discovery import mdns_ssdp as mdns_mod
 from .discovery import nmap as nmap_mod
 from .discovery import rdns as rdns_mod
 from .discovery import reachability as reach_mod
@@ -215,6 +216,23 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
             except Exception as exc:  # pragma: no cover — defensive
                 log.warning("reachability probe failed", error=str(exc))
 
+        # 7e. mDNS (Bonjour) + SSDP (UPnP) service discovery. A few small
+        # multicast queries surface the service-advertising devices ARP/nmap
+        # miss (AirPrint printers, Apple TV, Chromecast, Sonos, Roku, cameras).
+        # Time-bounded and best-effort.
+        services: list[dict[str, Any]] = []
+        if settings.mdns_enabled:
+            try:
+                bind_ip = state.primary_cidr.split("/")[0] if state.primary_cidr else None
+                services = mdns_mod.discover(
+                    bind_ip=bind_ip,
+                    mdns_seconds=settings.mdns_seconds,
+                    ssdp_seconds=settings.ssdp_seconds,
+                )
+                ctx.raw_outputs["service_discovery"] = services
+            except Exception as exc:  # pragma: no cover — defensive
+                log.warning("service discovery failed", error=str(exc))
+
         # 8. Persist everything
         _persist(
             ctx,
@@ -228,6 +246,7 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
             topology=topology,
             dns_results=dns_results,
             reachability=reachability,
+            services=services,
         )
 
     except Exception as exc:
@@ -376,6 +395,7 @@ def _persist(
     topology: dict[str, Any] | None = None,
     dns_results: list[dns_mod.DnsProbeResult] | None = None,
     reachability: list[dict[str, Any]] | None = None,
+    services: list[dict[str, Any]] | None = None,
 ) -> None:
     # Devices: merge unique by (ip, mac), recording the discovery source.
     seen: dict[tuple[str | None, str | None], dict[str, Any]] = {}
@@ -461,6 +481,53 @@ def _persist(
                 if ip and not dev.get("hostname") and ip in ptr:
                     dev["hostname"] = ptr[ip]
                     dev["source"] = (dev.get("source") or "") + "+rdns"
+
+    # mDNS/SSDP service-discovery enrichment: backfill hostnames + attach a
+    # device hint and the observed service types for IPs we already saw, and add
+    # service-only IPs (devices that answered Bonjour/UPnP but were invisible to
+    # ARP/nmap). All of these flow into the devices table + persistent inventory.
+    if services:
+        svc_by_ip: dict[str, dict[str, Any]] = {}
+        for s in services:
+            ip = s.get("ip")
+            if not ip:
+                continue
+            e = svc_by_ip.setdefault(
+                ip, {"hostname": None, "hint": None, "services": set(), "sources": set()})
+            if s.get("hostname") and not e["hostname"]:
+                e["hostname"] = s["hostname"]
+            if s.get("device_hint") and not e["hint"]:
+                e["hint"] = s["device_hint"]
+            e["services"].update(s.get("services") or [])
+            if s.get("source"):
+                e["sources"].add(s["source"])
+        existing_ips = {d.get("ip") for d in seen.values()}
+        for dev in seen.values():
+            ip = dev.get("ip")
+            if ip and ip in svc_by_ip:
+                info = svc_by_ip[ip]
+                if not dev.get("hostname") and info["hostname"]:
+                    dev["hostname"] = info["hostname"]
+                dev["extra"] = _merge_extra(dev.get("extra"), {
+                    "service_hint": info["hint"],
+                    "services": sorted(info["services"]),
+                })
+                dev["source"] = (dev.get("source") or "") + "+svc"
+        for ip, info in svc_by_ip.items():
+            if ip in existing_ips:
+                continue
+            seen[(ip, None)] = {
+                "scan_run_id": ctx.scan_id,
+                "ip": ip,
+                "mac": None,
+                "hostname": info["hostname"],
+                "vendor": None,
+                "source": "+".join(sorted(s for s in info["sources"] if s)) or "mdns",
+                "extra": _merge_extra("{}", {
+                    "service_hint": info["hint"],
+                    "services": sorted(info["services"]),
+                }),
+            }
 
     insert_many("devices", list(seen.values()))
 
@@ -577,6 +644,41 @@ def _persist(
             }
             for r in reachability
         ])
+
+    # mDNS/SSDP service-discovery rows (one per responder IP + protocol).
+    if services:
+        insert_many("service_discovery", [
+            {
+                "scan_run_id": ctx.scan_id,
+                "ip": s.get("ip"),
+                "source": s.get("source"),
+                "hostname": s.get("hostname"),
+                "service_types": s.get("services") or None,
+                "device_hint": s.get("device_hint"),
+                "details": json.dumps(s.get("details") or {}),
+            }
+            for s in services
+            if s.get("ip")
+        ])
+
+
+def _merge_extra(extra: Any, add: dict[str, Any]) -> str:
+    """Merge `add` into a device's JSONB `extra` (stored as a JSON string),
+    dropping empty values. Tolerates extra being a JSON string, a dict, or None."""
+    base: dict[str, Any] = {}
+    if isinstance(extra, str) and extra.strip():
+        try:
+            loaded = json.loads(extra)
+            if isinstance(loaded, dict):
+                base = loaded
+        except (ValueError, TypeError):
+            base = {}
+    elif isinstance(extra, dict):
+        base = dict(extra)
+    for k, v in add.items():
+        if v not in (None, [], {}, ""):
+            base[k] = v
+    return json.dumps(base)
 
 
 def _inventory_rows(

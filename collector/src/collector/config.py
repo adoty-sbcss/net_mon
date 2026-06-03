@@ -82,6 +82,17 @@ class Settings(BaseSettings):
     # scan); a kill-switch rather than a tuning knob.
     inventory_enabled: bool = Field(default=True, alias="NETMON_INVENTORY_ENABLED")
 
+    # --- mDNS (Bonjour) + SSDP (UPnP) service discovery ---
+    # Each scan, send a few multicast queries (mDNS 224.0.0.251:5353, SSDP
+    # 239.255.255.250:1900) and read the replies. Catches AirPrint printers,
+    # Apple TV/AirPlay, Chromecasts, Sonos, Rokus, smart TVs, IP cameras, and
+    # UPnP/DLNA media servers — most of which barely show up in ARP/nmap. Cheap
+    # and read-only beyond the small query packets; time-bounded by the seconds
+    # below so it can't stretch a scan.
+    mdns_enabled: bool = Field(default=True, alias="NETMON_MDNS_ENABLED")
+    mdns_seconds: float = Field(default=3.0, alias="NETMON_MDNS_SECONDS")
+    ssdp_seconds: float = Field(default=3.0, alias="NETMON_SSDP_SECONDS")
+
     # --- Network-device reachability (ping + traceroute + SNMP-response) ---
     # Each scan, probe the infrastructure candidate set (gateway + LLDP mgmt IPs
     # + network-vendor OUIs) so the dashboard can show which switches are out

@@ -287,7 +287,7 @@ Each hourly ZIP contains:
 - `README.md` — the prompt to paste into Claude
 - `HOURLY_SUMMARY.md` — table of scans in this hour
 - `inventory.csv` / `inventory.json` — the box's **persistent** device inventory across all scans (per MAC: first/last seen, times seen, last known IP / hostname / vendor / device-class / location). Lets the analysis tell brand-new devices from long-known ones.
-- `scans/scan_<id>/` — one folder per scan with `summary.md`, `topology.json`, `devices.csv`, `metrics.json`, `timeline.json`, `findings.json`, and `raw/` tool outputs
+- `scans/scan_<id>/` — one folder per scan with `summary.md`, `topology.json`, `devices.csv`, `metrics.json`, `timeline.json`, `findings.json`, `service_discovery.json` (mDNS/SSDP), and `raw/` tool outputs
 
 Drop the ZIP into a Claude chat, paste the prompt from inside, and Claude tells you what's going on with the network — loops, broadcast storms, rogue DHCP servers, duplicate IPs, unusual devices.
 

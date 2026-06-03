@@ -122,10 +122,12 @@ def _scan_payload(scan_id: int) -> dict[str, str]:
     topo_edges = fetch_table_for_scan("topology_edges", scan_id)
     dns = fetch_table_for_scan("dns_probes", scan_id)
     reachability = fetch_table_for_scan("network_reachability", scan_id)
+    services = fetch_table_for_scan("service_discovery", scan_id)
 
     return {
         "summary.md": _build_summary_md(scan, devices, neighbors, arp, dhcp, stp,
-                                        traffic, snmp, findings, dns, reachability),
+                                        traffic, snmp, findings, dns, reachability,
+                                        services),
         "findings.json": _jsonify(findings),
         "topology.json": json.dumps(_build_topology(scan, devices, neighbors, arp),
                                     indent=2, default=_default),
@@ -148,6 +150,11 @@ def _scan_payload(scan_id: int) -> dict[str, str]:
         "net_reachability.json": json.dumps({"devices": reachability},
                                             indent=2, default=_default),
         "raw/net-reachability.json": _jsonify(reachability),
+        # mDNS/SSDP service discovery: AirPrint/Apple TV/Chromecast/Sonos/Roku/
+        # cameras/UPnP media — the service-advertising devices ARP/nmap miss.
+        "service_discovery.json": json.dumps({"devices": services},
+                                             indent=2, default=_default),
+        "raw/service-discovery.json": _jsonify(services),
         "raw/scan.json": _jsonify(scan),
         "raw/lldp-neighbors.json": _jsonify(neighbors),
         "raw/arp-table.json": _jsonify(arp),
@@ -178,6 +185,7 @@ def _build_summary_md(
     findings: list[dict[str, Any]],
     dns: list[dict[str, Any]],
     reachability: list[dict[str, Any]] | None = None,
+    services: list[dict[str, Any]] | None = None,
 ) -> str:
     lines = []
     lines.append(f"# NetMon scan #{scan['id']}")
@@ -203,6 +211,8 @@ def _build_summary_md(
     lines.append(f"- STP events: **{len(stp)}**")
     lines.append(f"- SNMP rows: **{len(snmp)}**")
     lines.append(f"- DNS probes: **{len(dns)}**")
+    if services:
+        lines.append(f"- mDNS/SSDP service responders: **{len({s.get('ip') for s in services})}**")
     lines.append(f"- Pre-built findings: **{len(findings)}**")
     lines.append("")
 
@@ -241,6 +251,31 @@ def _build_summary_md(
                 f"| {ping} | {f'{rtt:.1f}' if isinstance(rtt, (int, float)) else '-'} "
                 f"| {snmpv} | {hops if hops is not None else '-'} |"
             )
+        lines.append("")
+
+    if services:
+        # Group responders by hint for a quick "what's out there" rollup.
+        by_ip: dict[Any, dict[str, Any]] = {}
+        for s in services:
+            ip = s.get("ip")
+            entry = by_ip.setdefault(ip, {"hint": None, "host": None,
+                                          "svcs": set(), "srcs": set()})
+            entry["hint"] = entry["hint"] or s.get("device_hint")
+            entry["host"] = entry["host"] or s.get("hostname")
+            entry["svcs"].update(s.get("service_types") or [])
+            entry["srcs"].add(s.get("source"))
+        lines.append("## Service discovery (mDNS / SSDP)")
+        lines.append("")
+        lines.append(f"- Responders found: **{len(by_ip)}** "
+                     "(devices advertising Bonjour/UPnP services)")
+        lines.append("")
+        lines.append("| IP | Host | Likely type | Via | Services |")
+        lines.append("|---|---|---|---|---|")
+        for ip, e in by_ip.items():
+            svcs = ", ".join(sorted(e["svcs"]))[:80] or "-"
+            srcs = "+".join(sorted(x for x in e["srcs"] if x))
+            lines.append(
+                f"| {ip} | {e['host'] or '-'} | {e['hint'] or '-'} | {srcs} | {svcs} |")
         lines.append("")
 
     if traffic:

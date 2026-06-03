@@ -265,3 +265,18 @@ CREATE TABLE IF NOT EXISTS inventory_devices (
 CREATE INDEX IF NOT EXISTS idx_inventory_last_seen ON inventory_devices(last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_inventory_vendor    ON inventory_devices(vendor);
 CREATE INDEX IF NOT EXISTS idx_inventory_network   ON inventory_devices(last_network_id);
+
+-- mDNS (Bonjour) + SSDP (UPnP) service discovery, per scan (see migration 0011).
+CREATE TABLE IF NOT EXISTS service_discovery (
+    id            SERIAL PRIMARY KEY,
+    scan_run_id   INTEGER NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
+    ip            INET NOT NULL,
+    source        TEXT NOT NULL,
+    hostname      TEXT,
+    service_types TEXT[],
+    device_hint   TEXT,
+    details       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    seen_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_service_discovery_scan ON service_discovery(scan_run_id);
+CREATE INDEX IF NOT EXISTS idx_service_discovery_ip   ON service_discovery(ip);
