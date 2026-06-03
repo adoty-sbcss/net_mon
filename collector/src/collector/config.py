@@ -73,6 +73,15 @@ class Settings(BaseSettings):
     rdns_enabled: bool = Field(default=True, alias="NETMON_RDNS_ENABLED")
     rdns_timeout_sec: int = Field(default=2, alias="NETMON_RDNS_TIMEOUT_SEC")
 
+    # --- Persistent device inventory ---
+    # Maintain a durable, MAC-keyed inventory across scans (first/last seen,
+    # times seen, last known IP/hostname/vendor/location). The per-scan tables
+    # stay the raw evidence; this is the rolled-up "what's on the networks this
+    # box monitors" view the discovery/security/fleet features build on. Cheap
+    # (one indexed upsert per discovered device, in a single transaction per
+    # scan); a kill-switch rather than a tuning knob.
+    inventory_enabled: bool = Field(default=True, alias="NETMON_INVENTORY_ENABLED")
+
     # --- Network-device reachability (ping + traceroute + SNMP-response) ---
     # Each scan, probe the infrastructure candidate set (gateway + LLDP mgmt IPs
     # + network-vendor OUIs) so the dashboard can show which switches are out

@@ -395,6 +395,108 @@ def insert_topology(scan_run_id: int, nodes: list[dict[str, Any]], edges: list[d
                 )
 
 
+# ---------------------------------------------------------------------------
+# Persistent device inventory (cross-scan, MAC-keyed). See migration 0010.
+# ---------------------------------------------------------------------------
+
+
+def upsert_inventory_devices(rows: list[dict[str, Any]]) -> tuple[int, int]:
+    """Upsert this scan's discovered devices into the persistent MAC-keyed
+    inventory. Returns (upserted, new) where `new` counts first-time devices.
+
+    Each row needs a `mac`; rows without one are skipped (MAC is the inventory's
+    identity). On conflict we bump last_seen_at + times_seen and refresh the
+    location/IP, but COALESCE hostname/vendor/device_class so a scan that failed
+    to resolve a name doesn't blank out a value we already had.
+    """
+    if not rows:
+        return (0, 0)
+    upserted = 0
+    new = 0
+    with connect() as conn:
+        with conn.cursor() as cur:
+            for r in rows:
+                mac = r.get("mac")
+                if not mac:
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO inventory_devices
+                        (mac, last_ip, hostname, vendor, device_class, last_source,
+                         last_network_id, last_interface, last_scan_run_id,
+                         district_slug, school_slug, device_slug)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (mac) DO UPDATE SET
+                        last_seen_at     = NOW(),
+                        times_seen       = inventory_devices.times_seen + 1,
+                        last_ip          = EXCLUDED.last_ip,
+                        hostname         = COALESCE(EXCLUDED.hostname, inventory_devices.hostname),
+                        vendor           = COALESCE(EXCLUDED.vendor, inventory_devices.vendor),
+                        device_class     = COALESCE(EXCLUDED.device_class, inventory_devices.device_class),
+                        last_source      = EXCLUDED.last_source,
+                        last_network_id  = EXCLUDED.last_network_id,
+                        last_interface   = EXCLUDED.last_interface,
+                        last_scan_run_id = EXCLUDED.last_scan_run_id,
+                        district_slug    = EXCLUDED.district_slug,
+                        school_slug      = EXCLUDED.school_slug,
+                        device_slug      = EXCLUDED.device_slug
+                    -- xmax = 0 only for a freshly INSERTed row; non-zero means
+                    -- the ON CONFLICT path updated an existing one.
+                    RETURNING (xmax = 0) AS inserted
+                    """,
+                    (mac, r.get("last_ip"), r.get("hostname"), r.get("vendor"),
+                     r.get("device_class"), r.get("last_source"),
+                     r.get("last_network_id"), r.get("last_interface"),
+                     r.get("last_scan_run_id"),
+                     r.get("district_slug"), r.get("school_slug"), r.get("device_slug")),
+                )
+                row = cur.fetchone()
+                upserted += 1
+                if row and row.get("inserted"):
+                    new += 1
+    return (upserted, new)
+
+
+def list_inventory(limit: int | None = None) -> list[dict[str, Any]]:
+    """The persistent inventory, most-recently-seen first."""
+    sql = """
+        SELECT mac, first_seen_at, last_seen_at, times_seen, last_ip, hostname,
+               vendor, device_class, last_source, last_network_id, last_interface,
+               last_scan_run_id, district_slug, school_slug, device_slug
+          FROM inventory_devices
+         ORDER BY last_seen_at DESC
+    """
+    params: tuple[Any, ...] = ()
+    if limit is not None:
+        sql += " LIMIT %s"
+        params = (limit,)
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return list(cur.fetchall())
+
+
+def inventory_counts() -> dict[str, int]:
+    """Headline inventory numbers for the bundle summary."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    count(*)                                                  AS total,
+                    count(*) FILTER (WHERE first_seen_at > NOW() - INTERVAL '24 hours') AS new_24h,
+                    count(*) FILTER (WHERE last_seen_at  > NOW() - INTERVAL '24 hours') AS seen_24h
+                  FROM inventory_devices
+                """
+            )
+            row = cur.fetchone() or {}
+            return {
+                "total": int(row.get("total") or 0),
+                "new_24h": int(row.get("new_24h") or 0),
+                "seen_24h": int(row.get("seen_24h") or 0),
+            }
+
+
 def insert_many(table: str, rows: list[dict[str, Any]]) -> None:
     """Insert a batch of rows by column-name dict. Table name is whitelisted."""
     if not rows:

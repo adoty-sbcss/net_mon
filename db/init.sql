@@ -238,3 +238,30 @@ CREATE TABLE IF NOT EXISTS findings (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_findings_scan ON findings(scan_run_id);
+
+-- Persistent device inventory, keyed on MAC (see migration 0010).
+-- Unlike every table above, this one is NOT scan-scoped: it's the durable
+-- cross-scan rollup of every device this box has ever seen (first/last seen,
+-- times seen, last known IP/hostname/vendor/location). last_scan_run_id is
+-- SET NULL (not CASCADE) so the inventory outlives the raw scan evidence.
+CREATE TABLE IF NOT EXISTS inventory_devices (
+    mac              MACADDR PRIMARY KEY,
+    first_seen_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    times_seen       INTEGER NOT NULL DEFAULT 1,
+    last_ip          INET,
+    hostname         TEXT,
+    vendor           TEXT,
+    device_class     TEXT,
+    last_source      TEXT,
+    last_network_id  TEXT,
+    last_interface   TEXT,
+    last_scan_run_id INTEGER REFERENCES scan_runs(id) ON DELETE SET NULL,
+    district_slug    TEXT,
+    school_slug      TEXT,
+    device_slug      TEXT,
+    extra            JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_inventory_last_seen ON inventory_devices(last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_inventory_vendor    ON inventory_devices(vendor);
+CREATE INDEX IF NOT EXISTS idx_inventory_network   ON inventory_devices(last_network_id);

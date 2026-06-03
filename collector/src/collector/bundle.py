@@ -12,7 +12,7 @@ from typing import Any
 import structlog
 
 from .config import get_settings
-from .db import fetch_scan, fetch_table_for_scan
+from .db import fetch_scan, fetch_table_for_scan, inventory_counts, list_inventory
 from .prompts import get_bundle_readme, get_bundle_readme_hourly
 
 log = structlog.get_logger(__name__)
@@ -69,16 +69,26 @@ def build_hourly_bundle(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Persistent inventory is cross-scan, so it lives once at the bundle root —
+    # not duplicated under every scans/scan_<id>/ folder.
+    inventory = list_inventory()
+    inv_counts = inventory_counts()
+
     summary = _build_hourly_summary(
         scan_ids=scan_ids,
         device_name=device_name,
         window_start=window_start,
         window_end=window_end,
+        inv_counts=inv_counts,
     )
 
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
         z.writestr("README.md", get_bundle_readme_hourly())
         z.writestr("HOURLY_SUMMARY.md", summary)
+        z.writestr("inventory.csv", _inventory_csv(inventory))
+        z.writestr("inventory.json", json.dumps(
+            {"counts": inv_counts, "devices": inventory},
+            indent=2, default=_default))
         for sid in scan_ids:
             payload = _scan_payload(sid)
             for name, content in payload.items():
@@ -300,6 +310,7 @@ def _build_hourly_summary(
     device_name: str,
     window_start: datetime,
     window_end: datetime,
+    inv_counts: dict[str, int] | None = None,
 ) -> str:
     lines = []
     lines.append(f"# NetMon hourly rollup — {device_name}")
@@ -308,6 +319,17 @@ def _build_hourly_summary(
     lines.append(f"- **Device:** {device_name}")
     lines.append(f"- **Scans in this hour:** {len(scan_ids)}")
     lines.append("")
+
+    if inv_counts is not None:
+        lines.append("## Persistent inventory (all networks this box monitors)")
+        lines.append("")
+        lines.append(f"- Known devices (lifetime): **{inv_counts.get('total', 0)}**")
+        lines.append(f"- First seen in last 24h: **{inv_counts.get('new_24h', 0)}**")
+        lines.append(f"- Seen in last 24h: **{inv_counts.get('seen_24h', 0)}**")
+        lines.append("")
+        lines.append("Full device list in `inventory.csv` / `inventory.json` at the bundle root.")
+        lines.append("")
+
     lines.append("## Scans")
     lines.append("")
     lines.append("| ID | Interface | CIDR | Gateway | Trigger | Duration |")
@@ -520,6 +542,20 @@ def _build_timeline(dhcp: list[dict[str, Any]], stp: list[dict[str, Any]]) -> li
 def _devices_csv(rows: list[dict[str, Any]]) -> str:
     buf = io.StringIO()
     fieldnames = ["id", "ip", "mac", "hostname", "vendor", "source", "first_seen_at", "last_seen_at"]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: ("" if r.get(k) is None else str(r.get(k))) for k in fieldnames})
+    return buf.getvalue()
+
+
+def _inventory_csv(rows: list[dict[str, Any]]) -> str:
+    buf = io.StringIO()
+    fieldnames = [
+        "mac", "last_ip", "hostname", "vendor", "device_class",
+        "first_seen_at", "last_seen_at", "times_seen",
+        "last_network_id", "last_interface",
+    ]
     writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
     for r in rows:

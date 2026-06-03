@@ -448,8 +448,7 @@ def _persist(
         if ctx.gateway_ip:
             resolvers.append(ctx.gateway_ip)
         # de-dup, preserve order
-        _seenr: set[str] = set()
-        resolvers = [r for r in resolvers if not (r in _seenr or _seenr.add(r))]
+        resolvers = list(dict.fromkeys(resolvers))
         need = [
             dev["ip"]
             for dev in seen.values()
@@ -464,6 +463,22 @@ def _persist(
                     dev["source"] = (dev.get("source") or "") + "+rdns"
 
     insert_many("devices", list(seen.values()))
+
+    # Persistent MAC-keyed inventory rollup. The per-scan `devices` rows above
+    # answer "what did this scan see"; this upsert maintains the durable
+    # cross-scan "what devices exist on the networks this box monitors" inventory
+    # that the discovery/security/fleet features build on. Best-effort: a failure
+    # here must not fail the scan or lose the per-scan tables already committed.
+    if settings.inventory_enabled:
+        try:
+            inv_rows = _inventory_rows(seen.values(), ctx)
+            if inv_rows:
+                from .db import upsert_inventory_devices
+                upserted, new = upsert_inventory_devices(inv_rows)
+                log.info("inventory updated", scan_id=ctx.scan_id,
+                         upserted=upserted, new=new)
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("inventory upsert failed", error=str(exc))
 
     insert_many("neighbors", [
         {**n, "scan_run_id": ctx.scan_id, "extra": "{}",
@@ -562,6 +577,49 @@ def _persist(
             }
             for r in reachability
         ])
+
+
+def _inventory_rows(
+    devices: Any, ctx: ScanContext
+) -> list[dict[str, Any]]:
+    """Collapse this scan's discovered devices into one inventory upsert row per
+    MAC. Rows without a MAC are dropped (MAC is the inventory key). When the same
+    MAC shows up under several IPs in one scan, keep the first and fill in any
+    hostname / IP / vendor the later duplicates supply."""
+    settings = get_settings()
+    by_mac: dict[str, dict[str, Any]] = {}
+    for d in devices:
+        mac = d.get("mac")
+        if not mac:
+            continue
+        norm = str(mac).lower()
+        existing = by_mac.get(norm)
+        if existing is None:
+            by_mac[norm] = {
+                "mac": mac,
+                "last_ip": d.get("ip"),
+                "hostname": d.get("hostname"),
+                "vendor": d.get("vendor"),
+                # device_class is populated later by the fingerprint/SNMP
+                # classifiers; None here means "leave any existing value alone"
+                # (the upsert COALESCEs it).
+                "device_class": None,
+                "last_source": d.get("source"),
+                "last_network_id": ctx.network_id,
+                "last_interface": ctx.interface,
+                "last_scan_run_id": ctx.scan_id,
+                "district_slug": settings.district_slug or None,
+                "school_slug": settings.school_slug or None,
+                "device_slug": settings.device_slug or None,
+            }
+        else:
+            if not existing.get("hostname") and d.get("hostname"):
+                existing["hostname"] = d.get("hostname")
+            if not existing.get("last_ip") and d.get("ip"):
+                existing["last_ip"] = d.get("ip")
+            if not existing.get("vendor") and d.get("vendor"):
+                existing["vendor"] = d.get("vendor")
+    return list(by_mac.values())
 
 
 def _looks_like_mac(s: str | None) -> bool:

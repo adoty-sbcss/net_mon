@@ -107,6 +107,11 @@ to the configured SFTP server at the top of the hour.
 - **HOURLY_SUMMARY.md** — Read first. Lists every scan in the window,
   plus aggregate counts and notable changes between scans.
 - **README.md** — This file. Use the prompt below.
+- **inventory.csv / inventory.json** — The box's *persistent* device
+  inventory across all scans (not just this hour): per MAC, the first/last
+  time it was ever seen, how many scans it has appeared in, and its last
+  known IP / hostname / vendor / device-class / location. Use this to tell
+  brand-new devices from long-known ones.
 - **scans/scan_<id>/** — Per-scan data. Each folder contains:
   - `summary.md`, `findings.json`, `topology.json`, `devices.csv`,
     `metrics.json`, `timeline.json`, `dns_health.json`
@@ -125,13 +130,17 @@ to the configured SFTP server at the top of the hour.
 > 1. Read `HOURLY_SUMMARY.md` first to understand what's in the bundle.
 > 2. For each scan, summarize the network identity (subnet, gateway,
 >    vendor mix, apparent device roles).
-> 3. Compare scans across the hour. Flag anything that changed:
+> 3. Cross-reference `inventory.csv` (the box's lifetime device list).
+>    Call out devices first seen in the last 24h (`first_seen_at`), and
+>    note any whose `vendor` / `device_class` looks out of place for the
+>    network they're on (`last_network_id`).
+> 4. Compare scans across the hour. Flag anything that changed:
 >    - Devices appearing or disappearing
 >    - MAC/IP bindings shifting
 >    - DHCP server changing or multiple servers seen
 >    - STP root changing, topology change flag flapping
 >    - Broadcast / multicast rate spikes
-> 4. Across the hour, look for and call out evidence of:
+> 5. Across the hour, look for and call out evidence of:
 >    - **Layer-2 loops** (root churn, frequent topology changes, MAC
 >      flapping, TTL anomalies)
 >    - **Broadcast/multicast storms** (rates relative to total packets,
@@ -142,7 +151,7 @@ to the configured SFTP server at the top of the hour.
 >      native VLAN)
 >    - **Unusual hosts** (vendor OUI mismatches, unexpected devices)
 >    - **Interface health** (high error/drop counts, asymmetric flow)
-> 5. Walk each scan's `dns_health.json`:
+> 6. Walk each scan's `dns_health.json`:
 >    - Compare per-resolver mean latency. Flag DHCP-assigned resolvers
 >      noticeably slower than the public ones (1.1.1.1/8.8.8.8/9.9.9.9).
 >    - Flag `nxdomain_rewrite: true` — ISP/filter is rewriting NXDOMAIN.
@@ -150,9 +159,9 @@ to the configured SFTP server at the top of the hour.
 >      disagreement is split-horizon or hijacking.
 >    - Track DNS error rates across the hour. A resolver going from
 >      clean to SERVFAIL/TIMEOUT mid-hour is a real incident.
-> 6. Rank findings by severity and confidence (definite vs.
+> 7. Rank findings by severity and confidence (definite vs.
 >    suggestive). Cite the scan id and file that supports each finding.
-> 7. End with a short list of follow-up checks (SNMP polls, switch
+> 8. End with a short list of follow-up checks (SNMP polls, switch
 >    CLI, longer captures, specific MACs to track).
 >
 > If a scan is missing data or looks truncated, say so.
