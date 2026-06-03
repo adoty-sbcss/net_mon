@@ -12,9 +12,9 @@ Ordered so foundations land before the things that depend on them. Status reflec
 
 **Phase 0 — Data foundation** · ✅ `inventory_devices` keystone shipped 2026-06-03. The MAC-keyed cross-scan inventory the rest of Discovery/Security/Fleet hangs off.
 
-**Phase 1 — Inventory enrichment**
+**Phase 1 — Inventory enrichment** ✅ done
 1. ✅ DHCP fingerprinting (opt 55) — **done dashboard-side** (`netmon-dashboard` `47d016d`); collector already ships the raw options. On-box classifier is now an air-gapped-only optional follow-on.
-2. mDNS/Bonjour + SSDP/UPnP discovery — one new `discovery/` module; huge in K-12. **← real next-up collector work.**
+2. ✅ mDNS/Bonjour + SSDP/UPnP discovery — collector shipped (`4ef1072`); dashboard ingest of `service_discovery.json` is the follow-on.
 
 **Phase 2 — History-dependent** (needs the inventory over time)
 3. Change detection per switch port (inventory + LLDP).
@@ -69,8 +69,8 @@ Ordered so foundations land before the things that depend on them. Status reflec
 - [x] **Persistent device inventory** — printers, IoT, AV, computers, etc. ✅ **SHIPPED 2026-06-03**
   Cross-scan persistence keyed on MAC: `inventory_devices` table ([db/migrations/0010_add_inventory_devices.sql](db/migrations/0010_add_inventory_devices.sql)) with first/last seen, times seen, last known IP/hostname/vendor/location, and box identity. Upserted each scan in [scan.py](collector/src/collector/scan.py) `_persist`; surfaced as `inventory.csv`/`inventory.json` at the hourly-bundle root. The `device_class` column ships empty on purpose — it's the hook the two enrichment items below attach to. Foundation for everything in this section + cross-site correlation.
 
-- [ ] **mDNS / Bonjour + SSDP / UPnP discovery** (suggested)
-  Catches Apple printers, AirPlay receivers, Chromecasts, Sonos, IP cameras — most of which barely show up in ARP/nmap. Huge in K-12.
+- [x] **mDNS / Bonjour + SSDP / UPnP discovery** (suggested) ✅ **SHIPPED 2026-06-03** — collector side
+  [discovery/mdns_ssdp.py](collector/src/collector/discovery/mdns_ssdp.py) (`4ef1072`): pure-stdlib mDNS PTR + SSDP M-SEARCH, full DNS decode, service-type → `device_hint`. New `service_discovery` table (migration 0011); enriches the device set (backfills hostnames, **adds service-only IPs ARP/nmap missed**) → flows into the inventory; ships `service_discovery.json` in the bundle. Catches Apple AirPrint/AirPlay, Chromecasts, Sonos, Rokus, smart TVs, IP cameras. *Live-multicast validation pending on Monitor1.* Dashboard ingest of `service_discovery.json` is the follow-on (like DHCP fingerprint).
 
 - [x] **DHCP fingerprinting (option 55)** (suggested) ✅ **SHIPPED — dashboard-side**
   Done in the **dashboard ingest pipeline**, not the collector: `netmon-dashboard` commit `47d016d` ("feat(ingest): DHCP fingerprint → device type + hostname") classifies on ingest from the options the collector already ships. The collector's job here is just *capturing* the raw fingerprint fields (options 55/60/12 in `dhcp_observations`, [init.sql](db/init.sql)) — which it already does. So for any **connected** site, devices get classified centrally.
@@ -181,11 +181,10 @@ Ordered so foundations land before the things that depend on them. Status reflec
 - [ ] **Per-box version + health view** (suggested)
   Which boxes are on which git SHA, last successful upload, last reboot, lynis score trend.
 
-- [ ] **Sensor self-health telemetry** (CPU / RAM / disk / OS) ⭐ *requested*
-  Report each sensor's **own** vitals (distinct from the network it watches) so the dashboard sensor page shows box health at a glance: CPU utilization + load average, RAM used/total, disk used/free (root + `/var/lib/netmon`), OS + kernel version, uptime / last boot, and on a Pi the CPU temp. Optional: per-container (collector/postgres) health + restart counts.
-  - **Source — pure stdlib, no deps:** read `/proc/stat` (CPU), `/proc/meminfo` (RAM), `os.statvfs` (disk), `/etc/os-release` + `os.uname()` (OS/kernel), `/proc/uptime` (uptime), `/sys/class/thermal/*/temp` (Pi temp). `selftest.py` already reports disk space, so the precedent exists — generalize it into a `host_metrics()` helper.
-  - **Transport — piggyback the existing check-in** ([checkin.py](collector/src/collector/checkin.py)): add a `hostMetrics` object to the ~10-min check-in POST. No new inbound path, no new timer; the dashboard already receives `agentVersion`/`localIp` there.
-  - **Dashboard:** store latest on the sensor row + a small time-series for trend; render gauges (CPU/RAM/disk) + OS/uptime on the sensor page; threshold to yellow/red. Feeds the [[Heartbeat per box]] and [[Per-box version + health view]] items above — same family — and gives a clean hook for low-disk / high-CPU **alerts** later.
+- [~] **Sensor self-health telemetry** (CPU / RAM / disk / OS) ⭐ *requested* — 🚧 **collector side SHIPPED; dashboard render pending**
+  Report each sensor's **own** vitals (distinct from the network it watches) so the dashboard sensor page shows box health at a glance: CPU utilization + load average, RAM used/total, disk used/free, OS + kernel version, uptime / last boot, and on a Pi the CPU temp.
+  - **Collector side ✅ shipped:** [host_metrics.py](collector/src/collector/host_metrics.py) reads `/proc/stat` (CPU), `/proc/meminfo` (RAM), `os.statvfs(/var/lib/netmon)` (disk), host `/etc/os-release` (bind-mounted) + `os.uname()` (OS/kernel), `/proc/uptime`, `/sys/class/thermal` (Pi temp); resilient per-field. [checkin.py](collector/src/collector/checkin.py) reports it as a `hostMetrics` object on the ~10-min check-in (no new inbound path/timer). docker-compose mounts the host os-release so the distro is the box's, not the image's.
+  - **Dashboard side ⏳ pending** (netmon-dashboard): store latest `hostMetrics` + `lastCheckinAt` on the sensor row (+ small time-series for trend); render gauges (CPU/RAM/disk) + OS/uptime/version on the sensor page; threshold to green/yellow/red. This is also the data behind **Heartbeat per box** and **Per-box version + health view** (same family) and the hook for low-disk / high-CPU **alerts** later.
 
 - [ ] **Org-wide search and reporting** (suggested)
   "Find every printer in the district" / "every device on EOL Windows" / "every site missing a heartbeat >24h."
