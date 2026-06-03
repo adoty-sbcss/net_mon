@@ -38,6 +38,21 @@ else
     fi
 fi
 
+# Update the Postgres image too. The collector image we build ourselves, but
+# postgres:16-alpine is a pulled tag that `up -d` never re-fetches once present,
+# so Alpine CVEs and Postgres 16.x patch releases would otherwise never land.
+# `pull` grabs the current 16-alpine; `up -d postgres` only recreates if the
+# image digest actually changed (brief DB blip, data persists on the volume).
+log "pulling latest postgres image"
+if ! docker compose pull postgres 2>&1 | while read -r ln; do log "  $ln"; done; then
+    log "WARN: postgres image pull failed; continuing with current image"
+else
+    log "applying postgres image (recreates only if the digest changed)"
+    if ! docker compose up -d postgres 2>&1 | while read -r ln; do log "  $ln"; done; then
+        log "WARN: postgres up -d reported errors"
+    fi
+fi
+
 log "running: docker compose build --pull --no-cache collector"
 if ! docker compose build --pull --no-cache collector 2>&1 | while read -r ln; do log "  $ln"; done; then
     log "ERROR: deep rebuild failed"
