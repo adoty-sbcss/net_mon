@@ -228,6 +228,8 @@ The wizard:
 
 The switch port must already be a trunk that allows those VLANs — the sensor can't reconfigure the switch. Each VLAN's scans are tagged with `vlan_id` + `parent_interface` in the bundle. Drop noisy VLANs from auto-scanning with `NETMON_EXCLUDE_VLANS=900,999` (a manual `./netmon scan eth0.900` still works). Confirm the sub-interfaces with `./netmon interfaces`.
 
+**Field notes:** trunk monitoring needs **systemd-networkd** (the Ubuntu Server default) — on a NetworkManager box the wizard warns and the VLANs may not attach. The apply uses `netplan try` (auto-reverts in 120s if it can't reach the network), so a bad VLAN change can't strand the box. If **detection sees no VLANs on a known-good trunk**, the NIC may be stripping 802.1Q tags in hardware before capture — turn that off with `sudo ethtool -K <parent> rxvlan off` and re-run, or just enter the VLANs manually (detection is only a convenience; the sub-interfaces work regardless).
+
 To disable hourly uploads without removing the SFTP creds, set `NETMON_SFTP_ENABLED=false` in `/etc/netmon/netmon.env` and `./netmon restart`.
 
 ---

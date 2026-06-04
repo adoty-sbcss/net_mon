@@ -67,6 +67,12 @@ def primary_interface() -> str | None:
     return None
 
 
+def _is_vlan_subif(iface: str) -> bool:
+    """True for a VLAN sub-interface name like eth0.10 / enp0s31f6.100."""
+    parent, _, tag = iface.rpartition(".")
+    return bool(parent) and tag.isdigit() and 1 <= int(tag) <= 4094
+
+
 def _default_route_via(iface: str) -> tuple[str | None, str | None]:
     """Find the default gateway IP and MAC for traffic leaving `iface`."""
     routes = _run_ip_json(["ip", "-j", "route", "show", "default"]) or []
@@ -75,8 +81,11 @@ def _default_route_via(iface: str) -> tuple[str | None, str | None]:
         if r.get("dev") == iface and r.get("gateway"):
             gw_ip = r["gateway"]
             break
-    if gw_ip is None:
-        # Fall back: first default we find, even on another iface.
+    if gw_ip is None and not _is_vlan_subif(iface):
+        # Fall back to the global default for a plain interface with no default
+        # route of its own. NOT for a VLAN monitoring sub-interface (eth0.10):
+        # those run with routes OFF, so borrowing the box's uplink gateway would
+        # mis-attribute every VLAN scan and misdirect its ARP/SNMP/reach probes.
         for r in routes:
             if r.get("gateway"):
                 gw_ip = r["gateway"]

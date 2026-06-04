@@ -75,6 +75,7 @@ generate_vlan_netplan() {
         local vid cidr pair
         for vid in ${vlans//,/ }; do
             [[ "$vid" =~ ^[0-9]+$ ]] || continue
+            vid=$((10#$vid))   # strip leading zeros (avoid bash octal parsing)
             (( vid >= 1 && vid <= 4094 )) || continue
             cidr=""
             for pair in ${statics//,/ }; do
@@ -127,6 +128,18 @@ prompt_trunk_config() {
         echo "${parent} is not the box's uplink, so the trunk is monitoring-only."
     fi
 
+    # 2b. Renderer sanity. VLAN sub-interfaces are reliable under systemd-networkd
+    # (the Ubuntu Server default). On a NetworkManager-managed box the apply can
+    # bounce the connection and the VLANs may not attach — warn, don't block.
+    if command -v systemctl >/dev/null 2>&1 \
+        && systemctl is-active --quiet NetworkManager 2>/dev/null \
+        && ! systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+        echo ""
+        warn "This box appears to use NetworkManager, not systemd-networkd."
+        warn "VLAN sub-interfaces are most reliable under networkd — they may not come"
+        warn "up cleanly here. Consider moving the parent to netplan/networkd first."
+    fi
+
     # 3. Detect VLANs on the trunk
     local detected=""
     echo ""
@@ -136,7 +149,10 @@ prompt_trunk_config() {
         if [[ -n "$detected" ]]; then
             ok "detected VLANs: ${detected}"
         else
-            warn "no tagged VLANs seen — quiet trunk, an access port, or the collector isn't running yet. Enter them manually."
+            warn "no tagged VLANs detected — a quiet trunk, an access port, or the collector"
+            warn "isn't running yet (normal during first-boot, before setup starts it)."
+            warn "Enter the VLANs manually now; re-run 'sudo netmon-wizard trunk' after the"
+            warn "box is up to use auto-detect."
         fi
     fi
 
@@ -183,18 +199,32 @@ prompt_trunk_config() {
         ok "netplan config is valid"
     else
         warn "netplan validation failed:"; $SUDO sed 's/^/    /' /tmp/netmon-netplan.err
-        warn "Fix it and re-run: sudo netmon-wizard trunk"
+        warn "This can also be a PRE-EXISTING error elsewhere in /etc/netplan, or the"
+        warn "parent (${parent}) not being netplan-managed. Fix, then: sudo netmon-wizard trunk"
         return 0
     fi
-    if prompt_yesno "Apply now (creates the VLAN sub-interfaces)?" "Y"; then
-        if $SUDO netplan apply; then
-            ok "applied — VLAN sub-interfaces are up"
+    # netplan try needs an interactive terminal (it waits for ENTER to keep the
+    # change). If we're not on a TTY, write the file but don't apply.
+    if [[ ! -t 0 ]]; then
+        warn "not an interactive terminal — wrote ${f} but did NOT apply it."
+        echo "  Apply it yourself with:  sudo netplan try   (safe; auto-reverts)"
+        return 0
+    fi
+    if prompt_yesno "Apply now? (uses 'netplan try' — auto-reverts if it can't reach the network)" "Y"; then
+        echo "  applying… your SSH/console should stay up. Press ENTER at the netplan"
+        echo "  prompt to KEEP it; if anything breaks, do nothing and it auto-reverts."
+        # `netplan try` is the safe path for remote boxes: it applies, then reverts
+        # to the prior config on timeout or if the network can't be reached — so a
+        # bad VLAN change can never strand the box.
+        if $SUDO netplan try --timeout 120; then
+            ok "applied + kept — VLAN sub-interfaces are up"
             echo "  the collector discovers + scans them within a poll tick (~30s)."
         else
-            warn "netplan apply reported an error — check 'ip -br addr' and 'journalctl -u systemd-networkd'."
+            warn "netplan reverted — nothing kept (timeout, or it couldn't reach the network)."
+            warn "Your previous config is intact. Re-run 'sudo netmon-wizard trunk' when ready."
         fi
     else
-        echo "  (not applied — run 'sudo netplan apply' when ready)"
+        echo "  (not applied — the file is written; run 'sudo netplan try' when ready)"
     fi
 
     echo ""
