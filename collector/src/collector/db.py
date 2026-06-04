@@ -57,6 +57,8 @@ def insert_scan_run(
     gateway_mac: str | None,
     network_id: str | None,
     is_primary: bool = False,
+    vlan_id: int | None = None,
+    parent_interface: str | None = None,
 ) -> int:
     s = get_settings()
     with connect() as conn:
@@ -66,16 +68,18 @@ def insert_scan_run(
                 INSERT INTO scan_runs (
                     trigger_reason, interface, interface_cidr,
                     gateway_ip, gateway_mac, network_id, is_primary,
-                    district_slug, school_slug, device_slug
+                    district_slug, school_slug, device_slug,
+                    vlan_id, parent_interface
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (trigger_reason, interface, interface_cidr, gateway_ip,
                  gateway_mac, network_id, is_primary,
                  s.district_slug or None,
                  s.school_slug or None,
-                 s.device_slug or None),
+                 s.device_slug or None,
+                 vlan_id, parent_interface),
             )
             row = cur.fetchone()
             assert row is not None

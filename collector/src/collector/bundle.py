@@ -196,6 +196,8 @@ def _build_summary_md(
     lines.append(f"- **Trigger:** {scan.get('trigger_reason')}")
     _role = "primary uplink" if scan.get("is_primary") else "secondary (monitored)"
     lines.append(f"- **Interface:** {scan.get('interface')} ({_role})")
+    if scan.get("vlan_id") is not None:
+        lines.append(f"- **VLAN:** {scan.get('vlan_id')} (trunk {scan.get('parent_interface') or '?'})")
     lines.append(f"- **Subnet (CIDR):** {scan.get('interface_cidr')}")
     lines.append(f"- **Gateway IP:** {scan.get('gateway_ip')}")
     lines.append(f"- **Gateway MAC:** {scan.get('gateway_mac')}")

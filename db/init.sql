@@ -27,9 +27,15 @@ CREATE TABLE IF NOT EXISTS scan_runs (
     -- box that hasn't been through the first-boot wizard yet still inserts.
     district_slug   TEXT,
     school_slug     TEXT,
-    device_slug     TEXT
+    device_slug     TEXT,
+    -- VLAN attribution when scanning a trunk via sub-interfaces (see migration
+    -- 0012). NULL on a plain untagged interface; vlan_id 10 + parent eth0 for
+    -- a scan on eth0.10.
+    vlan_id          INTEGER,
+    parent_interface TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_runs_vlan ON scan_runs(vlan_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_scan_runs_network ON scan_runs(network_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_scan_runs_identity
     ON scan_runs(district_slug, school_slug, device_slug, started_at DESC);

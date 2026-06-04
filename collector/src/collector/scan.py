@@ -39,6 +39,18 @@ def _network_id(gateway_mac: str | None, cidr: str | None) -> str | None:
     return hashlib.sha256(f"{gateway_mac or 'no-gw'}|{cidr}".encode()).hexdigest()[:16]
 
 
+def _vlan_of(interface: str) -> tuple[int | None, str | None]:
+    """Derive (vlan_id, parent) from a VLAN sub-interface name:
+    'eth0.10' -> (10, 'eth0'); 'enp0s31f6.100' -> (100, 'enp0s31f6'); a plain
+    NIC -> (None, None). Matches the `parent.vid` naming the trunk wizard
+    generates via netplan, so trunk scans are attributable to their VLAN."""
+    m = re.match(r"^(.+)\.(\d{1,4})$", interface)
+    if not m:
+        return None, None
+    vid = int(m.group(2))
+    return (vid, m.group(1)) if 1 <= vid <= 4094 else (None, None)
+
+
 def _topology_due(net_id: str | None, interval_sec: int) -> bool:
     """Whether an SNMP topology crawl is due for this network.
 
@@ -84,6 +96,7 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
             log.info("cooldown active, skipping", network_id=net_id, last_scan=recent["id"])
             return None
 
+    vlan_id, parent_iface = _vlan_of(state.name)
     scan_id = insert_scan_run(
         trigger_reason=trigger_reason,
         interface=state.name,
@@ -92,9 +105,11 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
         gateway_mac=state.gateway_mac,
         network_id=net_id,
         is_primary=is_primary,
+        vlan_id=vlan_id,
+        parent_interface=parent_iface,
     )
     log.info("scan started",
-             scan_id=scan_id, interface=state.name,
+             scan_id=scan_id, interface=state.name, vlan_id=vlan_id,
              cidr=state.primary_cidr, gateway=state.gateway_ip)
     audit("scan_started",
           scan_id=scan_id, interface=state.name,
