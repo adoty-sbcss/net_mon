@@ -68,7 +68,7 @@ ${C_HEAD}╔══════════════════════�
 
 This walks you through the settings the box needs to start collecting
 and uploading. You can re-run any time with:  sudo netmon-wizard
-Per-section runs:  sudo netmon-wizard identity | sftp | snmp | dashboard | advanced
+Per-section runs:  sudo netmon-wizard identity | sftp | snmp | dashboard | trunk | advanced
 
 Press Enter at any prompt to keep the current value (shown in brackets).
 
@@ -101,6 +101,19 @@ run_full() {
     run_essentials
     prompt_snmp_config
     prompt_dashboard_config
+
+    # Optional VLAN trunk monitoring. Most sensors sit on a normal access port and
+    # skip this; a sensor on a switch trunk can monitor many VLANs from one box.
+    echo ""
+    echo "${C_INFO}VLAN trunk monitoring (optional)${C_OFF}"
+    echo "If this sensor is plugged into a switch TRUNK port (802.1Q) and you want to"
+    echo "watch several VLANs from this one box, set that up now — we'll add a VLAN"
+    echo "sub-interface per VLAN. On a normal access port, just skip it (press Enter)."
+    if prompt_yesno "Set up VLAN trunk monitoring now?" "N"; then
+        prompt_trunk_config
+    else
+        echo "  (skipped — set up any time with: sudo netmon-wizard trunk)"
+    fi
 
     echo ""
     if prompt_yesno "Set up advanced options now (scan mode, cadence, log level)?" "N"; then
