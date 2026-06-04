@@ -88,7 +88,19 @@ run_essentials() {
         log "Generated random POSTGRES_PASSWORD"
     fi
 
-    prompt_sftp_config "$(current_value NETMON_DEVICE)"
+    # SFTP: if the upload destination is fully provisioned (host + user +
+    # password already seeded from config/provisioning.env), don't ask — just use
+    # it. The tech only types the per-site identity. Not provisioned -> prompt.
+    if _sftp_provisioned; then
+        echo ""
+        ok "SFTP upload destination is pre-configured: $(current_value NETMON_SFTP_USER)@$(current_value NETMON_SFTP_HOST)"
+        echo "  (change it any time with: sudo netmon-wizard sftp)"
+        set_value NETMON_SFTP_ENABLED "true"
+        [[ -z "$(current_value NETMON_DEVICE_NAME)" ]] && \
+            set_value NETMON_DEVICE_NAME "$(current_value NETMON_DEVICE)"
+    else
+        prompt_sftp_config "$(current_value NETMON_DEVICE)"
+    fi
 }
 
 mark_wizard_done() {

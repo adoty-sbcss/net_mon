@@ -3,6 +3,16 @@
 [[ -n "${_NETMON_SFTP_SH:-}" ]] && return 0
 _NETMON_SFTP_SH=1
 
+# _sftp_provisioned — true if the upload destination is already fully set (host +
+# user + password), e.g. seeded from config/provisioning.env. Lets the first-boot
+# wizard SKIP the SFTP prompts entirely instead of making the tech Enter through
+# pre-filled values.
+_sftp_provisioned() {
+    [[ -n "$(current_value NETMON_SFTP_HOST)" ]] \
+        && [[ -n "$(current_value NETMON_SFTP_USER)" ]] \
+        && [[ -n "$(current_value NETMON_SFTP_PASSWORD)" ]]
+}
+
 # prompt_sftp_config — interactive walk through the SFTP destination fields.
 # Stores values in /etc/netmon/netmon.env via set_value. Also sets
 # NETMON_SFTP_ENABLED=true at the end so the uploader starts shipping.

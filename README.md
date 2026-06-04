@@ -52,9 +52,9 @@ On first run the wizard pre-fills the dashboard URL and bootstrap key from this 
 
 `setup.sh` invokes `netmon-wizard` which walks you through:
 
-**Essentials** (always asked):
-- **Identity** — district, school, and device/location label (e.g. "Library IDF"). These tag every scan and organize uploads on the SFTP server into `<district>/<school>/<device>/` folders.
-- **SFTP destination** — host, port, user, password (silent), remote path.
+**Essentials**:
+- **Identity** (always asked) — district, school, and device/location label (e.g. "Library IDF"). These tag every scan and organize uploads on the SFTP server into `<district>/<school>/<device>/` folders.
+- **SFTP destination** — host, port, user, password (silent), remote path. **Skipped automatically when it's already provisioned** (host + user + password from `config/provisioning.env`); only prompted on a box without provisioned SFTP creds.
 
 **Dashboard enrollment** (asked next):
 - **Dashboard URL** and **bootstrap key** — pre-filled if you created `config/provisioning.env` (above), so just press Enter. Leave the URL blank to run an SFTP-only box with no dashboard.
