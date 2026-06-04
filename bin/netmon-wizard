@@ -123,18 +123,10 @@ run_full() {
         prompt_dashboard_config
     fi
 
-    # Optional VLAN trunk monitoring. Most sensors sit on a normal access port and
-    # skip this; a sensor on a switch trunk can monitor many VLANs from one box.
-    echo ""
-    echo "${C_INFO}VLAN trunk monitoring (optional)${C_OFF}"
-    echo "If this sensor is plugged into a switch TRUNK port (802.1Q) and you want to"
-    echo "watch several VLANs from this one box, set that up now — we'll add a VLAN"
-    echo "sub-interface per VLAN. On a normal access port, just skip it (press Enter)."
-    if prompt_yesno "Set up VLAN trunk monitoring now?" "N"; then
-        prompt_trunk_config
-    else
-        echo "  (skipped — set up any time with: sudo netmon-wizard trunk)"
-    fi
+    # NOTE: VLAN trunk monitoring is offered by setup.sh AFTER the collector
+    # container starts (so the wizard can auto-detect the trunk's VLANs — the
+    # detector runs tshark inside that container). Run it any time standalone
+    # with: sudo netmon-wizard trunk.
 
     echo ""
     if prompt_yesno "Set up advanced options now (scan mode, cadence, log level)?" "N"; then

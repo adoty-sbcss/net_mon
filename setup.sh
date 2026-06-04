@@ -110,6 +110,22 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     sleep 2
 done
 
+# --- 5b. Optional: VLAN trunk monitoring ---------------------------------
+# Asked here — AFTER the collector container is up — so the wizard can
+# auto-detect the VLANs on the trunk (the 802.1Q sniff runs tshark inside
+# that container). On a normal access-port box the tech just skips it.
+echo ""
+echo "${C_INFO}=== Optional: VLAN trunk monitoring ===${C_OFF}"
+echo "If this sensor is plugged into a switch TRUNK port (802.1Q) and you want"
+echo "to watch several VLANs from this one box, set that up now — it can"
+echo "auto-detect the VLANs on the trunk. On a normal access port, just skip it."
+echo ""
+if prompt_yesno "Set up VLAN trunk monitoring now?" "N"; then
+    /usr/local/sbin/netmon-wizard trunk || true
+else
+    echo "  (skipped — set up any time with: sudo netmon-wizard trunk)"
+fi
+
 echo ""
 if prompt_yesno "Test the SFTP connection now?" "Y"; then
     if dc exec -T collector python -m collector upload-test; then
@@ -178,6 +194,7 @@ echo "       sudo netmon-wizard               # full re-run"
 echo "       sudo netmon-wizard identity      # just district/school/device"
 echo "       sudo netmon-wizard sftp          # just SFTP destination"
 echo "       sudo netmon-wizard snmp          # just SNMP communities"
+echo "       sudo netmon-wizard trunk         # VLAN trunk monitoring (many VLANs / box)"
 echo "       sudo netmon-wizard advanced      # scan mode / cadence / log level"
 echo ""
 
