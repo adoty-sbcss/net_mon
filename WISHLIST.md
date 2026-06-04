@@ -28,7 +28,7 @@ Ordered so foundations land before the things that depend on them. Status reflec
 
 **Parallel track B — Fleet/Azure** (control-plane already underway) — ✅ remote code update · ✅ sensor self-health (+ heartbeat + per-box version/health view) · ✅ fleet SFTP rotation — *all deployed 2026-06-03*. Remaining: cross-site MAC correlation (needs Phase 0) → org-wide search.
 
-**Parallel track C — Multi-VLAN trunk ingestion** ⭐ flagged priority — monitor many VLANs from one sensor over an 802.1Q trunk, wizard-driven. Independent of the inventory chain; see *Multi-network & VLAN* below for the full scoped spec.
+**Parallel track C — Multi-VLAN trunk ingestion** ⭐ — 🚧 **BUILT 2026-06-03 (`ea1ff9e` + `c74ef9b`), pending live-trunk validation.** Scan tagging + `detect-vlans` + `netmon-wizard trunk` (netplan gen, DHCP/static, uplink-protected) + `NETMON_EXCLUDE_VLANS`. Needs a real 802.1Q trunk to validate `netplan apply` / sub-if creation.
 
 **Already shipped** (de-scoped from the lists below, kept for context): SNMP topology crawl, DNS health, reachability ping/traceroute, iperf3, remote config push, check-in/auto-enroll, OUI vendor table, LLDP/CDP capability tags.
 
@@ -36,7 +36,7 @@ Ordered so foundations land before the things that depend on them. Status reflec
 
 ## Multi-network & VLAN
 
-- [ ] **Multi-VLAN ingestion over a trunk port** ⭐ *priority — flagship multi-network feature*
+- [~] **Multi-VLAN ingestion over a trunk port** ⭐ — 🚧 **BUILT, pending live-trunk validation** (`ea1ff9e` scan tagging + `c74ef9b` detection/wizard/netplan). `netmon-wizard trunk`: hybrid detect-then-edit, DHCP+optional-static (no routes → uplink-safe), persistent netplan, `NETMON_EXCLUDE_VLANS`. The poller already scans the sub-ifs + tags by VLAN. *Troubleshoot `netplan apply` + sub-if creation against a real trunk before relying on it.*
   Plug the sensor into a **district trunk** (802.1Q) and monitor *many VLANs from one box*. Today the poller scans each Linux interface independently — multi-NIC already works ([poller.py:52](collector/src/collector/poller.py:52)) — but a trunk only exposes its untagged/native VLAN to the kernel. The fix is config-driven VLAN sub-interfaces (`ip link add link eth0 ... type vlan id N`), each picked up automatically by the existing poller and tagged with its VLAN in the scan data. Scale target: **as many VLANs as the hardware/OS allows** (Linux supports up to 4094 sub-ifs per parent; the real ceiling is scan-cadence/CPU, not the kernel — so bound it with a sane per-VLAN rescan schedule + a "max active VLANs" guard, and `log()` if we cap).
 
   Decided during scoping (2026-06-03):
