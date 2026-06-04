@@ -112,7 +112,16 @@ run_full() {
     print_banner
     run_essentials
     prompt_snmp_config
-    prompt_dashboard_config
+
+    # Dashboard enrollment: if URL + bootstrap key are provisioned, skip the
+    # prompts entirely — the box auto-enrolls on first check-in. Otherwise ask.
+    if _dashboard_provisioned; then
+        echo ""
+        ok "Dashboard enrollment is pre-configured: $(current_value NETMON_DASHBOARD_URL)"
+        echo "  (auto-enrolls on first check-in; change with: sudo netmon-wizard dashboard)"
+    else
+        prompt_dashboard_config
+    fi
 
     # Optional VLAN trunk monitoring. Most sensors sit on a normal access port and
     # skip this; a sensor on a switch trunk can monitor many VLANs from one box.

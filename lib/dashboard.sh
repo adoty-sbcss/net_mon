@@ -4,6 +4,15 @@
 [[ -n "${_NETMON_DASHBOARD_SH:-}" ]] && return 0
 _NETMON_DASHBOARD_SH=1
 
+# _dashboard_provisioned — true if the dashboard control plane is fully set (URL +
+# bootstrap key, e.g. seeded from config/provisioning.env). Lets the first-boot
+# wizard SKIP the enrollment prompts entirely — the box auto-enrolls on its first
+# check-in using the baked-in key.
+_dashboard_provisioned() {
+    [[ -n "$(current_value NETMON_DASHBOARD_URL)" ]] \
+        && [[ -n "$(current_value NETMON_BOOTSTRAP_KEY)" ]]
+}
+
 # prompt_dashboard_config — opt the box into the dashboard control plane and set
 # the shared bootstrap key for auto-enrollment. Outbound HTTPS only; no inbound.
 #

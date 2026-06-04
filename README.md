@@ -56,8 +56,8 @@ On first run the wizard pre-fills the dashboard URL and bootstrap key from this 
 - **Identity** (always asked) — district, school, and device/location label (e.g. "Library IDF"). These tag every scan and organize uploads on the SFTP server into `<district>/<school>/<device>/` folders.
 - **SFTP destination** — host, port, user, password (silent), remote path. **Skipped automatically when it's already provisioned** (host + user + password from `config/provisioning.env`); only prompted on a box without provisioned SFTP creds.
 
-**Dashboard enrollment** (asked next):
-- **Dashboard URL** and **bootstrap key** — pre-filled if you created `config/provisioning.env` (above), so just press Enter. Leave the URL blank to run an SFTP-only box with no dashboard.
+**Dashboard enrollment**:
+- **Dashboard URL** and **bootstrap key** — **skipped automatically when provisioned** (URL + key from `config/provisioning.env`); the box auto-enrolls on its first check-in. Only prompted on a box without provisioned enrollment values (leave the URL blank there to run an SFTP-only box with no dashboard).
 
 **Then** the wizard asks "Set up advanced options now?" — say yes only if you want to override defaults for:
 - SNMP communities (if you have read strings for switches/routers)
