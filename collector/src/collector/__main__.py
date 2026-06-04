@@ -75,6 +75,22 @@ def cmd_scan(interface: str, reason: str) -> None:
     click.echo(f"scan complete, id={scan_id}")
 
 
+@cli.command("detect-vlans")
+@click.argument("interface")
+@click.option("--seconds", default=8, show_default=True, help="Capture window.")
+def cmd_detect_vlans(interface: str, seconds: int) -> None:
+    """Sniff 802.1Q tags on INTERFACE and print the VLAN IDs seen (comma-separated).
+
+    The trunk wizard runs this in the collector container (which has tshark +
+    host networking) to propose which VLANs to monitor. Prints nothing — exit 0 —
+    if no tagged frames are seen (a plain access port or a very quiet trunk).
+    """
+    from .discovery import vlan_detect
+    vlans = vlan_detect.detect_vlans(interface, seconds=seconds)
+    if vlans:
+        click.echo(",".join(str(v) for v in vlans))
+
+
 @cli.command("list")
 @click.option("--limit", default=50, show_default=True, help="Max rows to show.")
 def cmd_list(limit: int) -> None:

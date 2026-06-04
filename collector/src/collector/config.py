@@ -28,6 +28,11 @@ class Settings(BaseSettings):
         default="lo,docker0,br-,veth,virbr,tun,tap",
         alias="NETMON_EXCLUDE_IFACES",
     )
+    # VLAN IDs the poller must NOT auto-scan even if a sub-interface exists
+    # (comma-separated). Lets an operator drop noisy/irrelevant VLANs from a
+    # monitored trunk without removing the sub-interface. A manual `scan` is
+    # explicit and ignores this.
+    exclude_vlans: str = Field(default="", alias="NETMON_EXCLUDE_VLANS")
 
     snmp_enabled: bool = Field(default=False, alias="NETMON_SNMP_ENABLED")
     snmp_config: Path = Field(default=Path("/etc/netmon/snmp.yaml"), alias="NETMON_SNMP_CONFIG")
@@ -179,6 +184,10 @@ class Settings(BaseSettings):
     @property
     def exclude_prefixes(self) -> tuple[str, ...]:
         return tuple(s.strip() for s in self.exclude_ifaces.split(",") if s.strip())
+
+    @property
+    def exclude_vlan_set(self) -> set[int]:
+        return {int(v.strip()) for v in self.exclude_vlans.split(",") if v.strip().isdigit()}
 
     @property
     def snmp_community_list(self) -> tuple[str, ...]:

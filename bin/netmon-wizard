@@ -43,6 +43,7 @@ cd "$REPO_DIR"
 . "$LIB_DIR/snmp.sh"
 . "$LIB_DIR/dashboard.sh"
 . "$LIB_DIR/advanced.sh"
+. "$LIB_DIR/trunk.sh"
 
 WIZARD_SENTINEL="${NETMON_VAR_DIR}/.wizard-done"
 
@@ -131,12 +132,13 @@ case "${1:-}" in
     advanced)      prompt_advanced_config ;;
     cadence)       prompt_scan_cadence ;;
     loglevel|log)  prompt_log_level ;;
+    trunk|vlan)    prompt_trunk_config ;;
     -h|--help|help)
         sed -n '2,15p' "$0" | sed 's/^# //; s/^#//'
         ;;
     *)
         echo "ERROR: unknown section: $1" >&2
-        echo "Try: identity | sftp | snmp | advanced | cadence | loglevel" >&2
+        echo "Try: identity | sftp | snmp | dashboard | advanced | cadence | loglevel | trunk" >&2
         exit 1
         ;;
 esac

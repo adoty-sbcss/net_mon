@@ -213,6 +213,21 @@ ip -br addr show wlan0
 
 That's it — no NetMon config needed. The new network shows up as a secondary monitored connection and gets scanned + bundled + uploaded on the same cadence as the wired uplink.
 
+### Monitoring many VLANs over one trunk port
+
+Plug the sensor into a switch **trunk** port (802.1Q) and monitor every VLAN on it from one box. NetMon adds a VLAN sub-interface per VLAN; the poller then scans each like any NIC and tags the data with its VLAN.
+
+```bash
+sudo netmon-wizard trunk      # or ./netmon trunk, or Configure ▶ → VLAN trunk setup
+```
+
+The wizard:
+- **detects** the VLANs present on the trunk (sniffs 802.1Q tags for a few seconds), proposes them, and lets you add/remove;
+- gives each VLAN an IP by **DHCP** (or a **static** you provide for VLANs without DHCP) — but with **no routes**, so a monitored VLAN can never hijack the box's real uplink;
+- writes a persistent netplan file (`/etc/netplan/60-netmon-vlans.yaml`) and applies it.
+
+The switch port must already be a trunk that allows those VLANs — the sensor can't reconfigure the switch. Each VLAN's scans are tagged with `vlan_id` + `parent_interface` in the bundle. Drop noisy VLANs from auto-scanning with `NETMON_EXCLUDE_VLANS=900,999` (a manual `./netmon scan eth0.900` still works). Confirm the sub-interfaces with `./netmon interfaces`.
+
 To disable hourly uploads without removing the SFTP creds, set `NETMON_SFTP_ENABLED=false` in `/etc/netmon/netmon.env` and `./netmon restart`.
 
 ---

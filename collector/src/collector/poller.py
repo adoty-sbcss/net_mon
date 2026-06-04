@@ -9,7 +9,7 @@ import structlog
 from .config import get_settings
 from .db import recent_network_scan
 from .discovery import interfaces as iface_mod
-from .scan import run_scan
+from .scan import _vlan_of, run_scan
 
 log = structlog.get_logger(__name__)
 
@@ -73,6 +73,12 @@ def tick() -> None:
 
     for st in states:
         if not st.has_usable_ip:
+            continue
+
+        # Skip VLANs the operator excluded (NETMON_EXCLUDE_VLANS) — e.g. noisy or
+        # irrelevant VLANs on a monitored trunk. A manual `scan` ignores this.
+        vlan_id, _ = _vlan_of(st.name)
+        if vlan_id is not None and vlan_id in settings.exclude_vlan_set:
             continue
 
         net_id = _network_id(st.gateway_mac, st.primary_cidr)
