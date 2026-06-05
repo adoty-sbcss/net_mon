@@ -128,6 +128,38 @@ cmd_status() {
             || echo "  (no identity set — run: sudo netmon-wizard identity)"
     fi
     echo ""
+    printf '%s== Control plane / enrollment ==%s\n' "$C_HEAD" "$C_OFF"
+    if [[ -f "$NETMON_ENV_FILE" ]]; then
+        local cp_url cp_key cp_tok
+        cp_url="$(sudo sed -nE 's/^NETMON_DASHBOARD_URL=//p' "$NETMON_ENV_FILE" 2>/dev/null | head -1 | tr -d '"')"
+        cp_key="$(sudo sed -nE 's/^NETMON_BOOTSTRAP_KEY=//p'  "$NETMON_ENV_FILE" 2>/dev/null | head -1 | tr -d '"')"
+        cp_tok="$(sudo sed -nE 's/^NETMON_ENROLL_TOKEN=//p'   "$NETMON_ENV_FILE" 2>/dev/null | head -1 | tr -d '"')"
+        if [[ -n "$cp_url" ]]; then
+            echo "  dashboard url: $cp_url"
+        else
+            echo "  dashboard url: ${C_WARN}(blank — collector falls back to baked default)${C_OFF}"
+        fi
+        if [[ -n "$cp_key" && -n "$cp_tok" ]]; then
+            echo "  credential:    bootstrap-key + enroll-token"
+        elif [[ -n "$cp_key" ]]; then
+            echo "  credential:    bootstrap-key (auto-enroll)"
+        elif [[ -n "$cp_tok" ]]; then
+            echo "  credential:    enroll-token (manual)"
+        else
+            echo "  credential:    ${C_WARN}none — box cannot enroll${C_OFF}"
+        fi
+        # enrolled = the box has been issued (and stored) a per-sensor token
+        local enrolled="(collector not running)"
+        if dc ps --status running 2>/dev/null | grep -q netmon-collector; then
+            if dc exec -T collector sh -c 'test -f /var/lib/netmon/enroll-token' 2>/dev/null; then
+                enrolled="yes"
+            else
+                enrolled="${C_WARN}no — not yet enrolled${C_OFF}"
+            fi
+        fi
+        printf "  enrolled:      %b\n" "$enrolled"
+    fi
+    echo ""
     cmd_interfaces
     echo ""
     printf '%s== Recent scans ==%s\n' "$C_HEAD" "$C_OFF"

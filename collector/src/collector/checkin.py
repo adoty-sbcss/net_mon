@@ -43,6 +43,13 @@ TOKEN_FILE = Path("/var/lib/netmon/enroll-token")
 EXIT_CONFIG_CHANGED = 10
 EXIT_UPDATE_REQUESTED = 11
 
+# Baked-in default dashboard URL (public hostname, not a secret). Used when
+# NETMON_DASHBOARD_URL is unset OR blank, so a box can never silently fail to
+# phone home just because provisioning left the URL empty. Only matters when a
+# credential (bootstrap key or enroll token) is also present — an SFTP-only box
+# with no key still no-ops at the "not enrolled" step.
+DEFAULT_DASHBOARD_URL = "https://netmon.sbcss.net"
+
 
 def _post(url: str, token: str | None, body: dict) -> dict | None:
     data = json.dumps(body).encode("utf-8")
@@ -337,9 +344,12 @@ def _maybe_scheduled_iperf(url: str, token: str | None, settings) -> None:
 
 def run_checkin() -> int:
     settings = get_settings()
-    url = (settings.dashboard_url or "").rstrip("/")
+    # Fall back to the baked-in default when the env var is unset OR blank, so a
+    # provisioning slip (empty NETMON_DASHBOARD_URL) can't silently disable
+    # check-in/enrollment the way it did on baker-agent.
+    url = (settings.dashboard_url or DEFAULT_DASHBOARD_URL).rstrip("/")
     if not url:
-        log.info("checkin skipped: NETMON_DASHBOARD_URL not set")
+        log.info("checkin skipped: no dashboard URL configured")
         return 0
 
     token = _current_token(settings)

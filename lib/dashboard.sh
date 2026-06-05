@@ -4,6 +4,13 @@
 [[ -n "${_NETMON_DASHBOARD_SH:-}" ]] && return 0
 _NETMON_DASHBOARD_SH=1
 
+# Baked-in default dashboard URL. A public hostname, NOT a secret — so a fresh
+# box defaults to the right control plane even when no config/provisioning.env
+# was placed (the gap that left "baker-agent" silently un-enrolled). The
+# bootstrap KEY stays out of the public repo; it still comes from provisioning
+# or is typed. Override anytime via NETMON_DASHBOARD_URL.
+DEFAULT_DASHBOARD_URL="https://netmon.sbcss.net"
+
 # _dashboard_provisioned — true if the dashboard control plane is fully set (URL +
 # bootstrap key, e.g. seeded from config/provisioning.env). Lets the first-boot
 # wizard SKIP the enrollment prompts entirely — the box auto-enrolls on its first
@@ -33,6 +40,7 @@ prompt_dashboard_config() {
     local url_default key_default
     url_default="$(current_value NETMON_DASHBOARD_URL)"
     [[ -z "$url_default" ]] && url_default="$(provisioning_default NETMON_DASHBOARD_URL)"
+    [[ -z "$url_default" ]] && url_default="$DEFAULT_DASHBOARD_URL"
     key_default="$(current_value NETMON_BOOTSTRAP_KEY)"
     [[ -z "$key_default" ]] && key_default="$(provisioning_default NETMON_BOOTSTRAP_KEY)"
 

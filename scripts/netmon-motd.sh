@@ -56,6 +56,20 @@ fi
 WIZARD_STATE="not run"
 [ -f /var/lib/netmon/.wizard-done ] && WIZARD_STATE="ok"
 
+# Enrollment / control plane: enrolled if the box holds a per-sensor token.
+# "NOT ENROLLED" (yellow) when a credential is configured but no token yet —
+# the silent-failure case we want loud. "off" = intentional SFTP-only box.
+ENROLL="off"
+if [ "$HEALTH" = "containers up" ]; then
+    if docker exec netmon-collector sh -c 'test -f /var/lib/netmon/enroll-token' 2>/dev/null; then
+        ENROLL="enrolled"
+    else
+        BKEY="$(sudo -n grep -E '^NETMON_BOOTSTRAP_KEY=' /etc/netmon/netmon.env 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/^"//; s/"$//')"
+        ETOK="$(sudo -n grep -E '^NETMON_ENROLL_TOKEN=' /etc/netmon/netmon.env 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/^"//; s/"$//')"
+        [ -n "$BKEY$ETOK" ] && ENROLL="$(printf '\033[1;33mNOT ENROLLED\033[0m')"
+    fi
+fi
+
 # Primary uplink (default-route interface) + how many interfaces are monitored.
 PRIMARY="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
 GW="$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')"
@@ -65,7 +79,7 @@ IFACE_COUNT="$(ip -o -4 addr show scope global 2>/dev/null | awk '{print $2}' \
 printf '\n'
 printf '\033[1;36m NetMon\033[0m  %s\n' "$VERSION"
 [ -n "$IDENTITY" ] && printf '         %s\n' "$IDENTITY"
-printf '         %s  •  wizard: %s  •  last upload: %s\n' "$HEALTH" "$WIZARD_STATE" "$LAST_UP"
+printf '         %s  •  wizard: %s  •  enroll: %s  •  last upload: %s\n' "$HEALTH" "$WIZARD_STATE" "$ENROLL" "$LAST_UP"
 if [ -n "$PRIMARY" ]; then
     printf '         uplink: %s via %s  •  %s interface(s) monitored\n' "$PRIMARY" "$GW" "$IFACE_COUNT"
 else

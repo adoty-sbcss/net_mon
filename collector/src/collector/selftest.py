@@ -38,6 +38,7 @@ def run_all() -> list[CheckResult]:
         _check_bundle_dir,
         _check_interfaces,
         _check_capabilities,
+        _check_control_plane,
     ]
     out: list[CheckResult] = []
     for fn in checks:
@@ -188,3 +189,33 @@ def _check_capabilities() -> CheckResult:
                            "raw sockets denied — collector container needs NET_RAW")
     except Exception as exc:
         return CheckResult("capabilities", False, f"socket test error: {exc}")
+
+
+def _check_control_plane() -> CheckResult:
+    """Catch the silent never-enrolls misconfiguration (the baker-agent bug).
+
+    The dashboard control plane needs BOTH a URL and a credential (shared
+    bootstrap key for auto-enroll, or a per-sensor enroll token). The failure
+    we're guarding against is a half-configured box: one set, the other blank.
+    A box with NEITHER is treated as an intentional SFTP-only deployment and
+    passes — so this never false-alarms a box that isn't meant to phone home.
+    """
+    settings = get_settings()
+    has_url = bool((settings.dashboard_url or "").strip())
+    has_cred = bool((settings.bootstrap_key or "").strip()
+                    or (settings.enroll_token or "").strip())
+
+    if has_url and has_cred:
+        return CheckResult("control_plane", True,
+                           "configured (dashboard URL + enrollment credential present)")
+    if not has_url and not has_cred:
+        return CheckResult("control_plane", True,
+                           "not configured — SFTP-only box (no dashboard URL or key)")
+    if has_cred and not has_url:
+        return CheckResult("control_plane", False,
+                           "enrollment key/token set but NETMON_DASHBOARD_URL is blank — "
+                           "box will NEVER enroll; set the dashboard URL "
+                           "(see config/provisioning.env)")
+    return CheckResult("control_plane", False,
+                       "NETMON_DASHBOARD_URL set but no bootstrap key / enroll token — "
+                       "box cannot enroll; add NETMON_BOOTSTRAP_KEY")
