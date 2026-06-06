@@ -113,6 +113,24 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_SNMP_EXCLUDE"] = str(data.get("snmp_exclude") or "")
     if data.get("rescan_interval"):
         mapping["NETMON_RESCAN_INTERVAL"] = str(int(data["rescan_interval"]))
+    # SNMP topology crawl (pushed from the dashboard so 'spine' / 'full' + tuning
+    # are flippable without SSH). scope is validated to the known set; the rest are
+    # ints. Mirrors the topology settings in config.py.
+    if "snmp_topology_enabled" in data:
+        mapping["NETMON_SNMP_TOPOLOGY_ENABLED"] = "true" if data.get("snmp_topology_enabled") else "false"
+    if "snmp_topology_scope" in data:
+        scope = str(data.get("snmp_topology_scope") or "full").lower()
+        mapping["NETMON_SNMP_TOPOLOGY_SCOPE"] = scope if scope in ("full", "spine") else "full"
+    if data.get("snmp_topology_max_depth"):
+        mapping["NETMON_SNMP_TOPOLOGY_MAX_DEPTH"] = str(int(data["snmp_topology_max_depth"]))
+    if data.get("snmp_topology_time_budget"):
+        mapping["NETMON_SNMP_TOPOLOGY_TIME_BUDGET"] = str(int(data["snmp_topology_time_budget"]))
+    if "snmp_topology_interval" in data and data.get("snmp_topology_interval") is not None:
+        mapping["NETMON_SNMP_TOPOLOGY_INTERVAL"] = str(int(data["snmp_topology_interval"]))
+    if data.get("snmp_topology_max_nodes"):
+        mapping["NETMON_SNMP_TOPOLOGY_MAX_NODES"] = str(int(data["snmp_topology_max_nodes"]))
+    if data.get("snmp_topology_fanout_cap"):
+        mapping["NETMON_SNMP_TOPOLOGY_FANOUT_CAP"] = str(int(data["snmp_topology_fanout_cap"]))
     # SFTP upload destination (pushed from the dashboard).
     if "sftp_enabled" in data:
         mapping["NETMON_SFTP_ENABLED"] = "true" if data.get("sftp_enabled") else "false"
@@ -381,6 +399,10 @@ def run_checkin() -> int:
                 "snmp_enabled": settings.snmp_enabled,
                 "snmp_communities": settings.snmp_communities,
                 "snmp_exclude": settings.snmp_exclude,
+                "snmp_topology_enabled": settings.snmp_topology_enabled,
+                "snmp_topology_scope": settings.snmp_topology_scope,
+                "snmp_topology_max_depth": settings.snmp_topology_max_depth,
+                "snmp_topology_interval": settings.snmp_topology_interval,
                 "sftp_enabled": settings.sftp_enabled,
                 "sftp_host": settings.sftp_host,
                 "sftp_port": settings.sftp_port,
