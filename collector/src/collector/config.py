@@ -75,6 +75,19 @@ class Settings(BaseSettings):
     # Set to 0 to crawl on every scan (the old behavior).
     snmp_topology_interval: int = Field(default=7 * 24 * 3600,
                                         alias="NETMON_SNMP_TOPOLOGY_INTERVAL")
+    # Crawl SCOPE. 'full' (default) = the historical omnidirectional walk. 'spine'
+    # = directional: from the local switch, follow only the uplink toward the
+    # internet (gateway-MAC FDB port -> STP root port -> toward-gateway), so the
+    # crawl stops climbing at the L3 edge instead of flooding sideways into every
+    # IDF. Sibling switches a sensor isn't on the path to are surfaced as
+    # uncovered by the dashboard coverage view rather than crawled. Validate on a
+    # sensor (NETMON_SNMP_TOPOLOGY_SCOPE=spine) before making it the fleet default.
+    snmp_topology_scope: str = Field(default="full", alias="NETMON_SNMP_TOPOLOGY_SCOPE")
+    # Safety backstops (apply to BOTH scopes): stop enqueuing once this many nodes
+    # are known, and never fan out into more than N neighbors from one device — so
+    # a 200-port core can't explode the crawl regardless of depth/time.
+    snmp_topology_max_nodes: int = Field(default=600, alias="NETMON_SNMP_TOPOLOGY_MAX_NODES")
+    snmp_topology_fanout_cap: int = Field(default=40, alias="NETMON_SNMP_TOPOLOGY_FANOUT_CAP")
 
     # --- Reverse DNS (PTR) enrichment ---
     # After discovery, look up PTR records for devices that still have no

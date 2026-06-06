@@ -113,6 +113,94 @@ CDP_CACHE_COLS = {
     "8":  "platform",        # cdpCachePlatform
     "9":  "cap_raw",         # cdpCacheCapabilities (4-byte bitmap)
 }
+# The CDP cache row index is (cdpCacheIfIndex, cdpCacheDeviceIndex) — so idx[0] is
+# the LOCAL ifIndex the neighbor sits on (used to match the uplink port in spine
+# mode). The LLDP remote index is (time_mark, local_port, rem_idx); on Cisco
+# lldpRemLocalPortNum == ifIndex, which we use best-effort for the same match.
+
+# BRIDGE-MIB — used only in spine mode to find the uplink port toward the gateway.
+DOT1D_TPFDB_PORT       = "1.3.6.1.2.1.17.4.3.1.2"   # dot1dTpFdbPort: MAC-octet suffix -> bridge port
+DOT1D_BASEPORT_IFINDEX = "1.3.6.1.2.1.17.1.4.1.2"   # dot1dBasePortIfIndex: bridgePort -> ifIndex
+DOT1D_STP_ROOT_PORT    = "1.3.6.1.2.1.17.2.7.0"     # dot1dStpRootPort: bridge port toward the STP root
+
+# Recursion gate (spine + full): which advertised capabilities mark a device we
+# should crawl THROUGH. Endpoints (phones/APs/hosts) are recorded but not recursed.
+_FORWARDER_CAPS = {"bridge", "router", "switch", "source-route-bridge", "two-port-mac-relay"}
+_ENDPOINT_CAPS = {"telephone", "station", "wlan-ap", "host", "docsis"}
+
+
+def _should_recurse(caps: list[str] | None) -> bool:
+    """Recurse THROUGH a neighbor only when it isn't clearly an endpoint. Unknown
+    or empty caps → recurse (conservative: never block a device that just doesn't
+    advertise caps); a forwarder cap → recurse; an endpoint-only cap → stop."""
+    if not caps:
+        return True
+    if any(c in _FORWARDER_CAPS for c in caps):
+        return True
+    if any(c in _ENDPOINT_CAPS for c in caps):
+        return False
+    return True
+
+
+def _gateway_mac_fdb_suffix(gateway_mac: str | None) -> str | None:
+    """'aa:bb:cc:dd:ee:ff' -> '170.187.204.221.238.255' (the decimal-octet OID
+    suffix dot1dTpFdbPort is keyed by). None if the MAC isn't 6 valid hex bytes."""
+    if not gateway_mac:
+        return None
+    parts = gateway_mac.replace("-", ":").split(":")
+    if len(parts) != 6:
+        return None
+    try:
+        return ".".join(str(int(p, 16)) for p in parts)
+    except ValueError:
+        return None
+
+
+def _resolve_uplink_ifindex(
+    ip: str, community: str, gateway_mac: str | None,
+) -> int | None:
+    """The local ifIndex pointing toward the internet for switch `ip`:
+    gateway-MAC FDB port → bridge port → ifIndex; STP root port as fallback.
+    Returns None when neither resolves (caller treats as 'ambiguous')."""
+    base_to_ifindex: dict[str, int] = {}
+
+    def _ifindex_for_bridge_port(bp: str) -> int | None:
+        if not base_to_ifindex:
+            for oid, val in _snmp_walk(ip, community, DOT1D_BASEPORT_IFINDEX):
+                suffix = oid.strip(".").split(".")[-1]
+                try:
+                    base_to_ifindex[suffix] = int(val)
+                except (ValueError, TypeError):
+                    continue
+        return base_to_ifindex.get(bp)
+
+    # 1) Gateway-MAC FDB → the bridge port the egress MAC is learned on.
+    suffix = _gateway_mac_fdb_suffix(gateway_mac)
+    if suffix:
+        for oid, val in _snmp_walk(ip, community, DOT1D_TPFDB_PORT):
+            if oid.strip(".").endswith("." + suffix):
+                try:
+                    bp = str(int(val))
+                except (ValueError, TypeError):
+                    break
+                if bp and bp != "0":
+                    idx = _ifindex_for_bridge_port(bp)
+                    if idx is not None:
+                        return idx
+                break
+
+    # 2) STP root port → the bridge port toward the spanning-tree root (the core).
+    root_bp = _snmp_get(ip, community, DOT1D_STP_ROOT_PORT)
+    if root_bp:
+        try:
+            bp = str(int(root_bp.strip()))
+        except (ValueError, TypeError):
+            bp = ""
+        if bp and bp != "0":
+            idx = _ifindex_for_bridge_port(bp)
+            if idx is not None:
+                return idx
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +215,20 @@ def crawl(
     max_depth: int = 5,
     time_budget_sec: int = 60,
     exclude_ips: set[str] | None = None,
+    scope: str = "full",
+    gateway_ip: str | None = None,
+    gateway_mac: str | None = None,
+    max_nodes: int = 600,
+    fanout_cap: int = 40,
 ) -> dict[str, Any]:
-    """Recursively SNMP-walk LLDP/CDP tables outward from `seed_ips`."""
+    """Recursively SNMP-walk LLDP/CDP tables outward from `seed_ips`.
+
+    scope='full' (default): omnidirectional walk. scope='spine': from each switch
+    follow only the uplink toward the internet (gateway-MAC FDB port → STP root →
+    toward-gateway); stop at the L3 edge (gateway). Both scopes capability-gate
+    recursion (don't crawl through phones/APs/hosts) and honor max_nodes / fanout_cap.
+    """
+    spine = scope == "spine"
     if not seed_ips or not communities:
         return {"nodes": [], "edges": [], "stats": {
             "visited_ips": 0, "elapsed_sec": 0.0, "budget_exhausted": False,
@@ -152,6 +252,17 @@ def crawl(
     visited_ips: set[str] = set()
     queue: list[tuple[str, int]] = [(ip, 0) for ip in seed_ips if ip not in exclude]
     budget_exhausted = False
+    # Spine/guard bookkeeping for the stats block + safety backstops.
+    stat_uplink_resolved = 0
+    stat_uplink_ambiguous = 0
+    stat_truncated = False
+
+    def _can_enqueue() -> bool:
+        nonlocal stat_truncated
+        if len(visited_ips) + len(queue) >= max_nodes:
+            stat_truncated = True
+            return False
+        return True
 
     while queue:
         if time.monotonic() >= deadline:
@@ -200,6 +311,39 @@ def crawl(
         if local_caps and not node.get("capabilities"):
             node["capabilities"] = local_caps
 
+        # Spine mode: which local port (ifIndex) leads toward the internet, and is
+        # THIS the L3 edge (the gateway) where we stop? An unresolved uplink falls
+        # back to a normal (capability-gated) crawl from this switch.
+        is_l3_edge = spine and gateway_ip is not None and ip == gateway_ip
+        uplink_ifindex: int | None = None
+        if spine and not is_l3_edge:
+            uplink_ifindex = _resolve_uplink_ifindex(ip, community, gateway_mac)
+            if uplink_ifindex is not None:
+                stat_uplink_resolved += 1
+            else:
+                stat_uplink_ambiguous += 1
+        fanout = 0  # neighbors enqueued from THIS device (fanout_cap backstop)
+
+        def _consider(mgmt_ip: str | None, caps: list[str] | None, local_ifindex: int | None) -> None:
+            nonlocal fanout, stat_truncated
+            if not mgmt_ip or mgmt_ip in visited_ips or mgmt_ip in exclude:
+                return
+            if is_l3_edge:
+                return  # at the gateway → don't recurse toward the WAN
+            if not _should_recurse(caps):
+                return  # endpoint (phone/AP/host) → record it, don't crawl through it
+            if spine and uplink_ifindex is not None and mgmt_ip != gateway_ip:
+                # Directional: only follow the port toward the internet.
+                if local_ifindex != uplink_ifindex:
+                    return
+            if fanout >= fanout_cap:
+                stat_truncated = True
+                return
+            if not _can_enqueue():
+                return
+            queue.append((mgmt_ip, depth + 1))
+            fanout += 1
+
         # --- LLDP remote table -------------------------------------------
         rem_rows = _snmp_walk(ip, community, LLDP_REM_TABLE)
         rem_by_idx = _parse_indexed_table(rem_rows, LLDP_REM_TABLE, LLDP_REM_COLS)
@@ -243,10 +387,17 @@ def crawl(
                 "discovered_via_ip": ip,
             })
 
-            # Recurse via management IPs (never into excluded devices).
+            # Recurse via management IPs — capability-gated + (in spine mode)
+            # only toward the uplink port. lldpRemLocalPortNum (idx[1]) == ifIndex
+            # on Cisco; best-effort elsewhere (ambiguous → full fallback).
+            local_ifindex = None
+            if len(idx) > 1:
+                try:
+                    local_ifindex = int(idx[1])
+                except (ValueError, TypeError):
+                    local_ifindex = None
             for mip in mgmt_ips:
-                if mip and mip not in visited_ips and mip not in exclude:
-                    queue.append((mip, depth + 1))
+                _consider(mip, rem_caps, local_ifindex)
 
         # --- CDP cache table (Cisco) -------------------------------------
         cdp_rows = _snmp_walk(ip, community, CDP_CACHE_TABLE)
@@ -284,21 +435,33 @@ def crawl(
                 "via":               "cdp",
                 "discovered_via_ip": ip,
             })
-            if mgmt_ip and mgmt_ip not in visited_ips and mgmt_ip not in exclude:
-                queue.append((mgmt_ip, depth + 1))
+            # CDP cache index is (cdpCacheIfIndex, deviceIndex) — idx[0] is the
+            # local ifIndex, a clean uplink-port match in spine mode.
+            cdp_ifindex = None
+            if idx:
+                try:
+                    cdp_ifindex = int(idx[0])
+                except (ValueError, TypeError):
+                    cdp_ifindex = None
+            _consider(mgmt_ip, cdp_caps, cdp_ifindex)
 
     elapsed = time.monotonic() - started
     log.info("topology crawl done",
-             nodes=len(nodes), edges=len(edges),
+             scope=scope, nodes=len(nodes), edges=len(edges),
              visited=len(visited_ips), elapsed_sec=round(elapsed, 1),
-             budget_exhausted=budget_exhausted)
+             budget_exhausted=budget_exhausted, truncated=stat_truncated,
+             uplink_resolved=stat_uplink_resolved, uplink_ambiguous=stat_uplink_ambiguous)
     return {
         "nodes": list(nodes.values()),
         "edges": edges,
         "stats": {
-            "visited_ips":      len(visited_ips),
-            "elapsed_sec":      round(elapsed, 2),
-            "budget_exhausted": budget_exhausted,
+            "scope":             scope,
+            "visited_ips":       len(visited_ips),
+            "elapsed_sec":       round(elapsed, 2),
+            "budget_exhausted":  budget_exhausted,
+            "truncated_by_budget": stat_truncated,
+            "uplink_resolved":   stat_uplink_resolved,
+            "uplink_ambiguous":  stat_uplink_ambiguous,
         },
     }
 

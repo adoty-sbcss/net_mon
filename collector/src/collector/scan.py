@@ -196,6 +196,11 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
                     max_depth=settings.snmp_topology_max_depth,
                     time_budget_sec=settings.snmp_topology_time_budget,
                     exclude_ips=set(settings.snmp_exclude_list),
+                    scope=settings.snmp_topology_scope,
+                    gateway_ip=state.gateway_ip,
+                    gateway_mac=state.gateway_mac,
+                    max_nodes=settings.snmp_topology_max_nodes,
+                    fanout_cap=settings.snmp_topology_fanout_cap,
                 )
                 ctx.raw_outputs["snmp_topology"] = topology
                 log.info("snmp topology",
