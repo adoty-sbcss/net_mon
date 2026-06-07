@@ -235,6 +235,22 @@ def cmd_checkin() -> None:
     sys.exit(checkin_mod.run_checkin())
 
 
+@cli.command("console-session", hidden=True)
+@click.option("--broker", required=True, help="Broker WSS base URL (…/console).")
+@click.option("--sid", required=True, help="Session id.")
+def cmd_console_session(broker: str, sid: str) -> None:
+    """Run a remote-console session (browser-SSH, sensor side).
+
+    Spawned as a DETACHED subprocess by the check-in `open-console` handler — not
+    meant to be run by hand. The one-time token is read from NETMON_CONSOLE_TOKEN
+    (kept off the process argv). Dials the broker over WSS and services allow-
+    listed read-only diagnostics until the session ends.
+    """
+    from . import remote_console
+
+    sys.exit(remote_console.run_from_env(broker, sid))
+
+
 @cli.command("config-list")
 def cmd_config_list() -> None:
     """List available config backups on the SFTP server for this box."""

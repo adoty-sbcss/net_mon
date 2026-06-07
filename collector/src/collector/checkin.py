@@ -242,6 +242,43 @@ def _run_diag(command: str) -> tuple[str, dict]:
         return "failed", {"command": command, "error": str(exc)}
 
 
+def _spawn_console_session(args: dict) -> tuple[str, dict]:
+    """Kick off a DETACHED remote-console session process.
+
+    This check-in runs one-shot via `docker compose exec`, so a thread would die
+    when we exit. Instead spawn `collector console-session` in its OWN session
+    (start_new_session) so it reparents to the container's PID 1 and outlives us.
+    It dials the broker on its own; we just report that it started. The one-time
+    token is passed via env, NOT argv, to keep it out of the process list.
+    """
+    import os
+    import subprocess
+    import sys
+
+    broker = str(args.get("broker") or "")
+    token = str(args.get("token") or "")
+    sid = str(args.get("sid") or "")
+    if not broker or not token or not sid:
+        return "failed", {"error": "missing broker/token/sid"}
+    try:
+        env = dict(os.environ)
+        env["NETMON_CONSOLE_TOKEN"] = token
+        subprocess.Popen(
+            [sys.executable, "-m", "collector", "console-session",
+             "--broker", broker, "--sid", sid],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        log.info("remote console: session spawned", sid=sid)
+        return "done", {"started": True, "sid": sid}
+    except Exception as exc:  # noqa: BLE001
+        return "failed", {"error": str(exc)}
+
+
 def _run_command(command: str) -> tuple[str, dict]:
     """Execute a queued command. Returns (status, result)."""
     try:
@@ -508,6 +545,8 @@ def run_checkin() -> int:
                 "note": "host will run auto-update after this check-in",
                 "fromVersion": __version__,
             }
+        elif name == "open-console":
+            status, result = _spawn_console_session(cmd.get("args") or {})
         else:
             status, result = _run_command(str(name))
         audit("dashboard_command_ran", id=cid, command=name, status=status)

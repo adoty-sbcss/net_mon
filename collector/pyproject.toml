@@ -16,6 +16,9 @@ dependencies = [
     "pyyaml>=6.0",
     "manuf>=1.1",
     "paramiko>=3.4",
+    # Synchronous WS client for the remote-console (browser-SSH) session: the
+    # sensor dials OUT to the tunnel broker over WSS and services diagnostics.
+    "websocket-client>=1.7",
 ]
 # Note: SNMP is handled by shelling out to the net-snmp CLI (snmpget /
 # snmpbulkwalk, installed via the `snmp` apt package in the Dockerfile),
