@@ -91,6 +91,14 @@ class Settings(BaseSettings):
     snmp_topology_max_nodes: int = Field(default=600, alias="NETMON_SNMP_TOPOLOGY_MAX_NODES")
     snmp_topology_fanout_cap: int = Field(default=40, alias="NETMON_SNMP_TOPOLOGY_FANOUT_CAP")
 
+    # Release channel (read by scripts/auto-update.sh; reported at check-in so the
+    # dashboard rollout view knows each box's channel). 'stable' (default) tracks
+    # the dashboard-pinned good SHA in update_ref (empty => origin/main, i.e. the
+    # historical behavior); 'canary' tracks origin/main (latest); 'hold' pauses
+    # auto-update. Pushed from the dashboard like the other knobs.
+    update_channel: str = Field(default="stable", alias="NETMON_UPDATE_CHANNEL")
+    update_ref: str = Field(default="", alias="NETMON_UPDATE_REF")
+
     # --- Reverse DNS (PTR) enrichment ---
     # After discovery, look up PTR records for devices that still have no
     # hostname, querying the LOCAL site resolver(s) (DHCP-assigned DNS + gateway)

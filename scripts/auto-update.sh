@@ -29,7 +29,20 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
 SHA_FILE="/var/lib/netmon/last-known-good-sha"
+CURRENT_SHA_FILE="/var/lib/netmon/current-sha"   # reported to the dashboard at check-in
+ENV_FILE="/etc/netmon/netmon.env"
 HEALTHCHECK_WAIT_SECONDS="${NETMON_HEALTHCHECK_WAIT:-120}"
+
+# Read a NETMON_* key from the env file (root-owned 0600). Empty if absent.
+read_env() {
+    sudo grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true
+}
+# Persist the live commit SHA so the dashboard can show exactly which release a
+# box is on (release-channel rollout view). Best-effort.
+record_current_sha() {
+    sudo install -d -m 755 /var/lib/netmon 2>/dev/null || true
+    git rev-parse HEAD 2>/dev/null | sudo tee "$CURRENT_SHA_FILE" >/dev/null 2>&1 || true
+}
 
 LOG_TAG="netmon-update"
 log() {
@@ -67,10 +80,42 @@ if ! git fetch --quiet origin main 2>/dev/null; then
 fi
 
 LOCAL=$(git rev-parse HEAD)
-REMOTE=$(git rev-parse origin/main)
+
+# 1b. Release channel: resolve the TARGET this box should converge to. Default
+# (unset/unknown channel) == 'stable' with no pin == track origin/main, i.e. the
+# historical behavior — so shipping this is a no-op until channels are set from
+# the dashboard. 'canary' tracks origin/main (latest); 'hold' pauses updates;
+# 'stable' with a pin (NETMON_UPDATE_REF) converges to that exact commit.
+UPDATE_CHANNEL="$(read_env NETMON_UPDATE_CHANNEL)"
+UPDATE_REF="$(read_env NETMON_UPDATE_REF)"
+case "$UPDATE_CHANNEL" in
+    hold)
+        log "update channel=hold; skipping auto-update"
+        record_current_sha
+        exit 0
+        ;;
+    canary)
+        REMOTE=$(git rev-parse origin/main)
+        log "update channel=canary -> origin/main ${REMOTE:0:8}"
+        ;;
+    stable|"")
+        if [[ -n "$UPDATE_REF" ]] && REMOTE=$(git rev-parse --verify "${UPDATE_REF}^{commit}" 2>/dev/null); then
+            log "update channel=stable; pinned ${UPDATE_REF} -> ${REMOTE:0:8}"
+        else
+            [[ -n "$UPDATE_REF" ]] && log "WARN: pinned ref '${UPDATE_REF}' not found after fetch; tracking origin/main"
+            REMOTE=$(git rev-parse origin/main)
+            log "update channel=stable -> origin/main ${REMOTE:0:8}"
+        fi
+        ;;
+    *)
+        REMOTE=$(git rev-parse origin/main)
+        log "WARN: unknown update channel '${UPDATE_CHANNEL}'; tracking origin/main"
+        ;;
+esac
 
 if [[ "$LOCAL" == "$REMOTE" ]]; then
     log "already up to date at ${LOCAL:0:8}"
+    record_current_sha
     # Even when we don't pull, record the current SHA as last-known-good
     # so manual rollback has a target.
     if [[ ! -f "$SHA_FILE" ]] || [[ "$(cat "$SHA_FILE")" != "$LOCAL" ]]; then
@@ -80,7 +125,7 @@ if [[ "$LOCAL" == "$REMOTE" ]]; then
     exit 0
 fi
 
-log "update available: ${LOCAL:0:8} -> ${REMOTE:0:8}"
+log "update available: ${LOCAL:0:8} -> ${REMOTE:0:8} (channel=${UPDATE_CHANNEL:-stable})"
 
 # 2. Inspect what changed.
 CHANGED=$(git diff --name-only "$LOCAL" "$REMOTE")
@@ -120,13 +165,17 @@ if docker image inspect netmon/collector:latest >/dev/null 2>&1; then
     log "  tagged current image as netmon/collector:previous"
 fi
 
-# 4. Pull.
-if ! git pull --ff-only --quiet origin main; then
-    log "FATAL: fast-forward pull failed; manual intervention needed"
+# 4. Move to the resolved target (channel-aware). reset --hard is safe here: the
+# dirty-tree guard at the top already refused to run with local changes, and
+# REMOTE is always a fetched commit (origin/main or a verified pin). This handles
+# pinned downgrades and canary-ahead alike, where a plain --ff-only could not.
+if ! git reset --hard --quiet "$REMOTE"; then
+    log "FATAL: git reset to ${REMOTE:0:8} failed; manual intervention needed"
     exit 2
 fi
 NEW_HEAD=$(git rev-parse HEAD)
-log "pulled to ${NEW_HEAD:0:8}"
+record_current_sha
+log "updated to ${NEW_HEAD:0:8}"
 
 # 4b. Run path migration with the freshly-pulled code.
 log "ensuring canonical paths (and migrating legacy layout if needed)"

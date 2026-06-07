@@ -131,6 +131,12 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_SNMP_TOPOLOGY_MAX_NODES"] = str(int(data["snmp_topology_max_nodes"]))
     if data.get("snmp_topology_fanout_cap"):
         mapping["NETMON_SNMP_TOPOLOGY_FANOUT_CAP"] = str(int(data["snmp_topology_fanout_cap"]))
+    # Release channel (consumed by scripts/auto-update.sh on the host).
+    if "update_channel" in data:
+        ch = str(data.get("update_channel") or "stable").lower()
+        mapping["NETMON_UPDATE_CHANNEL"] = ch if ch in ("stable", "canary", "hold") else "stable"
+    if "update_ref" in data:
+        mapping["NETMON_UPDATE_REF"] = str(data.get("update_ref") or "")
     # SFTP upload destination (pushed from the dashboard).
     if "sftp_enabled" in data:
         mapping["NETMON_SFTP_ENABLED"] = "true" if data.get("sftp_enabled") else "false"
@@ -360,6 +366,16 @@ def _maybe_scheduled_iperf(url: str, token: str | None, settings) -> None:
         log.warning("could not persist iperf last-run", error=str(exc))
 
 
+def _current_sha() -> str | None:
+    """The git commit the box is running, written by scripts/auto-update.sh to a
+    file the container can read (the repo itself lives on the host, not in here)."""
+    try:
+        sha = Path("/var/lib/netmon/current-sha").read_text().strip()
+        return sha or None
+    except Exception:
+        return None
+
+
 def run_checkin() -> int:
     settings = get_settings()
     # Fall back to the baked-in default when the env var is unset OR blank, so a
@@ -387,6 +403,9 @@ def run_checkin() -> int:
         {
             "agentVersion": __version__,
             "configVersion": applied,
+            # Release-channel telemetry for the dashboard rollout view.
+            "commitSha": _current_sha(),
+            "updateChannel": settings.update_channel,
             "localIp": local_ip,
             "interface": iface,
             "interfaceCidr": cidr,
