@@ -205,9 +205,48 @@ def _collect_logs(lines: int = 250) -> tuple[str, dict]:
     return "done", out
 
 
+# Restricted "remote console" diagnostics. Each maps a command id to a FIXED argv
+# (no shell, no operator-supplied input) so there is zero injection surface; output
+# is captured + size-bounded. READ-ONLY only — state-changing actions (restart, etc.)
+# are intentionally NOT here pending security-chat sign-off; they reuse the existing
+# queue handlers below. The dashboard presents this same id set as the allow-list.
+_DIAG_COMMANDS: dict[str, list[str]] = {
+    "diag-interfaces": ["ip", "-br", "addr"],
+    "diag-routes": ["ip", "route"],
+    "diag-arp": ["ip", "-br", "neigh"],
+    "diag-disk": ["df", "-h"],
+    "diag-uptime": ["uptime"],
+    "diag-dns": [
+        "sh", "-c",
+        "cat /etc/resolv.conf 2>/dev/null; echo '--- test lookup ---'; "
+        "dig +time=2 +tries=1 +short google.com 2>&1 | head",
+    ],
+    "diag-selftest": ["python", "-m", "collector", "selftest"],
+}
+
+
+def _run_diag(command: str) -> tuple[str, dict]:
+    """Run an allow-listed, fixed-argv read-only diagnostic; bounded output."""
+    import subprocess
+
+    argv = _DIAG_COMMANDS.get(command)
+    if argv is None:
+        return "failed", {"error": f"unknown diagnostic {command!r}"}
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=20, check=False)
+        out = ((p.stdout or "") + (p.stderr or "")).strip()
+        return "done", {"command": command, "exit": p.returncode, "output": out[-16000:]}
+    except subprocess.TimeoutExpired:
+        return "failed", {"command": command, "error": "timed out"}
+    except Exception as exc:  # noqa: BLE001
+        return "failed", {"command": command, "error": str(exc)}
+
+
 def _run_command(command: str) -> tuple[str, dict]:
     """Execute a queued command. Returns (status, result)."""
     try:
+        if command in _DIAG_COMMANDS:
+            return _run_diag(command)
         if command == "collect-logs":
             return _collect_logs()
         if command == "run-scan":
