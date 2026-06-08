@@ -48,7 +48,10 @@ EXIT_UPDATE_REQUESTED = 11
 # phone home just because provisioning left the URL empty. Only matters when a
 # credential (bootstrap key or enroll token) is also present — an SFTP-only box
 # with no key still no-ops at the "not enrolled" step.
-DEFAULT_DASHBOARD_URL = "https://netmon.sbcss.net"
+# No org URL is baked into the public repo. The dashboard URL is provided per
+# deployment via NETMON_DASHBOARD_URL (set by the dashboard-generated installer
+# or site provisioning); an unconfigured box just skips check-in (logged).
+DEFAULT_DASHBOARD_URL = ""
 
 
 def _post(url: str, token: str | None, body: dict) -> dict | None:

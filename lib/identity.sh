@@ -20,7 +20,7 @@ _NETMON_IDENTITY_SH=1
 #   _name_var:  env var holding the human-readable value (e.g. NETMON_DISTRICT)
 #   _slug_var:  env var holding the slug (e.g. NETMON_DISTRICT_SLUG)
 #   _label:     prompt label
-#   _example:   shown as a hint, e.g. "San Bernardino County USD"
+#   _example:   shown as a hint, e.g. "Example County USD"
 _prompt_one_identity() {
     local name_var="$1" slug_var="$2" label="$3" example="$4"
     local current_name current_slug new_name new_slug
@@ -64,9 +64,9 @@ prompt_identity_config() {
     echo ""
 
     _prompt_one_identity NETMON_DISTRICT NETMON_DISTRICT_SLUG \
-        "District name" "San Bernardino County USD"
+        "District name" "Example County USD"
     _prompt_one_identity NETMON_SCHOOL   NETMON_SCHOOL_SLUG \
-        "School / site name" "Big Bear Elementary"
+        "School / site name" "Lincoln Elementary"
     _prompt_one_identity NETMON_DEVICE   NETMON_DEVICE_SLUG \
         "Device / location label" "Library IDF"
 

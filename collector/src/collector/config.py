@@ -146,7 +146,7 @@ class Settings(BaseSettings):
     )
     # Comma-separated test names. Keep small; ~4 names × ~5 resolvers/scan.
     dns_test_names: str = Field(
-        default="google.com,microsoft.com,cloudflare.com,sbcss.k12.ca.us",
+        default="google.com,microsoft.com,cloudflare.com",
         alias="NETMON_DNS_TEST_NAMES",
     )
     # Per-query timeout (seconds). dig +time=N +tries=1.

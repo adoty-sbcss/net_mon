@@ -4,12 +4,12 @@
 [[ -n "${_NETMON_DASHBOARD_SH:-}" ]] && return 0
 _NETMON_DASHBOARD_SH=1
 
-# Baked-in default dashboard URL. A public hostname, NOT a secret — so a fresh
-# box defaults to the right control plane even when no config/provisioning.env
-# was placed (the gap that left "baker-agent" silently un-enrolled). The
-# bootstrap KEY stays out of the public repo; it still comes from provisioning
-# or is typed. Override anytime via NETMON_DASHBOARD_URL.
-DEFAULT_DASHBOARD_URL="https://netmon.sbcss.net"
+# No org URL is baked into the PUBLIC repo. The dashboard URL is supplied per
+# deployment: from site provisioning (config/provisioning.env or
+# /etc/netmon/provisioning.env — both git-ignored), from the dashboard-generated
+# installer (which always sets NETMON_DASHBOARD_URL), or typed at the first-boot
+# wizard. The bootstrap KEY likewise never lives in the repo.
+DEFAULT_DASHBOARD_URL="${NETMON_DASHBOARD_URL:-}"
 
 # _dashboard_provisioned — true if the dashboard control plane is fully set (URL +
 # bootstrap key, e.g. seeded from config/provisioning.env). Lets the first-boot
