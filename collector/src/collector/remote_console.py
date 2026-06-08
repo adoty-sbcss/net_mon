@@ -22,7 +22,7 @@ import time
 
 import structlog
 
-from .checkin import _DIAG_COMMANDS, _CONTROL_COMMANDS
+from .checkin import _CONTROL_COMMANDS, _DIAG_COMMANDS
 
 log = structlog.get_logger(__name__)
 
