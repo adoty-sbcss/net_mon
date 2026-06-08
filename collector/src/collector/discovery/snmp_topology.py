@@ -353,7 +353,18 @@ def crawl(
                 stat_uplink_ambiguous += 1
         fanout = 0  # neighbors enqueued from THIS device (fanout_cap backstop)
 
-        def _consider(mgmt_ip: str | None, caps: list[str] | None, local_ifindex: int | None) -> None:
+        def _consider(
+            mgmt_ip: str | None,
+            caps: list[str] | None,
+            local_ifindex: int | None,
+            *,
+            # Bind the per-iteration loop vars as defaults (B023): the closure is
+            # only ever called synchronously within this iteration, so capturing
+            # their current values here is correct and keeps ruff happy.
+            is_l3_edge: bool = is_l3_edge,
+            uplink_ifindex: int | None = uplink_ifindex,
+            depth: int = depth,
+        ) -> None:
             nonlocal fanout, stat_truncated
             if not mgmt_ip or mgmt_ip in visited_ips or mgmt_ip in exclude:
                 return
