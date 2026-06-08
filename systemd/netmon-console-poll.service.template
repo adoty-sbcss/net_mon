@@ -1,0 +1,14 @@
+[Unit]
+Description=NetMon fast console poll (interactive open-console pickup)
+Documentation=https://github.com/adoty-sbcss/net_mon
+After=network-online.target docker.service netmon-collector.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=${USER}
+Group=${USER}
+WorkingDirectory=${REPO_DIR}
+ExecStart=${REPO_DIR}/scripts/netmon-console-poll.sh
+TimeoutStartSec=60
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

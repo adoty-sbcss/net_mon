@@ -227,12 +227,25 @@ _DIAG_COMMANDS: dict[str, list[str]] = {
     "diag-selftest": ["python", "-m", "collector", "selftest"],
 }
 
+# State-changing "remote console" actions (CON-5). SAME safety model as
+# _DIAG_COMMANDS — FIXED argv, no shell, no operator input, re-validated by the
+# sensor, output captured + size-bounded — but these CHANGE state, so the
+# dashboard gates them behind an explicit confirm + audit. IN-CONTAINER scope
+# only: host-level actions (restart docker, reboot, renew the host DHCP lease)
+# are intentionally NOT here — they need the separate host-execution path and
+# security-chat sign-off (see registry CON-5 / CON-7). Add only fast, safe,
+# reversible, container-reachable actions here; vet the list with the security chat.
+_CONTROL_COMMANDS: dict[str, list[str]] = {
+    # Flush the neighbor/ARP cache so stale entries are re-learned on next scan.
+    "ctl-flush-arp": ["ip", "-s", "neigh", "flush", "all"],
+}
+
 
 def _run_diag(command: str) -> tuple[str, dict]:
-    """Run an allow-listed, fixed-argv read-only diagnostic; bounded output."""
+    """Run an allow-listed, fixed-argv diagnostic or control action; bounded output."""
     import subprocess
 
-    argv = _DIAG_COMMANDS.get(command)
+    argv = _DIAG_COMMANDS.get(command) or _CONTROL_COMMANDS.get(command)
     if argv is None:
         return "failed", {"error": f"unknown diagnostic {command!r}"}
     try:
@@ -453,6 +466,42 @@ def _current_sha() -> str | None:
         return sha or None
     except Exception:
         return None
+
+
+def run_console_poll() -> int:
+    """Lightweight interactive-command poll (faster-pickup for the live console).
+
+    Runs far more often than the full check-in (every ~30s) but does almost
+    nothing: it asks the dashboard only for a queued `open-console` command and,
+    if present, spawns the detached session process so a live console pairs in
+    seconds instead of after the next ~10-min check-in. No config apply, no
+    health report, no other command types. Best-effort and side-effect-free
+    otherwise; enrollment + everything else stays with run_checkin().
+    """
+    settings = get_settings()
+    url = (settings.dashboard_url or DEFAULT_DASHBOARD_URL).rstrip("/")
+    if not url:
+        return 0
+    token = _current_token(settings)
+    if not token:
+        return 0  # not enrolled yet — the full check-in owns enrollment
+    resp = _post(f"{url}/api/sensor/console-poll", token, {})
+    if resp is None:
+        return 0
+    applied = _read_applied_version()
+    for cmd in resp.get("commands") or []:
+        cid = cmd.get("id")
+        name = cmd.get("command")
+        if name != "open-console":
+            continue
+        status, result = _spawn_console_session(cmd.get("args") or {})
+        audit("console_poll_command_ran", id=cid, command=name, status=status)
+        _post(
+            f"{url}/api/sensor/result",
+            token,
+            {"commandId": cid, "status": status, "result": result, "configVersion": applied},
+        )
+    return 0
 
 
 def run_checkin() -> int:

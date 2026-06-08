@@ -235,6 +235,20 @@ def cmd_checkin() -> None:
     sys.exit(checkin_mod.run_checkin())
 
 
+@cli.command("console-poll")
+def cmd_console_poll() -> None:
+    """Fast interactive-command poll: pick up + start a live console quickly.
+
+    Runs every ~30s (netmon-console-poll.timer) — much lighter than `checkin`.
+    Only looks for an `open-console` command and spawns the session, so a live
+    console pairs in seconds instead of after the next ~10-min check-in.
+    Outbound HTTPS only. Always exits 0 (best-effort).
+    """
+    from . import checkin as checkin_mod
+
+    sys.exit(checkin_mod.run_console_poll())
+
+
 @cli.command("console-session", hidden=True)
 @click.option("--broker", required=True, help="Broker WSS base URL (…/console).")
 @click.option("--sid", required=True, help="Session id.")

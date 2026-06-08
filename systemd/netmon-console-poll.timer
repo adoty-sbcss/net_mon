@@ -1,0 +1,17 @@
+[Unit]
+Description=NetMon fast console poll (every ~30s — interactive pickup)
+Documentation=https://github.com/adoty-sbcss/net_mon
+
+[Timer]
+# Fires shortly after boot, then every 30s. This is the interactive-latency knob
+# for the live remote console: a queued open-console request is picked up within
+# this interval rather than waiting for the ~10-min check-in. Kept cheap — the
+# poll only looks for an open-console command and no-ops otherwise.
+OnBootSec=2min
+OnUnitActiveSec=30s
+RandomizedDelaySec=5
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

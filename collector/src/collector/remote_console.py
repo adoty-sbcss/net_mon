@@ -3,10 +3,12 @@
 When the dashboard queues an `open-console` command, the check-in handler spawns
 a DETACHED subprocess running this module (`python -m collector console-session`).
 It dials OUT to the zero-secret tunnel broker over WSS (443), authenticates with
-the one-time session token, then services allow-listed diagnostic commands the
-operator sends, streaming output back. Restricted-command posture: ONLY ids in
-`_DIAG_COMMANDS` run — this module is the source of truth and re-validates every
-id the broker forwards. Nothing here can change state on the box.
+the one-time session token, then services allow-listed commands the operator
+sends, streaming output back. Restricted-command posture: ONLY ids in
+`_DIAG_COMMANDS` (read-only) or `_CONTROL_COMMANDS` (state-changing, CON-5) run —
+this module is the source of truth and re-validates every id the broker forwards.
+Both registries are FIXED argv (no shell, no operator input); control actions are
+in-container scope only and the dashboard gates them behind a confirm + audit.
 
 The session is bounded three ways: the broker's idle + 15-min time-box, the
 dashboard kill-switch (broker drops us), and our own hard ceiling below.
@@ -20,13 +22,15 @@ import time
 
 import structlog
 
-from .checkin import _DIAG_COMMANDS
+from .checkin import _DIAG_COMMANDS, _CONTROL_COMMANDS
 
 log = structlog.get_logger(__name__)
 
-# Hard local ceiling, slightly above the broker/dashboard 15-min time-box so the
-# server side normally ends the session first; this is just a backstop.
-MAX_SESSION_SEC = 16 * 60
+# Hard local ceiling, slightly above the broker/dashboard ABSOLUTE max (60 min,
+# the most an extend can reach — CON-6) so the server side normally ends the
+# session first via a "closed" frame; this is just a backstop against a wedged
+# broker connection. The real (possibly extended) deadline is driven server-side.
+MAX_SESSION_SEC = 61 * 60
 # recv() wakes up this often to send a keepalive ping (broker idle timer is 2m).
 RECV_TIMEOUT_SEC = 30
 # Mirror the check-in diagnostic bounds.
@@ -44,8 +48,13 @@ def _send(ws, obj: dict) -> bool:
 
 
 def _run_diag_stream(ws, cmd_id: str) -> None:
-    """Run an allow-listed fixed-argv diagnostic, streaming begin/out/exit frames."""
-    argv = _DIAG_COMMANDS.get(cmd_id)
+    """Run an allow-listed fixed-argv command, streaming begin/out/exit frames.
+
+    Accepts read-only diagnostics (`_DIAG_COMMANDS`) and state-changing control
+    actions (`_CONTROL_COMMANDS`, CON-5); both are re-validated here against the
+    fixed-argv registries — the broker's allow-list is only defense in depth.
+    """
+    argv = _DIAG_COMMANDS.get(cmd_id) or _CONTROL_COMMANDS.get(cmd_id)
     if argv is None:
         _send(ws, {"type": "err", "id": cmd_id, "message": f"not permitted: {cmd_id}"})
         return
