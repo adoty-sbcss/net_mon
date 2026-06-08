@@ -123,6 +123,26 @@ DOT1D_TPFDB_PORT       = "1.3.6.1.2.1.17.4.3.1.2"   # dot1dTpFdbPort: MAC-octet 
 DOT1D_BASEPORT_IFINDEX = "1.3.6.1.2.1.17.1.4.1.2"   # dot1dBasePortIfIndex: bridgePort -> ifIndex
 DOT1D_STP_ROOT_PORT    = "1.3.6.1.2.1.17.2.7.0"     # dot1dStpRootPort: bridge port toward the STP root
 
+# CORE-2: per-interface health (MAP-4) + STP port roles (MAP-3). Collected once
+# per POLLED node and stored on the node's `interfaces` map (ifIndex -> health).
+DOT1D_STP_PORT_STATE = "1.3.6.1.2.1.17.2.15.1.3"    # dot1dStpPortState (per bridge port)
+IF_OPER_STATUS       = "1.3.6.1.2.1.2.2.1.8"        # ifOperStatus
+IF_IN_ERRORS         = "1.3.6.1.2.1.2.2.1.14"       # ifInErrors
+IF_OUT_ERRORS        = "1.3.6.1.2.1.2.2.1.20"       # ifOutErrors
+IF_NAME              = "1.3.6.1.2.1.31.1.1.1.1"     # ifName (ifXTable)
+IF_HIGH_SPEED        = "1.3.6.1.2.1.31.1.1.1.15"    # ifHighSpeed (Mbps)
+
+_STP_STATE = {
+    "1": "disabled", "2": "blocking", "3": "listening",
+    "4": "learning", "5": "forwarding", "6": "broken",
+}
+_IF_OPER = {
+    "1": "up", "2": "down", "3": "testing", "4": "unknown",
+    "5": "dormant", "6": "notPresent", "7": "lowerLayerDown",
+}
+# Cap interfaces recorded per switch so a big chassis can't bloat the bundle.
+_IFACE_CAP = 400
+
 # Recursion gate (spine + full): which advertised capabilities mark a device we
 # should crawl THROUGH. Endpoints (phones/APs/hosts) are recorded but not recursed.
 _FORWARDER_CAPS = {"bridge", "router", "switch", "source-route-bridge", "two-port-mac-relay"}
@@ -310,6 +330,15 @@ def crawl(
         # Fill caps if the node was first seen as an LLDP remote (no local poll).
         if local_caps and not node.get("capabilities"):
             node["capabilities"] = local_caps
+
+        # CORE-2: per-interface health + STP port roles for this polled switch
+        # (MAP-3/MAP-4). Best-effort — never fail the crawl over enrichment.
+        try:
+            iface_health = _collect_interface_health(ip, community)
+            if iface_health:
+                node["interfaces"] = iface_health
+        except Exception:  # noqa: BLE001
+            log.debug("interface health collect failed", ip=ip)
 
         # Spine mode: which local port (ifIndex) leads toward the internet, and is
         # THIS the L3 edge (the gateway) where we stop? An unresolved uplink falls
@@ -683,3 +712,66 @@ def _snmp_walk(ip: str, community: str, base_oid: str) -> list[tuple[str, str]]:
             continue
         rows.append((parts[0], parts[1]))
     return rows
+
+
+def _walk_col(ip: str, community: str, base_oid: str) -> dict[str, str]:
+    """Walk a single-column table; return {index_suffix: value}.
+
+    For tables indexed by a single integer (ifIndex, bridge port), the suffix
+    after the column base IS the index.
+    """
+    out: dict[str, str] = {}
+    prefix = base_oid.strip(".")
+    for oid, value in _snmp_walk(ip, community, base_oid):
+        bare = oid.strip(".")
+        if not bare.startswith(prefix + "."):
+            continue
+        out[bare[len(prefix) + 1:]] = value
+    return out
+
+
+def _as_int(v: str | None) -> int | None:
+    if v is None:
+        return None
+    v = v.strip()
+    return int(v) if v.isdigit() else None
+
+
+def _collect_interface_health(ip: str, community: str) -> dict[str, dict]:
+    """Per-interface health for a polled switch (MAP-4) + STP port role (MAP-3).
+
+    Keyed by ifIndex: {name, speed_mbps, oper_status, in_errors, out_errors,
+    stp_state?}. Returns {} when the box exposes no ifName (not a switch / no
+    SNMP view) so older boxes + endpoints stay empty. Bounded by _IFACE_CAP.
+    Utilization needs counter deltas across scans — a follow-up, not here.
+    """
+    names = _walk_col(ip, community, IF_NAME)
+    if not names:
+        return {}
+    speeds = _walk_col(ip, community, IF_HIGH_SPEED)
+    oper = _walk_col(ip, community, IF_OPER_STATUS)
+    in_err = _walk_col(ip, community, IF_IN_ERRORS)
+    out_err = _walk_col(ip, community, IF_OUT_ERRORS)
+
+    # STP state is keyed by bridge port; map bridge port -> ifIndex to align it.
+    stp_by_bp = _walk_col(ip, community, DOT1D_STP_PORT_STATE)
+    bp_ifindex = _walk_col(ip, community, DOT1D_BASEPORT_IFINDEX)
+    stp_by_ifindex: dict[str, str] = {}
+    for bp, state in stp_by_bp.items():
+        ifidx = bp_ifindex.get(bp)
+        if ifidx:
+            stp_by_ifindex[ifidx] = _STP_STATE.get(state.strip(), state.strip())
+
+    out: dict[str, dict] = {}
+    for ifidx, raw_name in list(names.items())[:_IFACE_CAP]:
+        rec: dict = {"name": _strip_quotes(raw_name) or raw_name}
+        rec["speed_mbps"] = _as_int(speeds.get(ifidx))
+        op = (oper.get(ifidx) or "").strip()
+        rec["oper_status"] = _IF_OPER.get(op, op or None)
+        rec["in_errors"] = _as_int(in_err.get(ifidx))
+        rec["out_errors"] = _as_int(out_err.get(ifidx))
+        stp = stp_by_ifindex.get(ifidx)
+        if stp:
+            rec["stp_state"] = stp
+        out[ifidx] = rec
+    return out

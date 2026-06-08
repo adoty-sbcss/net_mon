@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -362,8 +363,8 @@ def insert_topology(scan_run_id: int, nodes: list[dict[str, Any]], edges: list[d
                     """
                     INSERT INTO topology_nodes
                         (scan_run_id, chassis_id, system_name, system_description,
-                         mgmt_ips, discovered_via_ip, source, capabilities)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                         mgmt_ips, discovered_via_ip, source, capabilities, extra)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
                     """,
                     (
                         scan_run_id,
@@ -374,6 +375,9 @@ def insert_topology(scan_run_id: int, nodes: list[dict[str, Any]], edges: list[d
                         n.get("discovered_via_ip"),
                         n.get("source") or "snmp",
                         n.get("capabilities") or None,
+                        # CORE-2: per-interface health + STP port roles ride in `extra`
+                        # (existing jsonb column — no migration). Empty when none collected.
+                        json.dumps({"interfaces": n.get("interfaces") or {}}),
                     ),
                 )
             for e in edges:
