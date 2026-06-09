@@ -177,6 +177,11 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_SPEEDTEST_SCHEDULE_SEC"] = str(int(data["speedtest_schedule_sec"]))
     if "speedtest_ookla_server" in data:
         mapping["NETMON_SPEEDTEST_OOKLA_SERVER"] = str(data.get("speedtest_ookla_server") or "")
+    # Latency probes (PERF-4) pushed from the dashboard.
+    if "latency_enabled" in data:
+        mapping["NETMON_LATENCY_ENABLED"] = "true" if data.get("latency_enabled") else "false"
+    if "latency_targets" in data:
+        mapping["NETMON_LATENCY_TARGETS"] = str(data.get("latency_targets") or "1.1.1.1,8.8.8.8")
     if mapping:
         _update_env_file(ENV_FILE, mapping)
         log.info("applied desired config", keys=list(mapping))
@@ -554,6 +559,70 @@ def _maybe_scheduled_speedtest(url: str, token: str | None, settings) -> None:
         log.warning("could not persist speedtest last-run", error=str(exc))
 
 
+def _report_latency(url: str, token: str | None, results: list[dict], trigger: str) -> None:
+    """POST each latency probe result to the dashboard (best-effort)."""
+    from datetime import UTC, datetime
+
+    ts = datetime.now(UTC).isoformat()
+    for r in results:
+        _post(
+            f"{url}/api/sensor/latency-result",
+            token,
+            {
+                "trigger": trigger,
+                "label": r.get("label"),
+                "target": r.get("host"),
+                "latencyMs": r.get("latency_ms"),
+                "jitterMs": r.get("jitter_ms"),
+                "lossPct": r.get("loss_pct"),
+                "ok": r.get("ok", False),
+                "error": r.get("error"),
+                "startedAt": ts,
+            },
+        )
+
+
+def _dns_resolver() -> str | None:
+    """First nameserver from /etc/resolv.conf, for the latency 'dns' target."""
+    try:
+        for line in Path("/etc/resolv.conf").read_text().splitlines():
+            s = line.strip()
+            if s.startswith("nameserver"):
+                parts = s.split()
+                if len(parts) >= 2:
+                    return parts[1]
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _maybe_latency(url: str, token: str | None, settings) -> None:
+    """Probe latency/jitter/loss to internet + gateway + DNS each check-in (cheap)."""
+    if not settings.latency_enabled:
+        return
+    from . import latency as latency_mod
+
+    targets: list[tuple[str, str]] = []
+    for host in str(settings.latency_targets or "").split(","):
+        host = host.strip()
+        if host:
+            targets.append(("internet", host))
+    gw = latency_mod.default_gateway()
+    if gw:
+        targets.append(("gateway", gw))
+    dns = _dns_resolver()
+    if dns:
+        targets.append(("dns", dns))
+    if not targets:
+        return
+    try:
+        results = latency_mod.probe_latency(targets, count=10)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("latency probe failed", error=str(exc))
+        return
+    _report_latency(url, token, results, "scheduled")
+
+
 def _current_sha() -> str | None:
     """The git commit the box is running, written by scripts/auto-update.sh to a
     file the container can read (the repo itself lives on the host, not in here)."""
@@ -706,9 +775,10 @@ def run_checkin() -> int:
             {"commandId": cid, "status": status, "result": result, "configVersion": applied},
         )
 
-    # Scheduled iperf + public speedtests piggyback on the check-in cadence.
+    # Scheduled iperf + public speedtests + latency probes piggyback on check-in.
     _maybe_scheduled_iperf(url, token, settings)
     _maybe_scheduled_speedtest(url, token, settings)
+    _maybe_latency(url, token, settings)
 
     if update_requested:
         return EXIT_UPDATE_REQUESTED

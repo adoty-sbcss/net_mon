@@ -184,6 +184,11 @@ class Settings(BaseSettings):
     # Optional pinned Ookla server id (blank = auto-pick nearest).
     speedtest_ookla_server: str = Field(default="", alias="NETMON_SPEEDTEST_OOKLA_SERVER")
 
+    # Latency / jitter / loss probes (PERF-4). Cheap pings each check-in when on.
+    latency_enabled: bool = Field(default=False, alias="NETMON_LATENCY_ENABLED")
+    # CSV of internet targets to ping; gateway + DNS resolver are added automatically.
+    latency_targets: str = Field(default="1.1.1.1,8.8.8.8", alias="NETMON_LATENCY_TARGETS")
+
     # Box identity (set by the first-boot wizard; empty on pre-wizard installs).
     # Used to tag scan_runs rows and, in a future phase, to drive the
     # hierarchical SFTP path and bundle filenames.
