@@ -168,6 +168,15 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_IPERF_DIRECTION"] = str(data.get("iperf_direction") or "down")
     if "iperf_protocol" in data:
         mapping["NETMON_IPERF_PROTOCOL"] = str(data.get("iperf_protocol") or "tcp")
+    # Public speed tests (PERF-2) pushed from the dashboard.
+    if "speedtest_enabled" in data:
+        mapping["NETMON_SPEEDTEST_ENABLED"] = "true" if data.get("speedtest_enabled") else "false"
+    if "speedtest_providers" in data:
+        mapping["NETMON_SPEEDTEST_PROVIDERS"] = str(data.get("speedtest_providers") or "ookla")
+    if data.get("speedtest_schedule_sec"):
+        mapping["NETMON_SPEEDTEST_SCHEDULE_SEC"] = str(int(data["speedtest_schedule_sec"]))
+    if "speedtest_ookla_server" in data:
+        mapping["NETMON_SPEEDTEST_OOKLA_SERVER"] = str(data.get("speedtest_ookla_server") or "")
     if mapping:
         _update_env_file(ENV_FILE, mapping)
         log.info("applied desired config", keys=list(mapping))
@@ -458,6 +467,93 @@ def _maybe_scheduled_iperf(url: str, token: str | None, settings) -> None:
         log.warning("could not persist iperf last-run", error=str(exc))
 
 
+SPEEDTEST_LAST_FILE = Path("/var/lib/netmon/speedtest-last-run")
+
+
+def _report_speedtest(url: str, token: str | None, res: dict, trigger: str) -> None:
+    """POST a public-speedtest result to the dashboard (best-effort)."""
+    from datetime import UTC, datetime
+
+    _post(
+        f"{url}/api/sensor/speedtest-result",
+        token,
+        {
+            "trigger": trigger,
+            "provider": res.get("provider"),
+            "downloadMbps": res.get("download_mbps"),
+            "uploadMbps": res.get("upload_mbps"),
+            "latencyMs": res.get("latency_ms"),
+            "jitterMs": res.get("jitter_ms"),
+            "lossPct": res.get("loss_pct"),
+            "server": res.get("server"),
+            "isp": res.get("isp"),
+            "resultUrl": res.get("result_url"),
+            "externalIp": res.get("external_ip"),
+            "ok": res.get("ok", False),
+            "error": res.get("error"),
+            "raw": res.get("raw"),
+            "startedAt": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+def _providers_list(settings) -> list[str]:
+    raw = str(getattr(settings, "speedtest_providers", "") or "ookla")
+    valid = {"ookla", "cloudflare"}
+    out = [p.strip().lower() for p in raw.split(",") if p.strip().lower() in valid]
+    return out or ["ookla"]
+
+
+def _run_speedtest_command(url: str, token: str | None, args: dict, trigger: str) -> tuple[str, dict]:
+    """On-demand speedtest from the command queue; runs the requested provider(s),
+    reports each result, returns a short status summary."""
+    from .speedtest import run_speedtest
+
+    settings = get_settings()
+    provider = str(args.get("provider") or "").strip().lower()
+    providers = [provider] if provider in ("ookla", "cloudflare") else _providers_list(settings)
+    summary: dict = {}
+    any_ok = False
+    for p in providers:
+        res = run_speedtest(
+            p,
+            server_id=args.get("server_id") or settings.speedtest_ookla_server or None,
+        )
+        _report_speedtest(url, token, res, trigger)
+        any_ok = any_ok or bool(res.get("ok"))
+        summary[p] = (
+            {"download_mbps": res.get("download_mbps"), "upload_mbps": res.get("upload_mbps")}
+            if res.get("ok")
+            else {"error": res.get("error")}
+        )
+    return ("done" if any_ok else "failed"), summary
+
+
+def _maybe_scheduled_speedtest(url: str, token: str | None, settings) -> None:
+    """Run scheduled public speedtest(s) if enabled and the interval has elapsed."""
+    import time
+
+    if not settings.speedtest_enabled:
+        return
+    now = time.time()
+    try:
+        last = float(SPEEDTEST_LAST_FILE.read_text().strip())
+    except Exception:
+        last = 0.0
+    if now - last < max(900, settings.speedtest_schedule_sec):  # 15-min floor (bandwidth)
+        return
+    from .speedtest import run_speedtest
+
+    for p in _providers_list(settings):
+        res = run_speedtest(p, server_id=settings.speedtest_ookla_server or None)
+        _report_speedtest(url, token, res, "scheduled")
+    try:
+        SPEEDTEST_LAST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SPEEDTEST_LAST_FILE.write_text(str(now))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not persist speedtest last-run", error=str(exc))
+
+
 def _current_sha() -> str | None:
     """The git commit the box is running, written by scripts/auto-update.sh to a
     file the container can read (the repo itself lives on the host, not in here)."""
@@ -586,6 +682,8 @@ def run_checkin() -> int:
         log.info("running queued command", id=cid, command=name)
         if name == "iperf":
             status, result = _run_iperf_command(url, token, cmd.get("args") or {}, "manual")
+        elif name == "speedtest":
+            status, result = _run_speedtest_command(url, token, cmd.get("args") or {}, "manual")
         elif name in ("update", "self-update", "update-now"):
             # The agent runs INSIDE the container an update replaces, so it can't
             # rebuild itself. Acknowledge here; the host check-in wrapper runs the
@@ -608,8 +706,9 @@ def run_checkin() -> int:
             {"commandId": cid, "status": status, "result": result, "configVersion": applied},
         )
 
-    # Scheduled iperf piggybacks on the check-in cadence (runs if due).
+    # Scheduled iperf + public speedtests piggyback on the check-in cadence.
     _maybe_scheduled_iperf(url, token, settings)
+    _maybe_scheduled_speedtest(url, token, settings)
 
     if update_requested:
         return EXIT_UPDATE_REQUESTED

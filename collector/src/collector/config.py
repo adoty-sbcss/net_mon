@@ -175,6 +175,15 @@ class Settings(BaseSettings):
     iperf_direction: str = Field(default="down", alias="NETMON_IPERF_DIRECTION")
     iperf_protocol: str = Field(default="tcp", alias="NETMON_IPERF_PROTOCOL")
 
+    # Public internet speed tests (PERF-2). Pushed from the dashboard via desired_config.
+    speedtest_enabled: bool = Field(default=False, alias="NETMON_SPEEDTEST_ENABLED")
+    # CSV of providers to run each cycle: "ookla", "cloudflare", or "ookla,cloudflare".
+    speedtest_providers: str = Field(default="ookla", alias="NETMON_SPEEDTEST_PROVIDERS")
+    # Default 6h — speedtests consume real bandwidth, so less frequent than iperf.
+    speedtest_schedule_sec: int = Field(default=6 * 3600, alias="NETMON_SPEEDTEST_SCHEDULE_SEC")
+    # Optional pinned Ookla server id (blank = auto-pick nearest).
+    speedtest_ookla_server: str = Field(default="", alias="NETMON_SPEEDTEST_OOKLA_SERVER")
+
     # Box identity (set by the first-boot wizard; empty on pre-wizard installs).
     # Used to tag scan_runs rows and, in a future phase, to drive the
     # hierarchical SFTP path and bundle filenames.

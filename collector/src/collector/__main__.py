@@ -235,6 +235,39 @@ def cmd_checkin() -> None:
     sys.exit(checkin_mod.run_checkin())
 
 
+@cli.command("speedtest")
+@click.option(
+    "--provider",
+    type=click.Choice(["ookla", "cloudflare", "both"]),
+    default="both",
+    help="Which public speed test to run.",
+)
+def cmd_speedtest(provider: str) -> None:
+    """Run a public internet speed test (Ookla and/or Cloudflare) and print results.
+
+    Manual/diagnostic use; scheduled runs are driven by the check-in loop
+    (NETMON_SPEEDTEST_*). Does NOT report to the dashboard — use the dashboard's
+    'Run now' for that.
+    """
+    from .speedtest import run_speedtest
+
+    provs = ["ookla", "cloudflare"] if provider == "both" else [provider]
+    failed = 0
+    for p in provs:
+        res = run_speedtest(p)
+        if res.get("ok"):
+            click.echo(
+                f"OK   {p}: down={res.get('download_mbps')} Mbps  up={res.get('upload_mbps')} Mbps  "
+                f"latency={res.get('latency_ms')} ms  jitter={res.get('jitter_ms')} ms"
+                + (f"  server={res.get('server')}" if res.get("server") else "")
+                + (f"  url={res.get('result_url')}" if res.get("result_url") else "")
+            )
+        else:
+            failed += 1
+            click.echo(f"FAIL {p}: {res.get('error')}", err=True)
+    sys.exit(1 if failed == len(provs) else 0)
+
+
 @cli.command("console-poll")
 def cmd_console_poll() -> None:
     """Fast interactive-command poll: pick up + start a live console quickly.

@@ -28,6 +28,16 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         procps \
     && rm -rf /var/lib/apt/lists/*
 
+# Ookla speedtest CLI (PERF-2: public internet speed tests). Non-fatal: if the
+# repo/install fails (offline build, URL change), run_ookla() degrades gracefully
+# and the dependency-free Cloudflare probe still works.
+RUN (curl -fsSL --retry 3 --max-time 60 \
+            https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | bash \
+        && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends speedtest \
+        && rm -rf /var/lib/apt/lists/* \
+        && echo "Ookla speedtest installed: $(speedtest --version 2>/dev/null | head -1)") \
+    || echo "WARN: Ookla speedtest install failed; 'ookla' provider unavailable (cloudflare still works)"
+
 # Refresh the OUI (MAC vendor) table at build time. The `manuf` PyPI package
 # bundles a years-old table that leaves ~a third of real OUIs unresolved; this
 # bakes a current Wireshark manuf file into the image so vendor classification
