@@ -66,6 +66,29 @@ ensure_paths_if_available() {
     fi
 }
 
+# REL-2: a repo cloned/owned by a different user than the one running this script
+# (the classic "cloned as root, but netmon-update.service runs as the service
+# user" case) makes EVERY git command fail with "fatal: detected dubious
+# ownership". That used to surface as the misleading "git fetch failed (network
+# down?)" and silently froze the box dozens of commits behind. Detect it up front
+# and self-heal: chown the repo back to us (preferred), else trust it via
+# safe.directory so at least reads work and log a loud, actionable warning.
+ensure_repo_ownership() {
+    local repo_uid me_uid me grp owner
+    repo_uid="$(stat -c %u "$REPO_DIR/.git" 2>/dev/null || stat -c %u "$REPO_DIR" 2>/dev/null || echo -1)"
+    me_uid="$(id -u)"
+    [[ "$repo_uid" == "$me_uid" ]] && return 0
+    me="$(id -un)"; grp="$(id -gn)"; owner="$(stat -c %U "$REPO_DIR" 2>/dev/null || echo '?')"
+    log "repo $REPO_DIR is owned by '$owner' (uid $repo_uid) but auto-update runs as '$me' (uid $me_uid) — git would refuse with 'dubious ownership'. Self-healing."
+    if sudo -n chown -R "$me:$grp" "$REPO_DIR" 2>/dev/null; then
+        log "self-healed: chowned $REPO_DIR to $me:$grp (root-clone bug; see lesson_autoupdate_root_clone)"
+    else
+        git config --global --add safe.directory "$REPO_DIR" 2>/dev/null || true
+        log "WARN: could not chown $REPO_DIR (no passwordless sudo). Added git safe.directory so fetch/status work, but 'git pull' may still fail on write until an admin runs:  sudo chown -R $me:$grp $REPO_DIR"
+    fi
+}
+ensure_repo_ownership
+
 # Refuse to run on a dirty working tree — we'd lose local changes.
 if [[ -n "$(git status --porcelain)" ]]; then
     log "FATAL: working tree has uncommitted changes; refusing to auto-update"
@@ -73,9 +96,14 @@ if [[ -n "$(git status --porcelain)" ]]; then
     exit 2
 fi
 
-# 1. Fetch latest refs.
-if ! git fetch --quiet origin main 2>/dev/null; then
-    log "git fetch failed (network down?); will retry next run"
+# 1. Fetch latest refs. Distinguish a genuine network failure from a lingering
+# ownership problem (REL-2) so the journal says something actionable.
+if ! fetch_err="$(git fetch --quiet origin main 2>&1)"; then
+    if printf '%s' "$fetch_err" | grep -qi "dubious ownership"; then
+        log "git fetch failed: dubious repo ownership persists after self-heal. Run:  sudo chown -R $(id -un):$(id -gn) $REPO_DIR"
+    else
+        log "git fetch failed (network down?); will retry next run"
+    fi
     exit 1
 fi
 
