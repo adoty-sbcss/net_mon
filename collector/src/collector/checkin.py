@@ -14,6 +14,13 @@ Exit codes the host wrapper (netmon-checkin.sh) acts on:
        (it runs inside the container being replaced), so the host runs the code
        update afterwards. 11 also implies the config-recreate of 10, so a config
        push + update in the same cycle both take effect.
+  12 — a HOST-LEVEL maintenance action was queued (restart / rebuild / reboot /
+       rollback). The agent can't perform these from inside the container, so it
+       records the request to /var/lib/netmon/host-action-request (a shared
+       host<->container bind mount) and the host wrapper drains + executes it via
+       scripts/host-action.sh after this check-in. 12 also implies the
+       config-recreate of 10. These are state-changing + privileged; the
+       dashboard gates each behind explicit confirm + approval + audit.
 The watchdog/auto-update machinery auto-rolls-back a bad restart or update.
 HTTP uses the stdlib only — no new dependency.
 """
@@ -40,8 +47,13 @@ log = structlog.get_logger(__name__)
 ENV_FILE = Path("/etc/netmon/netmon.env")
 APPLIED_VERSION_FILE = Path("/var/lib/netmon/applied-config-version")
 TOKEN_FILE = Path("/var/lib/netmon/enroll-token")
+# Drained + executed on the HOST by netmon-checkin.sh -> scripts/host-action.sh.
+# /var/lib/netmon is a shared host<->container bind mount, so this file is our
+# one-way IPC for actions the in-container agent can't perform itself.
+HOST_ACTION_FILE = Path("/var/lib/netmon/host-action-request")
 EXIT_CONFIG_CHANGED = 10
 EXIT_UPDATE_REQUESTED = 11
+EXIT_HOST_ACTION = 12
 
 # Baked-in default dashboard URL (public hostname, not a secret). Used when
 # NETMON_DASHBOARD_URL is unset OR blank, so a box can never silently fail to
@@ -238,7 +250,33 @@ _DIAG_COMMANDS: dict[str, list[str]] = {
         "cat /etc/resolv.conf 2>/dev/null; echo '--- test lookup ---'; "
         "dig +time=2 +tries=1 +short google.com 2>&1 | head",
     ],
+    # Reachability to the internet (fixed targets — no operator input, so no
+    # injection surface). Mirrors the sensor menu's "Ping" diagnostic.
+    "diag-ping": [
+        "sh", "-c",
+        "ping -c 4 -W 2 1.1.1.1 2>&1 | tail -n 6; echo '---'; "
+        "ping -c 4 -W 2 8.8.8.8 2>&1 | tail -n 6",
+    ],
+    # "Test SFTP" — connect/auth/list the remote path. Read-only (uploads nothing)
+    # and, crucially, surfaces whether uploads are actually ENABLED, since a plain
+    # connection test passes even when NETMON_SFTP_ENABLED=false (the footgun).
+    "diag-sftp-test": ["python", "-m", "collector", "upload-test"],
     "diag-selftest": ["python", "-m", "collector", "selftest"],
+}
+
+# HOST-LEVEL maintenance actions (restart / rebuild / reboot / rollback). Unlike
+# the diagnostics/controls above, these CANNOT run from inside the container — the
+# agent is a process in the very container some of them replace. So instead of
+# executing them, the agent records the request to HOST_ACTION_FILE and returns
+# EXIT_HOST_ACTION; the host wrapper (netmon-checkin.sh) drains the file and runs
+# scripts/host-action.sh, which holds the authoritative host-side allow-list. The
+# dashboard gates each behind explicit confirm + approval + audit. Keep this set
+# tight and mirrored with scripts/host-action.sh; vet additions with security.
+_HOST_ACTIONS: set[str] = {
+    "host-restart",   # docker compose restart (lightweight; no rebuild)
+    "host-rebuild",   # rebuild collector image + recreate (keeps DB/config/logs)
+    "host-reboot",    # systemctl reboot the box
+    "host-rollback",  # scripts/rollback.sh -> last-known-good SHA + image + DB
 }
 
 # State-changing "remote console" actions (CON-5). SAME safety model as
@@ -307,6 +345,30 @@ def _spawn_console_session(args: dict) -> tuple[str, dict]:
         return "done", {"started": True, "sid": sid}
     except Exception as exc:  # noqa: BLE001
         return "failed", {"error": str(exc)}
+
+
+def _request_host_action(action: str, command_id) -> tuple[str, dict]:
+    """Record a host-level action for the host wrapper to execute after check-in.
+
+    The agent can't restart/rebuild/reboot/rollback from inside the container, so
+    we append the (command_id, action) to HOST_ACTION_FILE — a shared bind mount
+    netmon-checkin.sh drains on EXIT_HOST_ACTION. Like the `update` path, the
+    outcome is observed on the NEXT check-in (uptime reset, recreated container,
+    rolled-back agentVersion), so we report 'scheduled' here, not 'done'.
+    """
+    if action not in _HOST_ACTIONS:
+        return "failed", {"error": f"unknown host action {action!r}"}
+    try:
+        HOST_ACTION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with HOST_ACTION_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(f"{command_id}\t{action}\n")
+        log.info("host action queued for host wrapper", action=action, id=command_id)
+        return "scheduled", {
+            "note": f"host will run '{action}' after this check-in",
+            "action": action,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return "failed", {"error": f"could not record host action: {exc}"}
 
 
 def _run_command(command: str) -> tuple[str, dict]:
@@ -745,6 +807,7 @@ def run_checkin() -> int:
                 audit("dashboard_config_apply_failed", version=version, error=str(exc))
 
     update_requested = False
+    host_action_requested = False
     for cmd in resp.get("commands") or []:
         cid = cmd.get("id")
         name = cmd.get("command")
@@ -753,6 +816,10 @@ def run_checkin() -> int:
             status, result = _run_iperf_command(url, token, cmd.get("args") or {}, "manual")
         elif name == "speedtest":
             status, result = _run_speedtest_command(url, token, cmd.get("args") or {}, "manual")
+        elif name in _HOST_ACTIONS:
+            status, result = _request_host_action(str(name), cid)
+            if status == "scheduled":
+                host_action_requested = True
         elif name in ("update", "self-update", "update-now"):
             # The agent runs INSIDE the container an update replaces, so it can't
             # rebuild itself. Acknowledge here; the host check-in wrapper runs the
@@ -780,6 +847,11 @@ def run_checkin() -> int:
     _maybe_scheduled_speedtest(url, token, settings)
     _maybe_latency(url, token, settings)
 
+    # Exit precedence: update (11) already recreates + may host-reboot via the
+    # update path, so it wins; then host actions (12); then a plain config
+    # recreate (10). Each higher code implies the recreate of 10.
     if update_requested:
         return EXIT_UPDATE_REQUESTED
+    if host_action_requested:
+        return EXIT_HOST_ACTION
     return EXIT_CONFIG_CHANGED if config_changed else 0

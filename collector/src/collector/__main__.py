@@ -129,9 +129,26 @@ def cmd_bundle(scan_id: int, output: str | None) -> None:
 
 @cli.command("upload-test")
 def cmd_upload_test() -> None:
-    """Test the SFTP connection: connect, authenticate, list the remote path."""
+    """Test the SFTP connection: connect, authenticate, list the remote path.
+
+    NOTE: this only proves the *credentials* work — it deliberately bypasses the
+    NETMON_SFTP_ENABLED gate. A box can pass this test yet never actually upload
+    because uploads are disabled. We surface that here so a green test isn't
+    mistaken for "uploads are working".
+    """
     ok, msg = uploader_mod.test_connection()
     click.echo(("OK   " if ok else "FAIL ") + msg)
+    if ok:
+        settings = get_settings()
+        if settings.sftp_enabled:
+            click.echo("uploads:       ENABLED (NETMON_SFTP_ENABLED=true) — bundles will ship")
+        else:
+            click.echo("uploads:       DISABLED (NETMON_SFTP_ENABLED=false)")
+            click.echo("  ⚠ Credentials work but real uploads are OFF, so NO data reaches the")
+            click.echo("    dashboard. Enable from the dashboard (sensor SFTP settings -> save")
+            click.echo("    with 'Enable' checked) or on the box:")
+            click.echo("      sudo sed -i 's/^NETMON_SFTP_ENABLED=.*/NETMON_SFTP_ENABLED=true/' /etc/netmon/netmon.env")
+            click.echo("      docker compose up -d --force-recreate collector")
     sys.exit(0 if ok else 2)
 
 

@@ -76,6 +76,24 @@ elif [ "$rc" = "11" ]; then
             | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done || true
     fi
     exit 0
+elif [ "$rc" = "12" ]; then
+    # Dashboard queued a HOST-LEVEL action (restart/rebuild/reboot/rollback) the
+    # in-container agent recorded to /var/lib/netmon/host-action-request. 12
+    # implies the config-recreate of 10, so apply any pushed config first, then
+    # hand the action(s) to scripts/host-action.sh (the host-side allow-list).
+    log "host action requested; recreating collector, then draining host-action queue"
+    if "${DC[@]}" up -d --force-recreate collector >/dev/null 2>&1; then
+        log "collector recreated (any pushed config applied)"
+    else
+        log "collector recreate FAILED"
+    fi
+    if [ -x "$REPO_DIR/scripts/host-action.sh" ]; then
+        "$REPO_DIR/scripts/host-action.sh" --drain 2>&1 \
+            | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done || true
+    else
+        log "scripts/host-action.sh missing; cannot run host action"
+    fi
+    exit 0
 elif [ "$rc" = "0" ]; then
     log "check-in ok"
     exit 0

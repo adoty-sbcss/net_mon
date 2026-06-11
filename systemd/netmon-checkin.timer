@@ -1,12 +1,14 @@
 [Unit]
-Description=NetMon dashboard check-in (every ~10 minutes)
+Description=NetMon dashboard check-in (every ~3 minutes)
 Documentation=https://github.com/adoty-sbcss/net_mon
 
 [Timer]
-# First run shortly after boot, then every 10 minutes. Latency for management
-# actions = this interval; fine for config/commands (not interactive control).
-OnBootSec=3min
-OnUnitActiveSec=10min
+# First run shortly after boot, then every 3 minutes. Latency for management
+# actions (config/command pickup) = this interval. Interactive remote-console
+# pairing uses the separate netmon-console-poll.timer (~30s), so this cadence is
+# only the device check-in / desired-config / command-queue poll.
+OnBootSec=2min
+OnUnitActiveSec=3min
 RandomizedDelaySec=60
 AccuracySec=30s
 Persistent=true
