@@ -84,7 +84,11 @@ echo ""
 log "Building the collector image (first build takes a few minutes)..."
 dc build
 log "Starting containers..."
-dc up -d
+# --force-recreate so a RE-RUN after a config change actually reloads the env
+# file. docker compose only injects netmon.env at container-create time, so a
+# plain `up -d` on an existing container keeps the old env (this is how a box
+# can end up with valid SFTP creds but uploads still disabled).
+dc up -d --force-recreate
 log "Waiting for the collector to come up..."
 for _ in $(seq 1 15); do
     if dc exec -T collector python -m collector --version >/dev/null 2>&1; then
