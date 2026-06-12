@@ -67,14 +67,19 @@ fi
 log "stopping containers..."
 "${DC[@]}" down >/dev/null 2>&1 || true
 
-# --- 3. Restore docker image from :previous tag, if it exists -----------
-
-if docker image inspect netmon/collector:previous >/dev/null 2>&1; then
-    log "retagging netmon/collector:previous -> :latest"
-    docker tag netmon/collector:previous netmon/collector:latest
+# --- 3. Select the rolled-back image (REL-3) -----------------------------
+# CI publishes an immutable :<sha> image for every main commit, and compose
+# reads the tag from the repo-root .env. Point it at the rollback target's SHA;
+# step 6 pulls it (usually a cache hit, so offline-safe) or falls back to a local
+# build. If TARGET_SHA predates REL-3, its compose uses the old build path and
+# the pull simply falls through to a build — still correct.
+ENV_DOTFILE="$REPO_DIR/.env"
+if [[ -f "$ENV_DOTFILE" ]] && grep -q '^NETMON_IMAGE_TAG=' "$ENV_DOTFILE"; then
+    sed -i "s|^NETMON_IMAGE_TAG=.*|NETMON_IMAGE_TAG=${TARGET_SHA}|" "$ENV_DOTFILE"
 else
-    log "WARN: no :previous image tag found; container will rebuild from rolled-back source"
+    echo "NETMON_IMAGE_TAG=${TARGET_SHA}" >> "$ENV_DOTFILE"
 fi
+log "rollback image tag set to :${TARGET_SHA:0:8}"
 
 # --- 4. Git rollback ----------------------------------------------------
 
@@ -112,7 +117,13 @@ else
     log "no snapshot at $LATEST_SNAP — DB will continue with current state"
 fi
 
-# --- 6. Bring everything back up ----------------------------------------
+# --- 6. Pull the rolled-back image (or rebuild), then bring everything up -
+
+log "pulling rolled-back collector image :${TARGET_SHA:0:8} (or building if unreachable)..."
+if ! "${DC[@]}" pull collector >/dev/null 2>&1; then
+    log "  pull failed (registry unreachable / tag missing); building locally"
+    "${DC[@]}" build --pull collector >/dev/null 2>&1 || log "  WARN: local build also failed"
+fi
 
 log "starting all containers..."
 "${DC[@]}" up -d >/dev/null

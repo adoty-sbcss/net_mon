@@ -1,3 +1,7 @@
+# REL-3 cutover marker: touching this file makes the last build-based auto-update
+# rebuild locally and tag the image as the new GHCR ref, so every box switches to
+# the prebuilt-image (pull) model cleanly even without reaching ghcr.io. After
+# this, boxes pull the CI-published image (auto-update.sh), build-fallback only.
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \

@@ -96,8 +96,13 @@ fi
 # --- 5. Build, start, optional SFTP test ---------------------------------
 
 echo ""
-log "Building containers (first build takes a few minutes)..."
-dc build
+# REL-3: pull the prebuilt image; build locally only if the registry is
+# unreachable (the build is reliable again now that Ookla was removed).
+log "Fetching the collector image..."
+if ! dc pull collector; then
+    log "Image pull failed (registry unreachable?); building locally (a few minutes)..."
+    dc build
+fi
 
 log "Starting containers..."
 dc up -d

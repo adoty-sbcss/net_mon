@@ -28,8 +28,13 @@ services:
       retries: 10
 
   collector:
+    # REL-3: pull a prebuilt image from GHCR (published by CI), selected by
+    # NETMON_IMAGE_TAG (auto-update writes it to .env: stable | canary | <sha>).
+    # `build:` is KEPT as a fallback — if a box can't reach ghcr.io (egress
+    # filtering), auto-update.sh builds locally instead (reliable again now that
+    # the Ookla install was removed from the Dockerfile). Default tag = stable.
+    image: ghcr.io/adoty-sbcss/netmon-collector:${NETMON_IMAGE_TAG:-stable}
     build: ./collector
-    image: netmon/collector:latest
     container_name: netmon-collector
     restart: unless-stopped
     # Host networking so we can see real interfaces, LLDP frames, broadcast traffic.

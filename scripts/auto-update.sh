@@ -44,6 +44,20 @@ record_current_sha() {
     git rev-parse HEAD 2>/dev/null | sudo tee "$CURRENT_SHA_FILE" >/dev/null 2>&1 || true
 }
 
+# REL-3: persist the image tag compose should run, in the repo-root .env that
+# `docker compose` auto-reads — so EVERY compose invocation (auto-update, the
+# netmon CLI, rollback) selects the same image. .env is gitignored, so git
+# reset --hard never clobbers it. Preserves any other keys already in .env.
+ENV_DOTFILE="$REPO_DIR/.env"
+write_image_tag_env() {
+    local tag="$1"
+    if [[ -f "$ENV_DOTFILE" ]] && grep -q '^NETMON_IMAGE_TAG=' "$ENV_DOTFILE"; then
+        sed -i "s|^NETMON_IMAGE_TAG=.*|NETMON_IMAGE_TAG=${tag}|" "$ENV_DOTFILE"
+    else
+        echo "NETMON_IMAGE_TAG=${tag}" >> "$ENV_DOTFILE"
+    fi
+}
+
 LOG_TAG="netmon-update"
 log() {
     local msg="$*"
@@ -124,20 +138,25 @@ case "$UPDATE_CHANNEL" in
         ;;
     canary)
         REMOTE=$(git rev-parse origin/main)
-        log "update channel=canary -> origin/main ${REMOTE:0:8}"
+        IMAGE_TAG="canary"
+        log "update channel=canary -> origin/main ${REMOTE:0:8} (image :canary)"
         ;;
     stable|"")
         if [[ -n "$UPDATE_REF" ]] && REMOTE=$(git rev-parse --verify "${UPDATE_REF}^{commit}" 2>/dev/null); then
-            log "update channel=stable; pinned ${UPDATE_REF} -> ${REMOTE:0:8}"
+            # Pinned to an exact commit -> the immutable per-commit image tag.
+            IMAGE_TAG="$REMOTE"
+            log "update channel=stable; pinned ${UPDATE_REF} -> ${REMOTE:0:8} (image :${REMOTE:0:8})"
         else
             [[ -n "$UPDATE_REF" ]] && log "WARN: pinned ref '${UPDATE_REF}' not found after fetch; tracking origin/main"
             REMOTE=$(git rev-parse origin/main)
-            log "update channel=stable -> origin/main ${REMOTE:0:8}"
+            IMAGE_TAG="stable"
+            log "update channel=stable -> origin/main ${REMOTE:0:8} (image :stable)"
         fi
         ;;
     *)
         REMOTE=$(git rev-parse origin/main)
-        log "WARN: unknown update channel '${UPDATE_CHANNEL}'; tracking origin/main"
+        IMAGE_TAG="stable"
+        log "WARN: unknown update channel '${UPDATE_CHANNEL}'; tracking origin/main (image :stable)"
         ;;
 esac
 
@@ -160,10 +179,10 @@ CHANGED=$(git diff --name-only "$LOCAL" "$REMOTE")
 log "files changed:"
 echo "$CHANGED" | while read -r f; do log "  $f"; done
 
-NEEDS_BUILD=0
-if echo "$CHANGED" | grep -qE '^(collector/(Dockerfile|pyproject\.toml|src/)|collector/entrypoint\.sh)'; then
-    NEEDS_BUILD=1
-fi
+# REL-3: code changes ship IN the prebuilt image now, so we no longer decide
+# whether to build from the diff — we always pull the resolved tag (and fall
+# back to a local build only if the registry is unreachable). The container is
+# recreated automatically by `up -d` when the pulled image digest changes.
 
 NEEDS_RECREATE=0
 if echo "$CHANGED" | grep -qE '^docker-compose\.yml$'; then
@@ -187,11 +206,10 @@ if [[ -x "$REPO_DIR/scripts/db-snapshot.sh" ]]; then
     fi
 fi
 
-# 3c. Tag the current collector image as :previous so rollback can swap back.
-if docker image inspect netmon/collector:latest >/dev/null 2>&1; then
-    docker tag netmon/collector:latest netmon/collector:previous 2>/dev/null || true
-    log "  tagged current image as netmon/collector:previous"
-fi
+# 3c. Rollback target = the immutable per-commit image tag :<LOCAL>. CI publishes
+# a :<sha> tag for every main commit, and the image is almost always still in the
+# local docker cache, so rollback.sh can restore it (pull or cached) without a
+# fragile local :previous tag. The SHA itself is already saved to $SHA_FILE above.
 
 # 4. Move to the resolved target (channel-aware). reset --hard is safe here: the
 # dirty-tree guard at the top already refused to run with local changes, and
@@ -204,6 +222,9 @@ fi
 NEW_HEAD=$(git rev-parse HEAD)
 record_current_sha
 log "updated to ${NEW_HEAD:0:8}"
+
+# Select the image tag for compose (stable | canary | <sha>) before pull/up.
+write_image_tag_env "$IMAGE_TAG"
 
 # 4b. Run path migration with the freshly-pulled code.
 log "ensuring canonical paths (and migrating legacy layout if needed)"
@@ -225,12 +246,16 @@ if systemctl list-unit-files netmon-update.timer 2>/dev/null | grep -q netmon-up
     fi
 fi
 
-# 5. Rebuild only if container code changed. Always --pull so we pick up
-# any security patches in the python:3.12-slim base image.
-if [[ $NEEDS_BUILD -eq 1 ]]; then
-    log "rebuilding collector image (with --pull for base-image security updates)"
+# 5. REL-3: pull the prebuilt image for the resolved tag. Fall back to a local
+# build only if the registry is unreachable (e.g. a school that blocks ghcr.io)
+# — the build is reliable again now that the Ookla install was removed.
+log "pulling collector image (ghcr.io/adoty-sbcss/netmon-collector:${IMAGE_TAG})"
+if docker compose pull collector >/dev/null 2>&1; then
+    log "  image pulled"
+else
+    log "WARN: image pull failed (registry unreachable?); building collector locally"
     if ! docker compose build --pull --quiet collector 2>&1 | while read -r ln; do log "  $ln"; done; then
-        log "ERROR: docker compose build failed"
+        log "ERROR: image pull AND local build both failed"
         exit 1
     fi
 fi

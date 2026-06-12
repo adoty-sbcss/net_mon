@@ -80,9 +80,17 @@ fi
 echo "=============================================================="
 echo ""
 
-# --- 6. Build + start the collector ---------------------------------------
-log "Building the collector image (first build takes a few minutes)..."
-dc build
+# --- 6. Pull (or build) + start the collector -----------------------------
+# REL-3: pull the prebuilt image from GHCR (seconds). Fall back to a local build
+# only if the registry is unreachable (e.g. a school that blocks ghcr.io) — the
+# build is reliable again now that the Ookla install was removed.
+log "Fetching the collector image..."
+if dc pull collector; then
+    ok "pulled prebuilt collector image"
+else
+    log "Image pull failed (registry unreachable?); building locally (a few minutes)..."
+    dc build
+fi
 log "Starting containers..."
 # --force-recreate so a RE-RUN after a config change actually reloads the env
 # file. docker compose only injects netmon.env at container-create time, so a
