@@ -18,6 +18,16 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
+# Cloudflare's speed.cloudflare.com edge now blocks the stdlib's default
+# `Python-urllib/<ver>` User-Agent (returns 403/404), which silently broke the
+# probe even though the endpoints are reachable. Send a browser-like UA so the
+# requests are served. (Confirmed 2026-06-12: Python-urllib UA → 403, browser UA
+# → 200 on /__down + /__up.)
+_BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
 
 def _empty(provider: str, error: str) -> dict:
     return {"ok": False, "provider": provider, "error": error[:500]}
@@ -36,12 +46,20 @@ def run_cloudflare(duration: int = 5, streams: int = 8, timeout: int = 60) -> di
     ctx = ssl.create_default_context()
     dur = max(2, min(int(duration or 5), 20))
 
+    def _get(url: str, timeout_s: int) -> "urllib.request.addinfourl":
+        # A real User-Agent is required — Cloudflare blocks Python-urllib's default.
+        return urllib.request.urlopen(
+            urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA}),
+            timeout=timeout_s,
+            context=ctx,
+        )
+
     # --- latency + jitter: a handful of tiny timed requests ---
     samples: list[float] = []
     try:
         for _ in range(20):
             t0 = time.monotonic()
-            with urllib.request.urlopen(f"{base}/__down?bytes=0", timeout=10, context=ctx) as r:
+            with _get(f"{base}/__down?bytes=0", 10) as r:
                 r.read()
             samples.append((time.monotonic() - t0) * 1000.0)
     except Exception as exc:  # noqa: BLE001
@@ -51,15 +69,18 @@ def run_cloudflare(duration: int = 5, streams: int = 8, timeout: int = 60) -> di
 
     def _download(deadline: float) -> int:
         n = 0
+        # Cloudflare 403s very large single /__down requests (100MB is rejected;
+        # ≤50MB is served). Request a safe size and RE-REQUEST until the time
+        # window closes, so a fast link still saturates the measurement window.
+        per_req = 25_000_000
         try:
-            with urllib.request.urlopen(
-                f"{base}/__down?bytes=100000000", timeout=timeout, context=ctx
-            ) as r:
-                while time.monotonic() < deadline:
-                    chunk = r.read(131072)
-                    if not chunk:
-                        break
-                    n += len(chunk)
+            while time.monotonic() < deadline:
+                with _get(f"{base}/__down?bytes={per_req}", timeout) as r:
+                    while time.monotonic() < deadline:
+                        chunk = r.read(131072)
+                        if not chunk:
+                            break
+                        n += len(chunk)
         except Exception:  # noqa: BLE001
             pass
         return n
@@ -69,7 +90,12 @@ def run_cloudflare(duration: int = 5, streams: int = 8, timeout: int = 60) -> di
         block = b"0" * (1 << 20)  # 1 MiB
         try:
             while time.monotonic() < deadline:
-                req = urllib.request.Request(f"{base}/__up", data=block, method="POST")
+                req = urllib.request.Request(
+                    f"{base}/__up",
+                    data=block,
+                    method="POST",
+                    headers={"User-Agent": _BROWSER_UA},
+                )
                 with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
                     r.read()
                 sent += len(block)
