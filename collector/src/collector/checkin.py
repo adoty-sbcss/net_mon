@@ -229,7 +229,10 @@ def _collect_logs(lines: int = 250) -> tuple[str, dict]:
     from .logging_setup import LOG_DIR
 
     out: dict[str, str] = {}
-    for fname in ("collector.log", "audit.log"):
+    # auto-update.log is written by the host's scripts/auto-update.sh into the
+    # /var/log/netmon bind mount, so include it here — it's the ONLY way to see
+    # why a remote update failed without SSH (the rest goes to host syslog).
+    for fname in ("collector.log", "audit.log", "auto-update.log"):
         p = LOG_DIR / fname
         try:
             tail = p.read_text(errors="replace").splitlines()[-lines:]
@@ -709,6 +712,19 @@ def _current_sha() -> str | None:
         return None
 
 
+def _last_update() -> dict | None:
+    """The outcome of the box's last auto-update run, written by auto-update.sh to
+    a bind-mounted file (status/reason/from/to/channel/at). Reported at check-in so
+    the dashboard can show WHY an update failed — the update runs host-side and
+    async, so this is the only feedback the dashboard gets. Best-effort."""
+    try:
+        raw = Path("/var/lib/netmon/last-update-result").read_text().strip()
+        data = json.loads(raw) if raw else None
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def run_console_poll() -> int:
     """Lightweight interactive-command poll (faster-pickup for the live console).
 
@@ -775,6 +791,9 @@ def run_checkin() -> int:
             # Release-channel telemetry for the dashboard rollout view.
             "commitSha": _current_sha(),
             "updateChannel": settings.update_channel,
+            # Outcome of the last host-side auto-update (so a failed update is
+            # visible on the dashboard instead of fire-and-forget).
+            "lastUpdate": _last_update(),
             "localIp": local_ip,
             "interface": iface,
             "interfaceCidr": cidr,

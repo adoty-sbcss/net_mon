@@ -33,6 +33,42 @@ CURRENT_SHA_FILE="/var/lib/netmon/current-sha"   # reported to the dashboard at 
 ENV_FILE="/etc/netmon/netmon.env"
 HEALTHCHECK_WAIT_SECONDS="${NETMON_HEALTHCHECK_WAIT:-120}"
 
+# Update observability: the update runs host-side and async, so its outcome never
+# reached the dashboard (fire-and-forget) and its log only went to syslog (no SSH
+# = no way to read it). Fix both:
+#   - RESULT_FILE: a one-line JSON outcome the next check-in reports back, so the
+#     dashboard shows "last update: failed (dubious ownership)" instead of nothing.
+#   - UPDATE_LOG: a copy of this run's log under /var/log/netmon (a host<->container
+#     bind mount) so `collect-logs` can retrieve it without SSH.
+# Both live on bind mounts the collector container can read.
+RESULT_FILE="/var/lib/netmon/last-update-result"
+UPDATE_LOG="/var/log/netmon/auto-update.log"
+
+# Record the terminal outcome for the dashboard. Driven by an EXIT trap so EVERY
+# exit path (including an unexpected set -e abort) reports something — the trap
+# writes whatever RESULT_STATUS/RESULT_REASON were last set to. LOCAL/NEW_HEAD may
+# be unset at early exits (set -u), hence the :- defaults.
+RESULT_STATUS="failed"
+RESULT_REASON="update did not complete"
+record_result() {
+    local at; at="$(date -Iseconds 2>/dev/null || echo unknown)"
+    local from="${LOCAL:-}" to="${NEW_HEAD:-${LOCAL:-}}" chan="${UPDATE_CHANNEL:-stable}"
+    local json
+    json="{\"status\":\"${RESULT_STATUS}\",\"reason\":\"${RESULT_REASON}\",\"from\":\"${from:0:12}\",\"to\":\"${to:0:12}\",\"channel\":\"${chan:-stable}\",\"at\":\"${at}\"}"
+    { printf '%s\n' "$json" >"$RESULT_FILE"; } 2>/dev/null \
+        || { printf '%s\n' "$json" | sudo -n tee "$RESULT_FILE" >/dev/null 2>&1; } \
+        || true
+}
+trap record_result EXIT
+
+# Keep the retrievable log from growing without bound (best-effort).
+if [[ -f "$UPDATE_LOG" ]]; then
+    log_lines="$(wc -l <"$UPDATE_LOG" 2>/dev/null || echo 0)"
+    if [[ "${log_lines:-0}" -gt 1000 ]]; then
+        { tail -n 500 "$UPDATE_LOG" >"${UPDATE_LOG}.tmp" && mv "${UPDATE_LOG}.tmp" "$UPDATE_LOG"; } 2>/dev/null || true
+    fi
+fi
+
 # Read a NETMON_* key from the env file (root-owned 0600). Empty if absent.
 read_env() {
     sudo grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true
@@ -64,7 +100,10 @@ log() {
     if command -v logger >/dev/null 2>&1; then
         logger -t "$LOG_TAG" "$msg"
     fi
-    printf '[%s] %s\n' "$(date -Iseconds)" "$msg"
+    local line; line="[$(date -Iseconds)] $msg"
+    printf '%s\n' "$line"
+    # Mirror to the bind-mounted log so `collect-logs` can retrieve it (best-effort).
+    { printf '%s\n' "$line" >>"$UPDATE_LOG"; } 2>/dev/null || true
 }
 
 # Source paths.sh so we can run ensure_paths after the git pull lands new
@@ -107,6 +146,7 @@ ensure_repo_ownership
 if [[ -n "$(git status --porcelain)" ]]; then
     log "FATAL: working tree has uncommitted changes; refusing to auto-update"
     log "Resolve manually:  cd $REPO_DIR && git status"
+    RESULT_STATUS="failed"; RESULT_REASON="working tree has uncommitted changes; refusing to auto-update"
     exit 2
 fi
 
@@ -115,8 +155,10 @@ fi
 if ! fetch_err="$(git fetch --quiet origin main 2>&1)"; then
     if printf '%s' "$fetch_err" | grep -qi "dubious ownership"; then
         log "git fetch failed: dubious repo ownership persists after self-heal. Run:  sudo chown -R $(id -un):$(id -gn) $REPO_DIR"
+        RESULT_STATUS="failed"; RESULT_REASON="git fetch failed: dubious repo ownership (needs: sudo chown -R the repo to the service user)"
     else
         log "git fetch failed (network down?); will retry next run"
+        RESULT_STATUS="failed"; RESULT_REASON="git fetch failed (registry/network unreachable)"
     fi
     exit 1
 fi
@@ -134,6 +176,7 @@ case "$UPDATE_CHANNEL" in
     hold)
         log "update channel=hold; skipping auto-update"
         record_current_sha
+        RESULT_STATUS="skipped"; RESULT_REASON="update channel=hold (updates paused)"
         exit 0
         ;;
     canary)
@@ -163,6 +206,7 @@ esac
 if [[ "$LOCAL" == "$REMOTE" ]]; then
     log "already up to date at ${LOCAL:0:8}"
     record_current_sha
+    RESULT_STATUS="ok"; RESULT_REASON="already up to date at ${LOCAL:0:8}"
     # Even when we don't pull, record the current SHA as last-known-good
     # so manual rollback has a target.
     if [[ ! -f "$SHA_FILE" ]] || [[ "$(cat "$SHA_FILE")" != "$LOCAL" ]]; then
@@ -217,6 +261,7 @@ fi
 # pinned downgrades and canary-ahead alike, where a plain --ff-only could not.
 if ! git reset --hard --quiet "$REMOTE"; then
     log "FATAL: git reset to ${REMOTE:0:8} failed; manual intervention needed"
+    RESULT_STATUS="failed"; RESULT_REASON="git reset to ${REMOTE:0:8} failed (repo not writable?)"
     exit 2
 fi
 NEW_HEAD=$(git rev-parse HEAD)
@@ -256,6 +301,7 @@ else
     log "WARN: image pull failed (registry unreachable?); building collector locally"
     if ! docker compose build --pull --quiet collector 2>&1 | while read -r ln; do log "  $ln"; done; then
         log "ERROR: image pull AND local build both failed"
+        RESULT_STATUS="failed"; RESULT_REASON="image pull AND local build both failed (registry + build deps unreachable — egress filtering?)"
         exit 1
     fi
 fi
@@ -271,6 +317,7 @@ if ! docker compose $COMPOSE_ARGS 2>&1 | while read -r ln; do log "  $ln"; done;
     if [[ -x "$REPO_DIR/scripts/rollback.sh" ]]; then
         "$REPO_DIR/scripts/rollback.sh" 2>&1 | while read -r ln; do log "  $ln"; done || true
     fi
+    RESULT_STATUS="failed"; RESULT_REASON="docker compose up failed; attempted rollback"
     exit 1
 fi
 
@@ -287,6 +334,7 @@ sleep "$HEALTHCHECK_WAIT_SECONDS"
 
 if docker compose exec -T collector python -m collector selftest >/dev/null 2>&1; then
     log "healthcheck passed; update complete at ${NEW_HEAD:0:8}"
+    RESULT_STATUS="ok"; RESULT_REASON="updated ${LOCAL:0:8} -> ${NEW_HEAD:0:8}; healthcheck passed"
     exit 0
 fi
 
@@ -298,13 +346,16 @@ log "  rollback target: ${LOCAL:0:8}"
 if [[ ! -x "$REPO_DIR/scripts/rollback.sh" ]]; then
     log "FATAL: scripts/rollback.sh missing — box is stuck on ${NEW_HEAD:0:8}"
     log "       manual recovery: git reset --hard $LOCAL && docker compose up -d --force-recreate"
+    RESULT_STATUS="failed"; RESULT_REASON="healthcheck failed after update to ${NEW_HEAD:0:8}; rollback.sh missing (box stuck on new build)"
     exit 1
 fi
 
 if "$REPO_DIR/scripts/rollback.sh" 2>&1 | while read -r ln; do log "  $ln"; done; then
     log "auto-rollback completed; box is back on ${LOCAL:0:8}"
+    RESULT_STATUS="rolled_back"; RESULT_REASON="healthcheck failed after update to ${NEW_HEAD:0:8}; auto-rolled-back to ${LOCAL:0:8}"
     exit 0
 else
     log "FATAL: auto-rollback also failed — manual intervention required"
+    RESULT_STATUS="failed"; RESULT_REASON="healthcheck failed after update to ${NEW_HEAD:0:8}; auto-rollback ALSO failed (manual intervention needed)"
     exit 1
 fi
