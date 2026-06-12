@@ -98,6 +98,56 @@ generate_vlan_netplan() {
     printf '%s' "$f"
 }
 
+# Non-interactive VLAN netplan apply with a connectivity guard — the headless
+# counterpart to prompt_trunk_config's `netplan try` (which needs a TTY). Writes
+# the sub-interface config, validates it, applies, and AUTO-REVERTS if the box's
+# default route disappears. Safe because we only ever ADD sub-interfaces (routes
+# off) and never touch the parent, so the uplink + SSH stay up. Used by install.sh
+# (install-time) and the dashboard apply-vlan host action (runtime push).
+# Args: parent vlans [statics]. Returns 0 on success, non-zero on any problem.
+apply_vlan_netplan_headless() {
+    local parent="$1" vlans="$2" statics="${3:-}"
+    local f="$NETMON_VLAN_NETPLAN"
+
+    if ! command -v netplan >/dev/null 2>&1; then
+        warn "netplan not found — cannot configure VLAN sub-interfaces on this box."
+        return 1
+    fi
+    if [[ -z "$parent" || -z "$vlans" ]]; then
+        warn "VLAN setup: missing parent interface or VLAN list — skipping."
+        return 1
+    fi
+
+    # Snapshot the default route so we can detect (and undo) connectivity loss.
+    local before_default after_default
+    before_default="$(ip route show default 2>/dev/null | head -1)"
+
+    generate_vlan_netplan "$parent" "$vlans" "$statics" >/dev/null
+    log "wrote ${f} (VLANs ${vlans} on ${parent}, routes off)"
+
+    if ! $SUDO netplan generate 2>/tmp/netmon-netplan.err; then
+        warn "netplan validation failed — removing our file so it can't break netplan:"
+        $SUDO sed 's/^/    /' /tmp/netmon-netplan.err 2>/dev/null || true
+        $SUDO rm -f "$f"
+        $SUDO netplan generate >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    $SUDO netplan apply 2>/dev/null || true
+    sleep 3
+
+    after_default="$(ip route show default 2>/dev/null | head -1)"
+    if [[ -n "$before_default" && -z "$after_default" ]]; then
+        warn "default route lost after VLAN apply — REVERTING (removing ${f})."
+        $SUDO rm -f "$f"
+        $SUDO netplan apply 2>/dev/null || true
+        return 1
+    fi
+
+    ok "VLAN sub-interfaces up on ${parent} (${vlans}); the collector scans them within a poll tick (~30s)."
+    return 0
+}
+
 prompt_trunk_config() {
     echo ""
     echo "${C_INFO}=== VLAN trunk monitoring ===${C_OFF}"
