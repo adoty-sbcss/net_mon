@@ -253,14 +253,8 @@ def cmd_checkin() -> None:
 
 
 @cli.command("speedtest")
-@click.option(
-    "--provider",
-    type=click.Choice(["ookla", "cloudflare", "both"]),
-    default="both",
-    help="Which public speed test to run.",
-)
-def cmd_speedtest(provider: str) -> None:
-    """Run a public internet speed test (Ookla and/or Cloudflare) and print results.
+def cmd_speedtest() -> None:
+    """Run a public internet speed test (Cloudflare) and print the result.
 
     Manual/diagnostic use; scheduled runs are driven by the check-in loop
     (NETMON_SPEEDTEST_*). Does NOT report to the dashboard — use the dashboard's
@@ -268,21 +262,15 @@ def cmd_speedtest(provider: str) -> None:
     """
     from .speedtest import run_speedtest
 
-    provs = ["ookla", "cloudflare"] if provider == "both" else [provider]
-    failed = 0
-    for p in provs:
-        res = run_speedtest(p)
-        if res.get("ok"):
-            click.echo(
-                f"OK   {p}: down={res.get('download_mbps')} Mbps  up={res.get('upload_mbps')} Mbps  "
-                f"latency={res.get('latency_ms')} ms  jitter={res.get('jitter_ms')} ms"
-                + (f"  server={res.get('server')}" if res.get("server") else "")
-                + (f"  url={res.get('result_url')}" if res.get("result_url") else "")
-            )
-        else:
-            failed += 1
-            click.echo(f"FAIL {p}: {res.get('error')}", err=True)
-    sys.exit(1 if failed == len(provs) else 0)
+    res = run_speedtest("cloudflare")
+    if res.get("ok"):
+        click.echo(
+            f"OK   cloudflare: down={res.get('download_mbps')} Mbps  up={res.get('upload_mbps')} Mbps  "
+            f"latency={res.get('latency_ms')} ms  jitter={res.get('jitter_ms')} ms"
+        )
+        sys.exit(0)
+    click.echo(f"FAIL cloudflare: {res.get('error')}", err=True)
+    sys.exit(1)
 
 
 @cli.command("console-poll")

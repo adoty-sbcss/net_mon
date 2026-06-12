@@ -175,14 +175,14 @@ class Settings(BaseSettings):
     iperf_direction: str = Field(default="down", alias="NETMON_IPERF_DIRECTION")
     iperf_protocol: str = Field(default="tcp", alias="NETMON_IPERF_PROTOCOL")
 
-    # Public internet speed tests (PERF-2). Pushed from the dashboard via desired_config.
+    # Public internet speed test (PERF-2). Pushed from the dashboard via desired_config.
     speedtest_enabled: bool = Field(default=False, alias="NETMON_SPEEDTEST_ENABLED")
-    # CSV of providers to run each cycle: "ookla", "cloudflare", or "ookla,cloudflare".
-    speedtest_providers: str = Field(default="ookla", alias="NETMON_SPEEDTEST_PROVIDERS")
-    # Default 6h — speedtests consume real bandwidth, so less frequent than iperf.
+    # Provider — Cloudflare only (Ookla removed: unreliable on filtered school
+    # networks). Kept as a field for forward-compat; values are normalized to
+    # "cloudflare" by the runner.
+    speedtest_providers: str = Field(default="cloudflare", alias="NETMON_SPEEDTEST_PROVIDERS")
+    # Default 6h — speed tests consume real bandwidth, so less frequent than iperf.
     speedtest_schedule_sec: int = Field(default=6 * 3600, alias="NETMON_SPEEDTEST_SCHEDULE_SEC")
-    # Optional pinned Ookla server id (blank = auto-pick nearest).
-    speedtest_ookla_server: str = Field(default="", alias="NETMON_SPEEDTEST_OOKLA_SERVER")
 
     # Latency / jitter / loss probes (PERF-4). Cheap pings each check-in when on.
     latency_enabled: bool = Field(default=False, alias="NETMON_LATENCY_ENABLED")

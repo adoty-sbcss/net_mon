@@ -184,11 +184,10 @@ def _apply_config(data: dict) -> None:
     if "speedtest_enabled" in data:
         mapping["NETMON_SPEEDTEST_ENABLED"] = "true" if data.get("speedtest_enabled") else "false"
     if "speedtest_providers" in data:
-        mapping["NETMON_SPEEDTEST_PROVIDERS"] = str(data.get("speedtest_providers") or "ookla")
+        # Cloudflare is the only provider now (Ookla removed); normalize anything.
+        mapping["NETMON_SPEEDTEST_PROVIDERS"] = "cloudflare"
     if data.get("speedtest_schedule_sec"):
         mapping["NETMON_SPEEDTEST_SCHEDULE_SEC"] = str(int(data["speedtest_schedule_sec"]))
-    if "speedtest_ookla_server" in data:
-        mapping["NETMON_SPEEDTEST_OOKLA_SERVER"] = str(data.get("speedtest_ookla_server") or "")
     # Latency probes (PERF-4) pushed from the dashboard.
     if "latency_enabled" in data:
         mapping["NETMON_LATENCY_ENABLED"] = "true" if data.get("latency_enabled") else "false"
@@ -564,40 +563,23 @@ def _report_speedtest(url: str, token: str | None, res: dict, trigger: str) -> N
     )
 
 
-def _providers_list(settings) -> list[str]:
-    raw = str(getattr(settings, "speedtest_providers", "") or "ookla")
-    valid = {"ookla", "cloudflare"}
-    out = [p.strip().lower() for p in raw.split(",") if p.strip().lower() in valid]
-    return out or ["ookla"]
-
-
 def _run_speedtest_command(url: str, token: str | None, args: dict, trigger: str) -> tuple[str, dict]:
-    """On-demand speedtest from the command queue; runs the requested provider(s),
-    reports each result, returns a short status summary."""
+    """On-demand speed test from the command queue. Cloudflare is the only
+    provider (Ookla removed); reports the result, returns a short status."""
     from .speedtest import run_speedtest
 
-    settings = get_settings()
-    provider = str(args.get("provider") or "").strip().lower()
-    providers = [provider] if provider in ("ookla", "cloudflare") else _providers_list(settings)
-    summary: dict = {}
-    any_ok = False
-    for p in providers:
-        res = run_speedtest(
-            p,
-            server_id=args.get("server_id") or settings.speedtest_ookla_server or None,
-        )
-        _report_speedtest(url, token, res, trigger)
-        any_ok = any_ok or bool(res.get("ok"))
-        summary[p] = (
-            {"download_mbps": res.get("download_mbps"), "upload_mbps": res.get("upload_mbps")}
-            if res.get("ok")
-            else {"error": res.get("error")}
-        )
-    return ("done" if any_ok else "failed"), summary
+    res = run_speedtest("cloudflare", duration=int(args.get("duration") or 5))
+    _report_speedtest(url, token, res, trigger)
+    summary = (
+        {"download_mbps": res.get("download_mbps"), "upload_mbps": res.get("upload_mbps")}
+        if res.get("ok")
+        else {"error": res.get("error")}
+    )
+    return ("done" if res.get("ok") else "failed"), {"cloudflare": summary}
 
 
 def _maybe_scheduled_speedtest(url: str, token: str | None, settings) -> None:
-    """Run scheduled public speedtest(s) if enabled and the interval has elapsed."""
+    """Run the scheduled Cloudflare speed test if enabled and the interval elapsed."""
     import time
 
     if not settings.speedtest_enabled:
@@ -611,9 +593,8 @@ def _maybe_scheduled_speedtest(url: str, token: str | None, settings) -> None:
         return
     from .speedtest import run_speedtest
 
-    for p in _providers_list(settings):
-        res = run_speedtest(p, server_id=settings.speedtest_ookla_server or None)
-        _report_speedtest(url, token, res, "scheduled")
+    res = run_speedtest("cloudflare")
+    _report_speedtest(url, token, res, "scheduled")
     try:
         SPEEDTEST_LAST_FILE.parent.mkdir(parents=True, exist_ok=True)
         SPEEDTEST_LAST_FILE.write_text(str(now))

@@ -1,23 +1,18 @@
-"""Public internet speed tests (PERF-2) — the WAN counterpart to iperf3.
+"""Public internet speed test (PERF-2) — the WAN counterpart to iperf3.
 
-Two providers, both reported through the same normalized result shape:
+Cloudflare-only: a lightweight, dependency-free probe against
+speed.cloudflare.com using the stdlib (urllib) — parallel time-boxed
+download/upload streams + a latency/jitter sample.
 
-  - ookla:      shells the official `speedtest` CLI (-f json). The recognizable
-                speedtest.net numbers + ISP + a shareable result URL. Needs the
-                `speedtest` binary in the image; unattended runs pass
-                --accept-license --accept-gdpr.
-  - cloudflare: a lightweight, dependency-free probe against speed.cloudflare.com
-                using the stdlib (urllib) — parallel time-boxed download/upload
-                streams + a latency/jitter sample. Good for corroboration + trend;
-                not a certified number like Ookla.
+The Ookla CLI provider was removed (2026-06-11): its binary couldn't be reliably
+installed on field boxes that build their image behind school egress filtering,
+and speedtest.net's servers are themselves frequently blocked by school content
+filters. Cloudflare's endpoint isn't, so it's the dependable WAN number.
 
 On-demand runs come via the check-in command queue; scheduled runs are driven
 from the check-in loop using pushed config (NETMON_SPEEDTEST_*).
 """
 from __future__ import annotations
-
-import json
-import subprocess
 
 import structlog
 
@@ -26,69 +21,6 @@ log = structlog.get_logger(__name__)
 
 def _empty(provider: str, error: str) -> dict:
     return {"ok": False, "provider": provider, "error": error[:500]}
-
-
-def run_ookla(server_id: str | None = None, timeout: int = 90) -> dict:
-    """Run the Ookla `speedtest` CLI and normalize its JSON result."""
-    cmd = ["speedtest", "-f", "json", "--accept-license", "--accept-gdpr"]
-    if server_id:
-        cmd += ["-s", str(server_id)]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except FileNotFoundError:
-        return _empty("ookla", "speedtest CLI not installed")
-    except subprocess.TimeoutExpired:
-        return _empty("ookla", "speedtest timed out")
-
-    out = (proc.stdout or "").strip()
-    data: dict | None = None
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
-        # Fall back to the last JSON line if the CLI emitted progress objects.
-        for line in reversed(out.splitlines()):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-                break
-            except json.JSONDecodeError:
-                continue
-    if not isinstance(data, dict):
-        return _empty("ookla", (proc.stderr or "speedtest produced no JSON"))
-    if data.get("error") or data.get("type") not in (None, "result"):
-        return _empty("ookla", str(data.get("error") or data.get("message") or "speedtest error"))
-
-    dl = data.get("download") or {}
-    ul = data.get("upload") or {}
-    ping = data.get("ping") or {}
-    server = data.get("server") or {}
-    # Ookla reports bandwidth in BYTES/sec.
-    return {
-        "ok": True,
-        "provider": "ookla",
-        "download_mbps": round((dl.get("bandwidth") or 0) * 8 / 1e6, 3),
-        "upload_mbps": round((ul.get("bandwidth") or 0) * 8 / 1e6, 3),
-        "latency_ms": ping.get("latency"),
-        "jitter_ms": ping.get("jitter"),
-        "loss_pct": data.get("packetLoss"),
-        "server": " ".join(
-            p for p in [server.get("name"), server.get("location")] if p
-        ).strip()
-        or None,
-        "isp": data.get("isp"),
-        "result_url": (data.get("result") or {}).get("url"),
-        "external_ip": (data.get("interface") or {}).get("externalIp"),
-        "raw": {
-            "download": dl,
-            "upload": ul,
-            "ping": ping,
-            "packetLoss": data.get("packetLoss"),
-            "server": server,
-            "result": data.get("result"),
-        },
-    }
 
 
 def run_cloudflare(duration: int = 5, streams: int = 8, timeout: int = 60) -> dict:
@@ -175,13 +107,10 @@ def run_cloudflare(duration: int = 5, streams: int = 8, timeout: int = 60) -> di
     }
 
 
-def run_speedtest(provider: str, **kwargs) -> dict:
-    """Dispatch to a provider. Returns the normalized result dict."""
-    if provider == "ookla":
-        return run_ookla(server_id=kwargs.get("server_id"))
-    if provider == "cloudflare":
-        return run_cloudflare(
-            duration=int(kwargs.get("duration") or 5),
-            streams=int(kwargs.get("streams") or 8),
-        )
-    return _empty(provider or "?", f"unknown speedtest provider: {provider!r}")
+def run_speedtest(provider: str = "cloudflare", **kwargs) -> dict:
+    """Run the speed test. Cloudflare is the only provider (Ookla removed), so any
+    provider value runs the Cloudflare probe."""
+    return run_cloudflare(
+        duration=int(kwargs.get("duration") or 5),
+        streams=int(kwargs.get("streams") or 8),
+    )
