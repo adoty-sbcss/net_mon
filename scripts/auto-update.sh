@@ -142,6 +142,60 @@ ensure_repo_ownership() {
 }
 ensure_repo_ownership
 
+# REL-3/REL-2 last-resort self-heal: if git is wedged by ownership and we couldn't
+# chown (a locked-down box with no passwordless sudo — exactly what stranded a
+# field box on old code), re-clone the repo FRESH to a dir we own and swap it in.
+# SAFE: all config/state lives OUTSIDE the repo (/etc/netmon, /var/lib/netmon), so
+# the repo is pure code — re-cloning loses nothing. CONSERVATIVE: only the
+# dubious-ownership fetch failure below calls this; the broken repo is moved aside
+# (never deleted) and restored if the swap fails; a marker prevents loops. On
+# success it re-execs the fresh script (forcing an image refresh) and never returns.
+selfheal_reclone() {
+    [[ -n "${NETMON_RECLONED:-}" ]] && { log "self-heal: already re-cloned this run; not looping"; return 1; }
+    # Never operate on a data/system dir, even if REPO_DIR is somehow misset.
+    case "$REPO_DIR" in
+        /|/etc|/etc/netmon|/var|/var/lib|/var/lib/netmon|"$HOME")
+            log "self-heal: refusing to re-clone suspicious REPO_DIR=$REPO_DIR"; return 1 ;;
+    esac
+    git config --global --add safe.directory "$REPO_DIR" 2>/dev/null || true
+    local url; url="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)"
+    [[ -z "$url" ]] && { log "self-heal: cannot read origin URL; not re-cloning"; return 1; }
+    local parent; parent="$(dirname "$REPO_DIR")"
+    [[ -w "$parent" ]] || { log "self-heal: parent dir $parent not writable; can't re-clone (needs an admin chown)"; return 1; }
+
+    local fresh="${REPO_DIR}.fresh.$$"
+    rm -rf "$fresh" 2>/dev/null || true
+    log "self-heal: re-cloning $url -> fresh tree owned by $(id -un)"
+    if ! git clone --quiet "$url" "$fresh"; then
+        log "self-heal: fresh clone failed (registry/network?); leaving existing repo untouched"
+        rm -rf "$fresh" 2>/dev/null || true
+        return 1
+    fi
+    if [[ ! -f "$fresh/docker-compose.yml" || ! -x "$fresh/scripts/auto-update.sh" ]]; then
+        log "self-heal: fresh clone failed validation; discarding"
+        rm -rf "$fresh" 2>/dev/null || true
+        return 1
+    fi
+    # Preserve the gitignored repo-root .env (image-tag selection) if present.
+    if [[ -f "$REPO_DIR/.env" ]]; then cp -p "$REPO_DIR/.env" "$fresh/.env" 2>/dev/null || true; fi
+
+    local aside="${REPO_DIR}.broken.$(date +%s 2>/dev/null || echo old)"
+    if ! mv "$REPO_DIR" "$aside" 2>/dev/null; then
+        log "self-heal: could not move old repo aside; aborting (repo untouched)"
+        rm -rf "$fresh" 2>/dev/null || true
+        return 1
+    fi
+    if ! mv "$fresh" "$REPO_DIR" 2>/dev/null; then
+        log "self-heal: CRITICAL: could not move fresh repo into place; restoring original"
+        mv "$aside" "$REPO_DIR" 2>/dev/null || true
+        rm -rf "$fresh" 2>/dev/null || true
+        return 1
+    fi
+    log "self-heal: re-clone complete (old repo saved at $aside); re-executing auto-update with fresh code"
+    export NETMON_RECLONED=1 NETMON_FORCE_REFRESH=1
+    exec "$REPO_DIR/scripts/auto-update.sh"
+}
+
 # Refuse to run on a dirty working tree — we'd lose local changes.
 if [[ -n "$(git status --porcelain)" ]]; then
     log "FATAL: working tree has uncommitted changes; refusing to auto-update"
@@ -155,7 +209,10 @@ fi
 if ! fetch_err="$(git fetch --quiet origin main 2>&1)"; then
     if printf '%s' "$fetch_err" | grep -qi "dubious ownership"; then
         log "git fetch failed: dubious repo ownership persists after self-heal. Run:  sudo chown -R $(id -un):$(id -gn) $REPO_DIR"
-        RESULT_STATUS="failed"; RESULT_REASON="git fetch failed: dubious repo ownership (needs: sudo chown -R the repo to the service user)"
+        # Last-resort: re-clone fresh + re-exec. exec's away on success; returns
+        # here only if it couldn't (then we record a clear, actionable failure).
+        selfheal_reclone || true
+        RESULT_STATUS="failed"; RESULT_REASON="git fetch failed: dubious repo ownership; auto re-clone unavailable (needs an admin: sudo chown -R the repo to the service user)"
     else
         log "git fetch failed (network down?); will retry next run"
         RESULT_STATUS="failed"; RESULT_REASON="git fetch failed (registry/network unreachable)"
@@ -203,7 +260,10 @@ case "$UPDATE_CHANNEL" in
         ;;
 esac
 
-if [[ "$LOCAL" == "$REMOTE" ]]; then
+# Skip the no-op early-exit when a self-heal re-clone asked for a forced refresh:
+# after a re-clone git is already at HEAD (LOCAL==REMOTE), but the box is still
+# running the OLD image, so we must fall through to pull + recreate.
+if [[ "$LOCAL" == "$REMOTE" && -z "${NETMON_FORCE_REFRESH:-}" ]]; then
     log "already up to date at ${LOCAL:0:8}"
     record_current_sha
     RESULT_STATUS="ok"; RESULT_REASON="already up to date at ${LOCAL:0:8}"
@@ -214,6 +274,9 @@ if [[ "$LOCAL" == "$REMOTE" ]]; then
         echo "$LOCAL" | sudo tee "$SHA_FILE" >/dev/null
     fi
     exit 0
+fi
+if [[ -n "${NETMON_FORCE_REFRESH:-}" ]]; then
+    log "post-reclone: forcing an image refresh even though git is current (${LOCAL:0:8})"
 fi
 
 log "update available: ${LOCAL:0:8} -> ${REMOTE:0:8} (channel=${UPDATE_CHANNEL:-stable})"

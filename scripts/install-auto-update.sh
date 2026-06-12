@@ -152,6 +152,27 @@ else
     echo "Sudoers drop-in already present ($SUDOERS_FILE)."
 fi
 
+# --- repo ownership invariant (prevents the root-clone freeze) -------------
+# auto-update.sh runs `git` as $TARGET_USER. If the repo was cloned as root (a
+# `sudo git clone`, or a root shell), git refuses every operation with "fatal:
+# detected dubious ownership" and the box silently freezes on old code — the
+# exact failure that stranded a field box. REL-2 added a runtime self-heal, but
+# the durable fix is to never create the mismatch: chown the repo to $TARGET_USER
+# at install time so the invariant holds from day one. Idempotent.
+repo_owner="$(stat -c %U "$REPO_DIR" 2>/dev/null || echo '?')"
+if [[ "$repo_owner" != "$TARGET_USER" ]]; then
+    echo "Repo is owned by '$repo_owner' but auto-update runs as '$TARGET_USER'; chowning so git can pull..."
+    if $SUDO chown -R "$TARGET_USER" "$REPO_DIR"; then
+        echo "  repo now owned by $TARGET_USER"
+    else
+        echo "WARN: could not chown $REPO_DIR to $TARGET_USER — auto-update may fail until an admin runs: sudo chown -R $TARGET_USER $REPO_DIR" >&2
+    fi
+fi
+# Belt-and-suspenders: trust the dir for git even if some path can't be chowned.
+if command -v runuser >/dev/null 2>&1; then
+    $SUDO runuser -u "$TARGET_USER" -- git config --global --add safe.directory "$REPO_DIR" 2>/dev/null || true
+fi
+
 echo ""
 echo "Installed. Useful commands:"
 echo "  systemctl list-timers 'netmon-*.timer'           # next scheduled runs"
