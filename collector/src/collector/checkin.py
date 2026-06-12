@@ -193,6 +193,15 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_LATENCY_ENABLED"] = "true" if data.get("latency_enabled") else "false"
     if "latency_targets" in data:
         mapping["NETMON_LATENCY_TARGETS"] = str(data.get("latency_targets") or "1.1.1.1,8.8.8.8")
+    # VLAN trunk monitoring config. Writing these only records the desired sub-
+    # interfaces; the actual netplan apply runs on the HOST via the
+    # 'host-apply-vlan' host-action (the container can't create persistent NICs).
+    if "trunk_parent" in data:
+        mapping["NETMON_TRUNK_PARENT"] = str(data.get("trunk_parent") or "")
+    if "trunk_vlans" in data:
+        mapping["NETMON_TRUNK_VLANS"] = re.sub(r"[^0-9,]", "", str(data.get("trunk_vlans") or ""))
+    if "trunk_statics" in data:
+        mapping["NETMON_TRUNK_STATICS"] = str(data.get("trunk_statics") or "")
     if mapping:
         _update_env_file(ENV_FILE, mapping)
         log.info("applied desired config", keys=list(mapping))
@@ -260,6 +269,15 @@ _DIAG_COMMANDS: dict[str, list[str]] = {
     # and, crucially, surfaces whether uploads are actually ENABLED, since a plain
     # connection test passes even when NETMON_SFTP_ENABLED=false (the footgun).
     "diag-sftp-test": ["python", "-m", "collector", "upload-test"],
+    # Sniff 802.1Q tags on the box's uplink (auto-detected) to discover which
+    # VLANs a trunk carries — feeds the dashboard's VLAN picker. Read-only.
+    "diag-detect-vlans": [
+        "sh", "-c",
+        "iface=$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}'); "
+        "if [ -n \"$iface\" ]; then echo \"sniffing $iface for 802.1Q tags (~8s)…\"; "
+        "python -m collector detect-vlans \"$iface\" --seconds 8; "
+        "else echo 'no default-route interface to sniff'; fi",
+    ],
     "diag-selftest": ["python", "-m", "collector", "selftest"],
 }
 
@@ -276,6 +294,7 @@ _HOST_ACTIONS: set[str] = {
     "host-rebuild",   # rebuild collector image + recreate (keeps DB/config/logs)
     "host-reboot",    # systemctl reboot the box
     "host-rollback",  # scripts/rollback.sh -> last-known-good SHA + image + DB
+    "host-apply-vlan", # apply NETMON_TRUNK_* netplan sub-interfaces (lib/trunk.sh)
 }
 
 # State-changing "remote console" actions (CON-5). SAME safety model as

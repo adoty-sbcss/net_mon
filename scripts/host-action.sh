@@ -79,6 +79,24 @@ run_action() {
                 return 1
             fi
             ;;
+        apply-vlan|host-apply-vlan)
+            log "ACTION apply-vlan: build VLAN sub-interfaces from NETMON_TRUNK_* (netplan, routes-off)"
+            # Subshell so the sourced libs (which redefine log/ok/warn) don't clobber
+            # this script's own logging. apply_vlan_netplan_headless is guarded —
+            # it auto-reverts if the box's default route is lost.
+            (
+                for lib in common.sh paths.sh envfile.sh trunk.sh; do
+                    # shellcheck source=/dev/null
+                    [ -f "$REPO_DIR/lib/$lib" ] && . "$REPO_DIR/lib/$lib"
+                done
+                t_parent="$(current_value NETMON_TRUNK_PARENT 2>/dev/null || true)"
+                t_vlans="$(current_value NETMON_TRUNK_VLANS 2>/dev/null || true)"
+                t_statics="$(current_value NETMON_TRUNK_STATICS 2>/dev/null || true)"
+                [ -z "$t_vlans" ] && { echo "NETMON_TRUNK_VLANS empty — nothing to apply"; exit 1; }
+                [ -z "$t_parent" ] && t_parent="$(_trunk_default_parent)"
+                apply_vlan_netplan_headless "$t_parent" "$t_vlans" "$t_statics"
+            ) 2>&1 | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done
+            ;;
         *)
             log "REFUSED unknown host action: '$action' (not in allow-list)"
             return 1
