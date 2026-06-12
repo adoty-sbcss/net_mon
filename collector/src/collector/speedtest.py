@@ -4,6 +4,12 @@ Cloudflare-only: a lightweight, dependency-free probe against
 speed.cloudflare.com using the stdlib (urllib) — parallel time-boxed
 download/upload streams + a latency/jitter sample.
 
+Practical ceiling: ~1 Gbps. This is a stdlib/urllib + thread-pool probe, so on
+multi-Gig links it becomes CPU-bound and under-reports — and it measures to
+Cloudflare's shared public edge, not the provisioned line rate. For 1–10 Gbps
+validation use iperf3 (the internal-throughput path) against a high-capacity
+server, not this WAN reachability/approx-speed check.
+
 The Ookla CLI provider was removed (2026-06-11): its binary couldn't be reliably
 installed on field boxes that build their image behind school egress filtering,
 and speedtest.net's servers are themselves frequently blocked by school content
@@ -33,7 +39,7 @@ def _empty(provider: str, error: str) -> dict:
     return {"ok": False, "provider": provider, "error": error[:500]}
 
 
-def run_cloudflare(duration: int = 5, streams: int = 8, timeout: int = 60) -> dict:
+def run_cloudflare(duration: int = 5, streams: int = 16, timeout: int = 60) -> dict:
     """Lightweight Cloudflare probe (stdlib only): latency/jitter + time-boxed
     parallel download/upload throughput against speed.cloudflare.com."""
     import ssl
@@ -72,7 +78,9 @@ def run_cloudflare(duration: int = 5, streams: int = 8, timeout: int = 60) -> di
         # Cloudflare 403s very large single /__down requests (100MB is rejected;
         # ≤50MB is served). Request a safe size and RE-REQUEST until the time
         # window closes, so a fast link still saturates the measurement window.
-        per_req = 25_000_000
+        # 50MB (the served max) + many parallel streams pushes the ceiling toward
+        # ~1 Gbps; past that this stdlib/urllib probe is CPU-bound — use iperf3.
+        per_req = 50_000_000
         try:
             while time.monotonic() < deadline:
                 with _get(f"{base}/__down?bytes={per_req}", timeout) as r:
@@ -138,5 +146,5 @@ def run_speedtest(provider: str = "cloudflare", **kwargs) -> dict:
     provider value runs the Cloudflare probe."""
     return run_cloudflare(
         duration=int(kwargs.get("duration") or 5),
-        streams=int(kwargs.get("streams") or 8),
+        streams=int(kwargs.get("streams") or 16),
     )
