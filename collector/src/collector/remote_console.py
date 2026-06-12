@@ -4,11 +4,17 @@ When the dashboard queues an `open-console` command, the check-in handler spawns
 a DETACHED subprocess running this module (`python -m collector console-session`).
 It dials OUT to the zero-secret tunnel broker over WSS (443), authenticates with
 the one-time session token, then services allow-listed commands the operator
-sends, streaming output back. Restricted-command posture: ONLY ids in
-`_DIAG_COMMANDS` (read-only) or `_CONTROL_COMMANDS` (state-changing, CON-5) run —
-this module is the source of truth and re-validates every id the broker forwards.
-Both registries are FIXED argv (no shell, no operator input); control actions are
-in-container scope only and the dashboard gates them behind a confirm + audit.
+sends, streaming output back. Restricted-command posture: only ids the sensor
+re-validates run —
+  - `_DIAG_COMMANDS` (read-only) + `_CONTROL_COMMANDS` (state-changing, CON-5):
+    FIXED argv, no shell, no operator input; run inline, bounded to ~20s.
+  - `_LIVE_OPS` (in-container operational: run-scan / upload-now / config-backup /
+    collect-logs): reuse the SAME handlers the queued path uses (`_run_command`),
+    run in a worker THREAD so a slow op (e.g. a full scan) doesn't block the recv
+    loop's keepalive and trip the broker's idle timer.
+HOST-level actions (restart/rebuild/reboot/rollback) + code `update` are NOT here:
+they need the host wrapper's exit-code path and stay on the queued near-live path.
+This module is the source of truth and re-validates every id the broker forwards.
 
 The session is bounded three ways: the broker's idle + 15-min time-box, the
 dashboard kill-switch (broker drops us), and our own hard ceiling below.
@@ -18,11 +24,12 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import time
 
 import structlog
 
-from .checkin import _CONTROL_COMMANDS, _DIAG_COMMANDS
+from .checkin import _CONTROL_COMMANDS, _DIAG_COMMANDS, _LIVE_OPS, _run_command
 
 log = structlog.get_logger(__name__)
 
@@ -84,6 +91,55 @@ def _run_diag_stream(ws, cmd_id: str) -> None:
         _send(ws, {"type": "err", "id": cmd_id, "message": str(exc)})
 
 
+def _op_result_text(cmd_id: str, status: str, result: dict) -> str:
+    """Render a queued-command result dict as terminal-friendly text for the live
+    console. Mirrors the cases `_run_command` returns so the operator sees a clear
+    one-liner (or log dump for collect-logs) instead of raw JSON."""
+    if not isinstance(result, dict):
+        return f"{status}: {result}"
+    if "error" in result:
+        return f"FAILED: {result['error']}"
+    if cmd_id == "run-scan":
+        return f"scan started — scan_id {result.get('scan_id', '?')}"
+    if cmd_id == "upload-now":
+        return f"upload: {result.get('status', status)}"
+    if cmd_id == "config-backup":
+        return f"config backup uploaded → {result.get('remote', '?')}"
+    if cmd_id == "collect-logs":
+        # result is {filename: contents, ...}
+        return "\n".join(f"=== {k} ===\n{v}" for k, v in result.items()) or "(no logs)"
+    return json.dumps(result, default=str)
+
+
+def _run_op_async(ws, cmd_id: str) -> None:
+    """Run an in-container operational command (run-scan / upload-now / etc.) in a
+    worker thread, streaming begin/out/exit. Threaded so the recv loop keeps
+    pinging the broker while a slow op runs (websocket-client send is thread-safe
+    with enable_multithread=True)."""
+
+    def worker() -> None:
+        _send(ws, {"type": "begin", "id": cmd_id})
+        t0 = time.monotonic()
+        try:
+            status, result = _run_command(cmd_id)
+            text = _op_result_text(cmd_id, status, result)[-OUTPUT_CAP:]
+            for i in range(0, len(text), CHUNK):
+                _send(ws, {"type": "out", "id": cmd_id, "data": text[i : i + CHUNK]})
+            _send(
+                ws,
+                {
+                    "type": "exit",
+                    "id": cmd_id,
+                    "code": 0 if status in ("done", "scheduled") else 1,
+                    "ms": int((time.monotonic() - t0) * 1000),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            _send(ws, {"type": "err", "id": cmd_id, "message": str(exc)})
+
+    threading.Thread(target=worker, name=f"console-op-{cmd_id}", daemon=True).start()
+
+
 def run_console_session(broker: str, token: str, sid: str) -> int:
     """Connect to the broker and service the operator's commands until it ends."""
     try:
@@ -126,7 +182,10 @@ def run_console_session(broker: str, token: str, sid: str) -> int:
             ftype = frame.get("type")
             if ftype == "cmd":
                 cmd_id = str(frame.get("id") or "")
-                _run_diag_stream(ws, cmd_id)
+                if cmd_id in _LIVE_OPS:
+                    _run_op_async(ws, cmd_id)  # threaded: long ops don't block recv
+                else:
+                    _run_diag_stream(ws, cmd_id)  # fast fixed-argv, inline
             elif ftype == "closed":
                 log.info("remote console: broker closed session", sid=sid)
                 break

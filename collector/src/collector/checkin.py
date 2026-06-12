@@ -291,6 +291,20 @@ _CONTROL_COMMANDS: dict[str, list[str]] = {
     "ctl-flush-arp": ["ip", "-s", "neigh", "flush", "all"],
 }
 
+# In-container OPERATIONAL commands that the live console may run directly (not
+# fixed-argv — they reuse the rich `_run_command` handlers below). Safe to run
+# from the detached console-session process because they execute entirely inside
+# the container (no host privileges, no exit-code signalling needed). HOST-level
+# actions + code `update` are deliberately excluded: those need the host wrapper's
+# exit-code path, so they stay on the queued near-live path. Mirrored by the
+# broker allow-list + the dashboard's CONSOLE_OP_COMMANDS. Vet additions with security.
+_LIVE_OPS: set[str] = {
+    "run-scan",       # force an immediate discovery scan
+    "upload-now",     # build + ship the latest hour's bundle now
+    "config-backup",  # snapshot + upload the collector config now
+    "collect-logs",   # gather recent logs and return them inline
+}
+
 
 def _run_diag(command: str) -> tuple[str, dict]:
     """Run an allow-listed, fixed-argv diagnostic or control action; bounded output."""
