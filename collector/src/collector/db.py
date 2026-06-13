@@ -377,7 +377,12 @@ def insert_topology(scan_run_id: int, nodes: list[dict[str, Any]], edges: list[d
                         n.get("capabilities") or None,
                         # CORE-2: per-interface health + STP port roles ride in `extra`
                         # (existing jsonb column — no migration). Empty when none collected.
-                        json.dumps({"interfaces": n.get("interfaces") or {}}),
+                        # PERF-3: the resolved uplink's octet-counter sample rides
+                        # alongside as `uplink` (present only on spine-crawled switches).
+                        json.dumps({
+                            "interfaces": n.get("interfaces") or {},
+                            "uplink": n.get("uplink"),
+                        }),
                     ),
                 )
             for e in edges:

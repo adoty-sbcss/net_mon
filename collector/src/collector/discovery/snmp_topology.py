@@ -131,6 +131,11 @@ IF_IN_ERRORS         = "1.3.6.1.2.1.2.2.1.14"       # ifInErrors
 IF_OUT_ERRORS        = "1.3.6.1.2.1.2.2.1.20"       # ifOutErrors
 IF_NAME              = "1.3.6.1.2.1.31.1.1.1.1"     # ifName (ifXTable)
 IF_HIGH_SPEED        = "1.3.6.1.2.1.31.1.1.1.15"    # ifHighSpeed (Mbps)
+# PERF-3: 64-bit octet counters, sampled ONLY for the resolved uplink ifIndex so
+# the dashboard can compute utilization (counter deltas across scans) vs an
+# admin-set committed/provisioned rate. HC (Counter64) avoids 32-bit wrap at speed.
+IF_HC_IN_OCTETS      = "1.3.6.1.2.1.31.1.1.1.6"     # ifHCInOctets  (ifXTable)
+IF_HC_OUT_OCTETS     = "1.3.6.1.2.1.31.1.1.1.10"    # ifHCOutOctets (ifXTable)
 
 _STP_STATE = {
     "1": "disabled", "2": "blocking", "3": "listening",
@@ -349,6 +354,17 @@ def crawl(
             uplink_ifindex = _resolve_uplink_ifindex(ip, community, gateway_mac)
             if uplink_ifindex is not None:
                 stat_uplink_resolved += 1
+                # PERF-3: sample the uplink's octet counters for utilization.
+                # Best-effort — never fail the crawl over an enrichment GET.
+                try:
+                    iface = (node.get("interfaces") or {}).get(str(uplink_ifindex))
+                    uplink_rec = _collect_uplink_counters(
+                        ip, community, uplink_ifindex, iface,
+                    )
+                    if uplink_rec:
+                        node["uplink"] = uplink_rec
+                except Exception:  # noqa: BLE001
+                    log.debug("uplink counter collect failed", ip=ip)
             else:
                 stat_uplink_ambiguous += 1
         fanout = 0  # neighbors enqueued from THIS device (fanout_cap backstop)
@@ -786,3 +802,31 @@ def _collect_interface_health(ip: str, community: str) -> dict[str, dict]:
             rec["stp_state"] = stp
         out[ifidx] = rec
     return out
+
+
+def _collect_uplink_counters(
+    ip: str, community: str, ifindex: int, iface: dict | None,
+) -> dict | None:
+    """PERF-3: sample the uplink interface's 64-bit octet counters + a wall-clock
+    timestamp so the dashboard can compute uplink utilization (counter deltas
+    across scans) against an admin-set committed rate.
+
+    Only the single resolved uplink ifIndex is sampled (two targeted GETs), not
+    the whole table. `iface` is this ifIndex's health record (for name/speed, if
+    already collected). Returns None when neither counter is readable.
+    """
+    idx = str(ifindex)
+    in_oct = _as_int(_snmp_get(ip, community, f"{IF_HC_IN_OCTETS}.{idx}"))
+    out_oct = _as_int(_snmp_get(ip, community, f"{IF_HC_OUT_OCTETS}.{idx}"))
+    if in_oct is None and out_oct is None:
+        return None
+    rec: dict = {
+        "ifindex": ifindex,
+        "in_octets": in_oct,
+        "out_octets": out_oct,
+        "counter_ts": time.time(),  # epoch seconds at sample time
+    }
+    if iface:
+        rec["name"] = iface.get("name")
+        rec["speed_mbps"] = iface.get("speed_mbps")
+    return rec
