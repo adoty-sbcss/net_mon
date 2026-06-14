@@ -35,6 +35,7 @@ across both polling AND topology crawl.
 """
 from __future__ import annotations
 
+import re
 import shutil
 import time
 from typing import Any
@@ -137,6 +138,22 @@ IF_HIGH_SPEED        = "1.3.6.1.2.1.31.1.1.1.15"    # ifHighSpeed (Mbps)
 IF_HC_IN_OCTETS      = "1.3.6.1.2.1.31.1.1.1.6"     # ifHCInOctets  (ifXTable)
 IF_HC_OUT_OCTETS     = "1.3.6.1.2.1.31.1.1.1.10"    # ifHCOutOctets (ifXTable)
 
+# INV: extra per-port detail for the device page — operator port label, admin
+# (config) state, and negotiated duplex. All indexed by ifIndex like the above.
+IF_ALIAS             = "1.3.6.1.2.1.31.1.1.1.18"    # ifAlias (operator description)
+IF_ADMIN_STATUS      = "1.3.6.1.2.1.2.2.1.7"        # ifAdminStatus
+DOT3_DUPLEX          = "1.3.6.1.2.1.10.7.2.1.19"    # dot3StatsDuplexStatus (EtherLike-MIB)
+
+# INV: PoE — POWER-ETHERNET-MIB (RFC 3621), pethPsePortTable. Indexed by
+# (pethPsePortGroupIndex, pethPsePortIndex) i.e. "group.port", NOT ifIndex — there
+# is no standard PsePort->ifIndex OID, so we best-effort join via ifName below.
+PETH_ADMIN           = "1.3.6.1.2.1.105.1.1.1.1.3"  # pethPsePortAdminEnable (TruthValue)
+PETH_DETECT          = "1.3.6.1.2.1.105.1.1.1.1.6"  # pethPsePortDetectionStatus
+PETH_CLASS           = "1.3.6.1.2.1.105.1.1.1.1.7"  # pethPsePortPowerClassifications
+# Per-port consumed power (mW). Vendor-specific (best-effort): Cisco
+# CISCO-POWER-ETHERNET-EXT-MIB AUGMENTS pethPsePortTable so it shares the index.
+CPE_EXT_PWR          = "1.3.6.1.4.1.9.9.402.1.2.1.7"  # cpeExtPsePortPwrConsumption (mW)
+
 _STP_STATE = {
     "1": "disabled", "2": "blocking", "3": "listening",
     "4": "learning", "5": "forwarding", "6": "broken",
@@ -145,6 +162,15 @@ _IF_OPER = {
     "1": "up", "2": "down", "3": "testing", "4": "unknown",
     "5": "dormant", "6": "notPresent", "7": "lowerLayerDown",
 }
+_IF_ADMIN = {"1": "up", "2": "down", "3": "testing"}
+_DUPLEX = {"1": "unknown", "2": "half", "3": "full"}
+# pethPsePortDetectionStatus (RFC 3621)
+_PETH_DETECT = {
+    "1": "disabled", "2": "searching", "3": "deliveringPower",
+    "4": "fault", "5": "test", "6": "otherFault",
+}
+# pethPsePortPowerClassifications (RFC 3621): class0(1)..class4(5)
+_PETH_CLASS = {"1": "class0", "2": "class1", "3": "class2", "4": "class3", "5": "class4"}
 # Cap interfaces recorded per switch so a big chassis can't bloat the bundle.
 _IFACE_CAP = 400
 
@@ -767,16 +793,20 @@ def _as_int(v: str | None) -> int | None:
 def _collect_interface_health(ip: str, community: str) -> dict[str, dict]:
     """Per-interface health for a polled switch (MAP-4) + STP port role (MAP-3).
 
-    Keyed by ifIndex: {name, speed_mbps, oper_status, in_errors, out_errors,
-    stp_state?}. Returns {} when the box exposes no ifName (not a switch / no
-    SNMP view) so older boxes + endpoints stay empty. Bounded by _IFACE_CAP.
-    Utilization needs counter deltas across scans — a follow-up, not here.
+    Keyed by ifIndex: {name, alias?, speed_mbps, oper_status, admin_status?,
+    duplex?, in_errors, out_errors, stp_state?, poe?}. Returns {} when the box
+    exposes no ifName (not a switch / no SNMP view) so older boxes + endpoints
+    stay empty. Bounded by _IFACE_CAP. Utilization needs counter deltas across
+    scans — a follow-up, not here.
     """
     names = _walk_col(ip, community, IF_NAME)
     if not names:
         return {}
     speeds = _walk_col(ip, community, IF_HIGH_SPEED)
     oper = _walk_col(ip, community, IF_OPER_STATUS)
+    admin = _walk_col(ip, community, IF_ADMIN_STATUS)
+    alias = _walk_col(ip, community, IF_ALIAS)
+    duplex = _walk_col(ip, community, DOT3_DUPLEX)
     in_err = _walk_col(ip, community, IF_IN_ERRORS)
     out_err = _walk_col(ip, community, IF_OUT_ERRORS)
 
@@ -792,16 +822,104 @@ def _collect_interface_health(ip: str, community: str) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for ifidx, raw_name in list(names.items())[:_IFACE_CAP]:
         rec: dict = {"name": _strip_quotes(raw_name) or raw_name}
+        al = _strip_quotes(alias.get(ifidx))
+        if al:
+            rec["alias"] = al
         rec["speed_mbps"] = _as_int(speeds.get(ifidx))
         op = (oper.get(ifidx) or "").strip()
         rec["oper_status"] = _IF_OPER.get(op, op or None)
+        ad = (admin.get(ifidx) or "").strip()
+        if ad:
+            rec["admin_status"] = _IF_ADMIN.get(ad, ad)
+        dx = (duplex.get(ifidx) or "").strip()
+        if dx:
+            rec["duplex"] = _DUPLEX.get(dx, dx)
         rec["in_errors"] = _as_int(in_err.get(ifidx))
         rec["out_errors"] = _as_int(out_err.get(ifidx))
         stp = stp_by_ifindex.get(ifidx)
         if stp:
             rec["stp_state"] = stp
         out[ifidx] = rec
+
+    # INV: PoE — best-effort join of the (group.port)-keyed PoE table onto ifIndex.
+    poe = _collect_poe(ip, community)
+    if poe:
+        unmatched = _attach_poe(out, poe)
+        if unmatched:
+            log.debug("poe ports unmatched to ifindex",
+                      ip=ip, unmatched=unmatched, poe_total=len(poe))
     return out
+
+
+def _collect_poe(ip: str, community: str) -> dict[str, dict]:
+    """PoE per PSE port from POWER-ETHERNET-MIB, keyed by "group.port".
+
+    {admin: bool, status: str, class: str, power_w: float?}. Empty when the box
+    isn't PoE / doesn't expose the MIB. power_w is best-effort (Cisco watts).
+    """
+    admin = _walk_col(ip, community, PETH_ADMIN)
+    detect = _walk_col(ip, community, PETH_DETECT)
+    pclass = _walk_col(ip, community, PETH_CLASS)
+    if not (admin or detect or pclass):
+        return {}
+    watts = _walk_col(ip, community, CPE_EXT_PWR)  # best-effort, Cisco-only
+    out: dict[str, dict] = {}
+    for key in set(admin) | set(detect) | set(pclass):
+        rec: dict = {}
+        av = (admin.get(key) or "").strip().lower()
+        if av:
+            rec["admin"] = av in ("1", "true", "true(1)")
+        st = (detect.get(key) or "").strip()
+        status = _PETH_DETECT.get(st, st or None)
+        if status:
+            rec["status"] = status
+        cl = (pclass.get(key) or "").strip()
+        klass = _PETH_CLASS.get(cl, cl or None)
+        if klass:
+            rec["class"] = klass
+        mw = _as_int(watts.get(key))
+        if mw is not None:
+            rec["power_w"] = round(mw / 1000.0, 1)
+        if rec:
+            out[key] = rec
+    return out
+
+
+def _attach_poe(interfaces: dict[str, dict], poe: dict[str, dict]) -> int:
+    """Best-effort map PoE rows (keyed "group.port") onto interface records by
+    matching the numbers parsed from each ifName — there is no standard
+    PsePort->ifIndex OID. Mutates `interfaces`; returns the count of PoE rows
+    that couldn't be matched to an ifIndex (logged by the caller)."""
+    tokens: list[tuple[list[int], str]] = []
+    for ifidx, rec in interfaces.items():
+        nums = [int(n) for n in re.findall(r"\d+", rec.get("name") or "")]
+        if nums:
+            tokens.append((nums, ifidx))
+    unmatched = 0
+    for key, prec in poe.items():
+        parts = key.split(".")
+        try:
+            grp, port = int(parts[0]), int(parts[1])
+        except (IndexError, ValueError):
+            unmatched += 1
+            continue
+        match: str | None = None
+        # 1) ifName ends with the PoE port AND contains the group earlier
+        #    (e.g. "GigabitEthernet1/0/12" -> tokens [1,0,12] matches group 1 port 12).
+        for nums, ifidx in tokens:
+            if nums[-1] == port and grp in nums[:-1]:
+                match = ifidx
+                break
+        # 2) single interface whose ifName ends with the port (single-group box).
+        if match is None:
+            cands = [ifidx for nums, ifidx in tokens if nums[-1] == port]
+            if len(cands) == 1:
+                match = cands[0]
+        if match is not None:
+            interfaces[match]["poe"] = prec
+        else:
+            unmatched += 1
+    return unmatched
 
 
 def _collect_uplink_counters(
