@@ -12,7 +12,13 @@ from typing import Any
 import structlog
 
 from .config import get_settings
-from .db import fetch_scan, fetch_table_for_scan, inventory_counts, list_inventory
+from .db import (
+    fetch_scan,
+    fetch_table_for_scan,
+    inventory_counts,
+    list_inventory,
+    list_snmp_credentials,
+)
 from .prompts import get_bundle_readme, get_bundle_readme_hourly
 
 log = structlog.get_logger(__name__)
@@ -88,6 +94,11 @@ def build_hourly_bundle(
         z.writestr("inventory.csv", _inventory_csv(inventory))
         z.writestr("inventory.json", json.dumps(
             {"counts": inv_counts, "devices": inventory},
+            indent=2, default=_default))
+        # Per-device SNMP credential cache (which read community works per device)
+        # — box-global, so it lives once at the bundle root like inventory.
+        z.writestr("snmp_credentials.json", json.dumps(
+            {"devices": list_snmp_credentials()},
             indent=2, default=_default))
         for sid in scan_ids:
             payload = _scan_payload(sid)

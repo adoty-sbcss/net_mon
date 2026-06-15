@@ -227,6 +227,23 @@ def get_snmp_credential(device_ip: str) -> dict[str, Any] | None:
             return cur.fetchone()
 
 
+def list_snmp_credentials() -> list[dict[str, Any]]:
+    """Every cached per-device SNMP credential, for the bundle → dashboard device
+    page ("which community works on this device"). Includes devices that never
+    succeeded (community NULL) so the UI can show SNMP history."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT device_ip, community, version, last_succeeded_at,
+                       last_attempt_at, failure_count
+                  FROM snmp_credentials
+                 ORDER BY device_ip
+                """
+            )
+            return list(cur.fetchall())
+
+
 def record_snmp_success(device_ip: str, community: str, version: str = "2c") -> None:
     """Record a working community for a device. Resets failure counter."""
     with connect() as conn:
