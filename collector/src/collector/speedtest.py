@@ -52,7 +52,7 @@ def run_cloudflare(duration: int = 5, streams: int = 16, timeout: int = 60) -> d
     ctx = ssl.create_default_context()
     dur = max(2, min(int(duration or 5), 20))
 
-    def _get(url: str, timeout_s: int) -> "urllib.request.addinfourl":
+    def _get(url: str, timeout_s: int):
         # A real User-Agent is required — Cloudflare blocks Python-urllib's default.
         return urllib.request.urlopen(
             urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA}),
