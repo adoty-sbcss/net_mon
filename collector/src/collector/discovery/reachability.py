@@ -29,6 +29,7 @@ _IPV4 = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
 _LOSS = re.compile(r"(\d+(?:\.\d+)?)%\s*packet loss")
 _RTT_AVG = re.compile(r"=\s*[\d.]+/([\d.]+)/")
 _FLOAT_MS = re.compile(r"([\d.]+)\s*ms")
+_HOP = re.compile(r"^(\d+)\s+(.*)$")  # traceroute hop line: "<n>  <rest>"
 
 
 def probe(
@@ -141,7 +142,7 @@ def _traceroute(ip: str, *, max_hops: int, wait: int) -> tuple[list[dict[str, An
     reached_at: int | None = None
     for line in res.stdout.splitlines():
         line = line.strip()
-        m = re.match(r"^(\d+)\s+(.*)$", line)
+        m = _HOP.match(line)
         if not m:
             continue  # the "traceroute to ..." header
         hop_num = int(m.group(1))

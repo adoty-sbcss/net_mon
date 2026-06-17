@@ -11,7 +11,7 @@ import structlog
 from .config import get_settings
 from .db import (
     complete_scan_run,
-    get_snmp_credential,
+    get_snmp_credentials,
     insert_many,
     insert_scan_run,
     last_topology_crawl,
@@ -376,9 +376,13 @@ def _probe_reachability(
 
     snmp_ok = {p.get("device_ip") for p in snmp_results}
 
+    # Cached SNMP credentials for the whole candidate set in ONE query (was a
+    # fresh DB connection per candidate IP).
+    creds = get_snmp_credentials(list(candidate_ips))
+
     targets: list[dict[str, Any]] = []
     for ip in candidate_ips:
-        cred = get_snmp_credential(ip)
+        cred = creds.get(ip)
         responded = (ip in snmp_ok) or bool(cred and cred.get("community"))
         if ip == gateway_ip:
             source = "gateway"

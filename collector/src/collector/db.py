@@ -227,6 +227,27 @@ def get_snmp_credential(device_ip: str) -> dict[str, Any] | None:
             return cur.fetchone()
 
 
+def get_snmp_credentials(device_ips: list[str]) -> dict[str, dict[str, Any]]:
+    """Batch form of get_snmp_credential: cached creds for many devices in ONE
+    round-trip (a single connection), keyed by device_ip. Devices we've never
+    tried are simply absent. Avoids opening a fresh psycopg connection per
+    candidate during a scan."""
+    if not device_ips:
+        return {}
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT device_ip, community, version, last_succeeded_at,
+                       last_attempt_at, failure_count
+                  FROM snmp_credentials
+                 WHERE device_ip = ANY(%s)
+                """,
+                (list(device_ips),),
+            )
+            return {r["device_ip"]: r for r in cur.fetchall()}
+
+
 def list_snmp_credentials() -> list[dict[str, Any]]:
     """Every cached per-device SNMP credential, for the bundle → dashboard device
     page ("which community works on this device"). Includes devices that never
