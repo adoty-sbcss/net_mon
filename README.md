@@ -2,6 +2,8 @@
 
 Plug an Ubuntu box into a network, collect everything about it, ship the data to your SFTP server every hour. Upload the ZIPs to Claude for analysis.
 
+> **New here?** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the whole-system picture — sensor → SFTP → dashboard ingest/analysis, the provisioning flow, and the remote-console broker — as diagrams.
+
 ---
 
 ## Where things live
