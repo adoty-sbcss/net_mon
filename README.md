@@ -2,7 +2,7 @@
 
 Plug an Ubuntu box into a network, collect everything about it, ship the data to your SFTP server every hour. Upload the ZIPs to Claude for analysis.
 
-> **New here?** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the whole-system picture — sensor → SFTP → dashboard ingest/analysis, the provisioning flow, and the remote-console broker — as diagrams.
+> **Want the whole-system picture?** The architecture diagrams — sensor → SFTP → dashboard ingest/analysis, provisioning, and the remote-console broker — live in the dashboard repo: [netmon-dashboard/docs/ARCHITECTURE.md](https://github.com/adoty-sbcss/netmon-dashboard/blob/main/docs/ARCHITECTURE.md).
 
 ---
 
