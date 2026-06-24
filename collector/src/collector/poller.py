@@ -7,13 +7,14 @@ import time
 import structlog
 
 from .config import get_settings
-from .db import recent_network_scan
+from .db import purge_old_scans, recent_network_scan
 from .discovery import interfaces as iface_mod
 from .scan import _vlan_of, run_scan
 
 log = structlog.get_logger(__name__)
 
 _stop = False
+_last_purge: float | None = None
 
 
 def _handle_signal(signum, frame):  # noqa: ANN001
@@ -27,6 +28,26 @@ def _network_id(gateway_mac: str | None, cidr: str | None) -> str | None:
         return None
     key = f"{gateway_mac or 'no-gw'}|{cidr}"
     return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def _maybe_purge(settings) -> None:  # noqa: ANN001
+    """Local-DB retention: at most once/day, drop scan_runs (and cascaded per-scan
+    tables) older than the configured window so the collector's own Postgres can't
+    grow unbounded. A restart just runs it once on the next tick — harmless."""
+    global _last_purge
+    if settings.local_retention_days <= 0:
+        return
+    now = time.monotonic()
+    if _last_purge is not None and (now - _last_purge) < 24 * 3600:
+        return
+    _last_purge = now
+    try:
+        n = purge_old_scans(settings.local_retention_days)
+        if n:
+            log.info("local retention: purged old scans",
+                     deleted=n, retention_days=settings.local_retention_days)
+    except Exception as exc:  # pragma: no cover — keep loop alive
+        log.warning("local retention purge failed", error=str(exc))
 
 
 def run_poller() -> None:
@@ -68,6 +89,7 @@ def tick() -> None:
     scan record but not scanned any differently.
     """
     settings = get_settings()
+    _maybe_purge(settings)
     states = iface_mod.snapshot(exclude_prefixes=settings.exclude_prefixes)
     primary = iface_mod.primary_interface()
 

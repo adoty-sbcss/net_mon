@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     # Anti-flap floor only: never scan the same network twice within this many
     # seconds, even if something asks. Much smaller than rescan_interval.
     cooldown_seconds: int = Field(default=300, alias="NETMON_COOLDOWN_SECONDS")
+    # Local Postgres retention: delete scan_runs (+ cascaded per-scan tables)
+    # older than this many days from the COLLECTOR's OWN db. Bundles upload hourly,
+    # so the box only needs recent scans for bundling + the crawl-gate lookups;
+    # without this the local db grows unbounded. The durable inventory survives
+    # (its scan FK is SET NULL, not CASCADE). 0 disables.
+    local_retention_days: int = Field(default=14, alias="NETMON_LOCAL_RETENTION_DAYS")
     exclude_ifaces: str = Field(
         default="lo,docker0,br-,veth,virbr,tun,tap",
         alias="NETMON_EXCLUDE_IFACES",
@@ -90,6 +96,14 @@ class Settings(BaseSettings):
     # a 200-port core can't explode the crawl regardless of depth/time.
     snmp_topology_max_nodes: int = Field(default=600, alias="NETMON_SNMP_TOPOLOGY_MAX_NODES")
     snmp_topology_fanout_cap: int = Field(default=40, alias="NETMON_SNMP_TOPOLOGY_FANOUT_CAP")
+    # How often to walk the HEAVY bulk SNMP OIDs (ifTable, the bridge FDB tables,
+    # ipNetToMediaTable). These are large — one row per interface / learned MAC /
+    # ARP entry — and change slowly, so walking them every hourly scan wastes
+    # compute and bloats the db + bundle. Walked at most once per this interval per
+    # network (default daily); the small identity/STP/port OIDs are still polled
+    # every scan. A manual `./netmon scan` (force=True) always walks them. 0 =
+    # every scan (the old behavior).
+    snmp_bulk_interval: int = Field(default=24 * 3600, alias="NETMON_SNMP_BULK_INTERVAL")
 
     # Release channel (read by scripts/auto-update.sh; reported at check-in so the
     # dashboard rollout view knows each box's channel). 'stable' (default) tracks

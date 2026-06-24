@@ -14,6 +14,8 @@ from .db import (
     get_snmp_credentials,
     insert_many,
     insert_scan_run,
+    last_dns_probe,
+    last_snmp_bulk,
     last_topology_crawl,
     recent_network_scan,
 )
@@ -68,6 +70,37 @@ def _topology_due(net_id: str | None, interval_sec: int) -> bool:
                  network_id=net_id, age_sec=int(age), interval_sec=interval_sec)
         return False
     return True
+
+
+def _snmp_bulk_due(net_id: str | None, interval_sec: int) -> bool:
+    """Whether the HEAVY bulk SNMP OIDs (FDB / ifTable / ARP cache) are due for
+    this network. Mirrors _topology_due: True if disabled (<=0), the network is
+    unknown, we've never walked them, or the last walk was longer ago than
+    interval_sec. Off-cadence scans poll only the small identity/STP/port OIDs."""
+    if interval_sec <= 0 or not net_id:
+        return True
+    last = last_snmp_bulk(net_id)
+    if last is None:
+        return True
+    age = time.time() - last.timestamp()
+    if age < interval_sec:
+        log.info("snmp bulk walk not due, polling identity OIDs only",
+                 network_id=net_id, age_sec=int(age), interval_sec=interval_sec)
+        return False
+    return True
+
+
+def _dns_due(interval_sec: int) -> bool:
+    """Whether box-wide DNS probes are due — run at most once per interval across
+    ALL networks/VLANs (the resolver path is identical, so per-scan is redundant).
+    True if disabled (<=0), never run, or the last run was longer ago than the
+    interval."""
+    if interval_sec <= 0:
+        return True
+    last = last_dns_probe()
+    if last is None:
+        return True
+    return (time.time() - last.timestamp()) >= interval_sec
 
 
 def run_scan(*, interface: str, trigger_reason: str, force: bool,
@@ -167,11 +200,14 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
         log.info("network device candidate set", count=len(snmp_candidates_list),
                  ips=snmp_candidates_list)
 
-        # 7. Optional SNMP polling
+        # 7. Optional SNMP polling. The heavy bulk OIDs (FDB / ifTable / ARP cache)
+        # are gated to a slow cadence (snmp_bulk_interval, default daily) — they
+        # change far slower than the hourly scan; identity OIDs stay every-scan.
         snmp_results: list[dict[str, Any]] = []
         if settings.snmp_enabled and snmp_candidates_list:
+            include_bulk = force or _snmp_bulk_due(net_id, settings.snmp_bulk_interval)
             try:
-                snmp_results = snmp_mod.poll(snmp_candidates_list)
+                snmp_results = snmp_mod.poll(snmp_candidates_list, include_bulk=include_bulk)
                 ctx.raw_outputs["snmp"] = snmp_results
             except Exception as exc:  # pragma: no cover — defensive
                 log.warning("snmp poll failed", error=str(exc))
@@ -210,11 +246,13 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
             except Exception as exc:  # pragma: no cover — defensive
                 log.warning("snmp topology crawl failed", error=str(exc))
 
-        # 7c. DNS health probes. Cheap (~1s of UDP), runs every scan when
-        # enabled. Measures path to public DNS *and* whatever the DHCP/static
-        # config gave us, so we can spot ISP DNS issues and resolver hijacking.
+        # 7c. DNS health probes. Cheap (~1s of UDP). Run at most once per
+        # rescan_interval BOX-WIDE — the resolver path (public list + the box's
+        # resolv.conf) is identical across VLANs/networks, so per-scan probes were
+        # pure duplication. Measures path to public DNS *and* whatever the
+        # DHCP/static config gave us — spots ISP DNS issues + resolver hijacking.
         dns_results: list[dns_mod.DnsProbeResult] = []
-        if settings.dns_enabled:
+        if settings.dns_enabled and (force or _dns_due(settings.rescan_interval)):
             try:
                 dns_results = dns_mod.probe_all()
             except Exception as exc:  # pragma: no cover — defensive

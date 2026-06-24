@@ -100,6 +100,18 @@ DEFAULT_OIDS: list[tuple[str, str, bool]] = [
     ("prtGeneralPrinterName","1.3.6.1.2.1.43.5.1.1.16",   True),
 ]
 
+# The HEAVY bulk OIDs — large (one row per interface / learned MAC / ARP entry)
+# and slow-changing. Gated to a slow cadence (see scan._snmp_bulk_due): when not
+# due, poll() skips these and walks only the small identity / STP / port OIDs.
+# Identity OIDs (sys*, entPhysical*, hrDevice*, printer) stay every-scan so device
+# classification is unaffected.
+BULK_OID_NAMES = frozenset({
+    "ifTable",
+    "ipNetToMediaTable",
+    "dot1dTpFdbTable",
+    "dot1qTpFdbPort",
+})
+
 # Lines net-snmp emits for absent objects — we skip these when parsing walks.
 _SKIP_MARKERS = (
     "No Such Object",
@@ -116,8 +128,11 @@ _SKIP_MARKERS = (
 # ---------------------------------------------------------------------------
 
 
-def poll(candidate_ips: list[str]) -> list[dict[str, Any]]:
-    """Try SNMP against each candidate IP. Returns a flat list of poll rows."""
+def poll(candidate_ips: list[str], include_bulk: bool = True) -> list[dict[str, Any]]:
+    """Try SNMP against each candidate IP. Returns a flat list of poll rows.
+
+    include_bulk=False skips the heavy slow-changing bulk OIDs (BULK_OID_NAMES) —
+    used on scans where the bulk walk isn't due (see scan._snmp_bulk_due)."""
     settings = get_settings()
     if not settings.snmp_enabled:
         return []
@@ -136,9 +151,10 @@ def poll(candidate_ips: list[str]) -> list[dict[str, Any]]:
         community = _select_community(ip, communities)
         if community is None:
             continue
-        out.extend(_poll_oids(ip, community))
+        out.extend(_poll_oids(ip, community, include_bulk=include_bulk))
 
-    log.info("snmp poll complete", candidates=len(candidate_ips), rows=len(out))
+    log.info("snmp poll complete", candidates=len(candidate_ips), rows=len(out),
+             include_bulk=include_bulk)
     return out
 
 
@@ -203,9 +219,11 @@ def _probe(ip: str, community: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _poll_oids(ip: str, community: str) -> list[dict[str, Any]]:
+def _poll_oids(ip: str, community: str, include_bulk: bool = True) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for name, oid, is_walk in DEFAULT_OIDS:
+        if not include_bulk and name in BULK_OID_NAMES:
+            continue  # heavy bulk walk not due this scan
         tool = "snmpbulkwalk" if is_walk else "snmpget"
         rc, out = _run_snmp([
             tool, "-v2c", "-c", community,

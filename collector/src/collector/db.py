@@ -149,6 +149,59 @@ def last_topology_crawl(network_id: str) -> Any | None:
             return row["last_at"] if row else None
 
 
+def last_snmp_bulk(network_id: str) -> Any | None:
+    """started_at of the most recent scan on this network that walked the HEAVY
+    bulk SNMP OIDs (detected via an ifTable row), or None. Gates the bulk walk to
+    a slow cadence — FDB / ifTable / ARP cache change far slower than the hourly
+    host inventory, so re-walking them every scan is wasted compute + db/bundle
+    bloat."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT max(sr.started_at) AS last_at
+                  FROM snmp_polls sp
+                  JOIN scan_runs sr ON sr.id = sp.scan_run_id
+                 WHERE sr.network_id = %s AND sp.oid_name = 'ifTable'
+                """,
+                (network_id,),
+            )
+            row = cur.fetchone()
+            return row["last_at"] if row else None
+
+
+def last_dns_probe() -> Any | None:
+    """started_at of the most recent scan (this box, ANY network) that ran DNS
+    probes, or None. DNS health tests the box's resolver path — identical across
+    VLANs/networks — so it runs at most once per cadence box-wide, not per scan."""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT max(sr.started_at) AS last_at
+                  FROM dns_probes dp
+                  JOIN scan_runs sr ON sr.id = dp.scan_run_id
+                """
+            )
+            row = cur.fetchone()
+            return row["last_at"] if row else None
+
+
+def purge_old_scans(retention_days: int) -> int:
+    """Delete scan_runs (and cascaded per-scan tables) older than retention_days
+    from the collector's local db. The durable inventory survives (its scan FK is
+    SET NULL, not CASCADE). Returns the number of scan_runs deleted; <=0 disables."""
+    if retention_days <= 0:
+        return 0
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM scan_runs WHERE started_at < NOW() - (%s || ' days')::interval",
+                (str(retention_days),),
+            )
+            return cur.rowcount
+
+
 def list_scan_runs_in_window(start, end) -> list[dict[str, Any]]:
     """Scans whose completed_at falls in [start, end). Times must be tz-aware."""
     with connect() as conn:
