@@ -188,6 +188,12 @@ class Settings(BaseSettings):
     iperf_duration: int = Field(default=10, alias="NETMON_IPERF_DURATION")
     iperf_direction: str = Field(default="down", alias="NETMON_IPERF_DIRECTION")
     iperf_protocol: str = Field(default="tcp", alias="NETMON_IPERF_PROTOCOL")
+    # Timezone the multi-schedule cron times are evaluated in (IANA name). The box
+    # OS clock may be UTC, but a schedule says "5am Pacific" — so we evaluate in
+    # this zone via zoneinfo, falling back to box-local if it's unknown. The
+    # per-schedule list itself rides a JSON file (see checkin.IPERF_SCHEDULES_FILE),
+    # not an env var, since its quotes/commas don't survive EnvironmentFile parsing.
+    iperf_timezone: str = Field(default="America/Los_Angeles", alias="NETMON_IPERF_TIMEZONE")
 
     # Public internet speed test (PERF-2). Pushed from the dashboard via desired_config.
     speedtest_enabled: bool = Field(default=False, alias="NETMON_SPEEDTEST_ENABLED")

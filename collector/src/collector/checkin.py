@@ -180,6 +180,12 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_IPERF_DIRECTION"] = str(data.get("iperf_direction") or "down")
     if "iperf_protocol" in data:
         mapping["NETMON_IPERF_PROTOCOL"] = str(data.get("iperf_protocol") or "tcp")
+    if "iperf_timezone" in data:
+        mapping["NETMON_IPERF_TIMEZONE"] = str(data.get("iperf_timezone") or "America/Los_Angeles")
+    # The multi-schedule cron list rides a JSON file, NOT the env file — its
+    # quotes/commas/brackets don't survive systemd EnvironmentFile parsing.
+    if "iperf_schedules" in data:
+        _write_iperf_schedules(data.get("iperf_schedules") or [])
     # Public speed tests (PERF-2) pushed from the dashboard.
     if "speedtest_enabled" in data:
         mapping["NETMON_SPEEDTEST_ENABLED"] = "true" if data.get("speedtest_enabled") else "false"
@@ -492,7 +498,22 @@ def _auto_enroll(settings, url: str) -> str:
     return token
 
 
-IPERF_LAST_FILE = Path("/var/lib/netmon/iperf-last-run")
+# Multi-schedule cron list (pushed from the dashboard) + the per-day "already
+# fired" ledger, both JSON files (not env — see _apply_config).
+IPERF_SCHEDULES_FILE = Path("/var/lib/netmon/iperf-schedules.json")
+IPERF_SLOTS_FILE = Path("/var/lib/netmon/iperf-slots.json")
+# Fire a slot if we check in within this window after its scheduled time (covers
+# the ~10-min check-in gap + a missed beat) — but never run it hours late.
+IPERF_SLOT_GRACE_SEC = 45 * 60
+
+
+def _write_iperf_schedules(schedules: list) -> None:
+    """Persist the pushed iperf schedule list to the JSON file the scheduler reads."""
+    try:
+        IPERF_SCHEDULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        IPERF_SCHEDULES_FILE.write_text(json.dumps(schedules))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not persist iperf schedules", error=str(exc))
 
 
 def _report_iperf(url: str, token: str | None, res: dict, trigger: str) -> None:
@@ -539,34 +560,112 @@ def _run_iperf_command(url: str, token: str | None, args: dict, trigger: str) ->
     return "failed", {"error": res.get("error")}
 
 
+def _load_iperf_schedules() -> list[dict]:
+    try:
+        data = json.loads(IPERF_SCHEDULES_FILE.read_text())
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _load_iperf_slots() -> dict:
+    try:
+        data = json.loads(IPERF_SLOTS_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_iperf_slots(slots: dict) -> None:
+    try:
+        IPERF_SLOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        IPERF_SLOTS_FILE.write_text(json.dumps(slots))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not persist iperf slots", error=str(exc))
+
+
+def _run_iperf_slot(
+    url: str, token: str | None, settings, proto: str, direction: str, duration: int
+) -> None:
+    """Run one scheduled slot. 'both' = a download then an upload (two results)."""
+    from .iperf import run_iperf
+
+    dirs = ["down", "up"] if direction == "both" else [direction]
+    for d in dirs:
+        res = run_iperf(
+            server=settings.iperf_server,
+            port=settings.iperf_port,
+            protocol=proto,
+            direction=d,
+            duration=duration,
+        )
+        _report_iperf(url, token, res, "scheduled")
+
+
 def _maybe_scheduled_iperf(url: str, token: str | None, settings) -> None:
-    """Run a scheduled iperf test if enabled and the interval has elapsed."""
-    import time
+    """Run any iperf schedule whose time-of-day + day-of-week has arrived and that
+    hasn't fired yet today. Cron-style and evaluated in settings.iperf_timezone, so
+    "5am" means 5am there regardless of the box's OS clock; each run is deduped per
+    day via a slot ledger. Schedules are pushed from the dashboard's Speed &
+    Bandwidth / sensor panel and persisted to IPERF_SCHEDULES_FILE."""
+    from datetime import datetime
 
     if not settings.iperf_enabled or not settings.iperf_server:
         return
-    now = time.time()
-    try:
-        last = float(IPERF_LAST_FILE.read_text().strip())
-    except Exception:
-        last = 0.0
-    if now - last < max(300, settings.iperf_schedule_sec):
+    schedules = _load_iperf_schedules()
+    if not schedules:
         return
-    from .iperf import run_iperf
 
-    res = run_iperf(
-        server=settings.iperf_server,
-        port=settings.iperf_port,
-        protocol=settings.iperf_protocol,
-        direction=settings.iperf_direction,
-        duration=settings.iperf_duration,
-    )
-    _report_iperf(url, token, res, "scheduled")
     try:
-        IPERF_LAST_FILE.parent.mkdir(parents=True, exist_ok=True)
-        IPERF_LAST_FILE.write_text(str(now))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not persist iperf last-run", error=str(exc))
+        from zoneinfo import ZoneInfo
+
+        now = datetime.now(ZoneInfo(settings.iperf_timezone))
+    except Exception:  # noqa: BLE001 — unknown zone / no tzdata → box-local clock
+        now = datetime.now().astimezone()
+    weekday = now.weekday()  # Mon=0 .. Sun=6 (matches the dashboard's day indices)
+    today = now.strftime("%Y-%m-%d")
+
+    slots = _load_iperf_slots()
+    fired = False
+    for sched in schedules:
+        if not isinstance(sched, dict):
+            continue
+        day_set = {int(d) for d in (sched.get("days") or []) if isinstance(d, (int, float))}
+        if weekday not in day_set:
+            continue
+        proto = "udp" if sched.get("protocol") == "udp" else "tcp"
+        direction = sched.get("direction") or "down"
+        if direction not in ("down", "up", "both"):
+            direction = "down"
+        try:
+            duration = max(1, min(int(sched.get("duration") or 10), 60))
+        except (TypeError, ValueError):
+            duration = 10
+        for hhmm in sched.get("times") or []:
+            parts = str(hhmm).split(":")
+            if len(parts) != 2:
+                continue
+            try:
+                scheduled = now.replace(
+                    hour=int(parts[0]), minute=int(parts[1]), second=0, microsecond=0
+                )
+            except ValueError:
+                continue  # out-of-range HH/MM
+            delta = (now - scheduled).total_seconds()
+            if delta < 0 or delta > IPERF_SLOT_GRACE_SEC:
+                continue  # not due yet, or too late to be useful
+            slot_key = f"{proto}|{direction}|{hhmm}"
+            if slots.get(slot_key) == today:
+                continue  # already ran this slot today
+            log.info(
+                "running scheduled iperf", protocol=proto, direction=direction, at=str(hhmm)
+            )
+            _run_iperf_slot(url, token, settings, proto, direction, duration)
+            slots[slot_key] = today
+            fired = True
+    if fired:
+        # Keep only today's fires so the ledger doesn't accumulate stale slots.
+        _save_iperf_slots({k: v for k, v in slots.items() if v == today})
 
 
 SPEEDTEST_LAST_FILE = Path("/var/lib/netmon/speedtest-last-run")
