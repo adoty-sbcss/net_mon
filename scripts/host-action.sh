@@ -24,6 +24,7 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
 REQUEST_FILE="/var/lib/netmon/host-action-request"
+RESULT_FILE="/var/lib/netmon/host-action-result"
 LOG_TAG="netmon-host-action"
 
 log() {
@@ -31,6 +32,21 @@ log() {
         logger -t "$LOG_TAG" "$*"
     fi
     printf '[%s] %s\n' "$(date -Iseconds)" "$*"
+}
+
+# Record an action's outcome to a bind-mounted file the in-container agent reports
+# at check-in (checkin.py:_last_host_action) -> the dashboard. Mirrors auto-update.sh's
+# last-update-result so a failed host action (e.g. a VLAN apply that crashed netplan)
+# is visible on the dashboard, not just buried in the box journal.
+write_result() {  # action status reason
+    local a="$1" s="$2" r="${3:-}"
+    r="${r//\\/\\\\}"; r="${r//\"/\\\"}"; r="$(printf '%s' "$r" | tr '\n\t' '  ')"
+    local json
+    json="$(printf '{"action":"%s","status":"%s","reason":"%s","at":"%s"}' \
+        "$a" "$s" "$r" "$(date -Iseconds 2>/dev/null || date)")"
+    printf '%s\n' "$json" > "$RESULT_FILE" 2>/dev/null \
+        || printf '%s\n' "$json" | "${SUDO[@]}" tee "$RESULT_FILE" >/dev/null 2>&1 \
+        || true
 }
 
 # docker compose, with sudo when the runner isn't in the docker group.
@@ -106,8 +122,9 @@ run_action() {
 
 # --- direct single-action invocation --------------------------------------
 if [ "${1:-}" != "--drain" ] && [ -n "${1:-}" ]; then
-    run_action "$1"
-    exit $?
+    run_action "$1"; rc=$?
+    [ "$rc" -eq 0 ] && write_result "$1" "ok" "" || write_result "$1" "failed" "action failed — see logs"
+    exit "$rc"
 fi
 
 # --- drain mode (called by netmon-checkin.sh) -----------------------------
@@ -126,7 +143,12 @@ PENDING="$(cat "$REQUEST_FILE" 2>/dev/null || "${SUDO[@]}" cat "$REQUEST_FILE" 2
 while IFS=$'\t' read -r cid action; do
     [ -z "${action:-}" ] && continue
     log "draining host action id=${cid:-?} action=${action}"
-    run_action "$action" || log "  action '${action}' reported a failure"
+    if run_action "$action"; then
+        write_result "$action" "ok" ""
+    else
+        write_result "$action" "failed" "action failed — run 'collect-logs' or check the box journal"
+        log "  action '${action}' reported a failure"
+    fi
 done <<< "$PENDING"
 
 exit 0

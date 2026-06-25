@@ -824,6 +824,49 @@ def _last_update() -> dict | None:
         return None
 
 
+def _last_host_action() -> dict | None:
+    """Outcome of the last HOST-LEVEL action (apply-vlan / restart / reboot / …),
+    written by scripts/host-action.sh to a bind-mounted file (action/status/reason/at).
+    Host actions run host-side and async, so — exactly like _last_update — this is the
+    only feedback the dashboard gets. Without it, a failed VLAN apply (e.g. the
+    netplan-on-NetworkManager crash) was invisible to the dashboard. Best-effort."""
+    try:
+        raw = Path("/var/lib/netmon/host-action-result").read_text().strip()
+        data = json.loads(raw) if raw else None
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _interfaces() -> list[dict]:
+    """The box's live interface list (name / cidr / up / vlan / primary) so the
+    dashboard can show per-VLAN status PRECISELY — which sub-interfaces actually came
+    up and got a lease — instead of inferring it from scan data alone. Excludes
+    virtual/container NICs. Best-effort: [] on any failure."""
+    try:
+        from .discovery import interfaces as iface_mod
+
+        primary = iface_mod.primary_interface()
+        out: list[dict] = []
+        for st in iface_mod.snapshot(
+            exclude_prefixes=("lo", "docker", "br-", "veth", "virbr", "tun", "tap")
+        ):
+            parent, _, tag = st.name.rpartition(".")
+            vlan = int(tag) if parent and tag.isdigit() and 1 <= int(tag) <= 4094 else None
+            out.append(
+                {
+                    "name": st.name,
+                    "cidr": st.ipv4_addrs[0] if st.ipv4_addrs else None,
+                    "up": bool(st.is_up),
+                    "vlan": vlan,
+                    "primary": st.name == primary,
+                }
+            )
+        return out
+    except Exception:
+        return []
+
+
 def run_console_poll() -> int:
     """Lightweight interactive-command poll (faster-pickup for the live console).
 
@@ -893,9 +936,15 @@ def run_checkin() -> int:
             # Outcome of the last host-side auto-update (so a failed update is
             # visible on the dashboard instead of fire-and-forget).
             "lastUpdate": _last_update(),
+            # Outcome of the last host-level action (apply-vlan / restart / …) so a
+            # failed VLAN apply is visible on the dashboard, not just the box journal.
+            "lastHostAction": _last_host_action(),
             "localIp": local_ip,
             "interface": iface,
             "interfaceCidr": cidr,
+            # Live interface list (uplink + VLAN sub-ifs) so the dashboard shows which
+            # VLANs actually came up + got a lease, not just what was configured.
+            "interfaces": _interfaces(),
             # Sensor self-health (CPU/RAM/disk/OS/uptime) for the dashboard's
             # per-box health view + heartbeat. Best-effort: {} if collection fails.
             "hostMetrics": host_metrics_mod.collect(),
