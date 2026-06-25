@@ -117,8 +117,11 @@ fi
 
 # Snapshot + clear up front so a queued reboot can't strand un-run later lines,
 # and a failing action can't loop forever.
-PENDING="$(cat "$REQUEST_FILE" 2>/dev/null || true)"
-: > "$REQUEST_FILE" 2>/dev/null || rm -f "$REQUEST_FILE" 2>/dev/null || true
+PENDING="$(cat "$REQUEST_FILE" 2>/dev/null || "${SUDO[@]}" cat "$REQUEST_FILE" 2>/dev/null || true)"
+# The agent writes this file from inside the container AS ROOT, so a non-root host
+# runner can't truncate it (Permission denied) — fall back to sudo, else a failed
+# action loops every check-in.
+{ : > "$REQUEST_FILE"; } 2>/dev/null || "${SUDO[@]}" rm -f "$REQUEST_FILE" 2>/dev/null || true
 
 while IFS=$'\t' read -r cid action; do
     [ -z "${action:-}" ] && continue

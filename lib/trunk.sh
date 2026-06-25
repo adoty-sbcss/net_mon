@@ -98,6 +98,100 @@ generate_vlan_netplan() {
     printf '%s' "$f"
 }
 
+# Which backend manages this box's networking? VLAN sub-interfaces render very
+# differently: under systemd-networkd our netplan `vlans:` stanza works, but under
+# NetworkManager `netplan generate` CRASHES (nm.c `vlan_link` assertion) because we
+# deliberately never declare the parent ethernet. So on an NM box we build the VLANs
+# with nmcli (NM-native) instead. Echoes "nm" or "networkd". Same heuristic the
+# wizard already warns on (NetworkManager active, systemd-networkd not).
+_vlan_backend() {
+    if command -v systemctl >/dev/null 2>&1 \
+        && systemctl is-active --quiet NetworkManager 2>/dev/null \
+        && ! systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+        printf 'nm'
+    else
+        printf 'networkd'
+    fi
+}
+
+# Create/refresh VLAN sub-interfaces via NetworkManager (nmcli) — the native path on
+# an NM-managed box, where the netplan vlans: renderer crashes. Each VLAN is its own
+# NM connection `netmon-vlan<id>` on `<parent>.<id>`, DHCP (or a static), with NO
+# default route and DHCP-pushed routes ignored (routes-off, mirroring netplan's
+# use-routes:false) so a monitored VLAN can never hijack the box's uplink. Idempotent:
+# reconciles the set — (re)creates the wanted VLANs, removes our stale ones. Guarded:
+# reverts if the default route disappears. Validated on Monitor1 (NM box) 2026-06-24.
+_apply_vlan_nmcli() {
+    local parent="$1" vlans="$2" statics="${3:-}"
+    if ! command -v nmcli >/dev/null 2>&1; then
+        warn "nmcli not found — cannot configure VLANs on this NetworkManager box."
+        return 1
+    fi
+
+    local before_default after_default
+    before_default="$(ip route show default 2>/dev/null | head -1)"
+
+    local want=" " vid cidr pair conname
+    for vid in ${vlans//,/ }; do
+        [[ "$vid" =~ ^[0-9]+$ ]] || continue
+        vid=$((10#$vid))   # strip leading zeros (avoid octal parsing)
+        (( vid >= 1 && vid <= 4094 )) || continue
+        want+="$vid "
+        conname="netmon-vlan${vid}"
+        cidr=""
+        for pair in ${statics//,/ }; do
+            [[ "$pair" == "${vid}:"* ]] && cidr="${pair#"${vid}":}"
+        done
+        # Recreate idempotently: drop any same-name connection, then add fresh.
+        $SUDO nmcli con delete "$conname" >/dev/null 2>&1 || true
+        if [[ -n "$cidr" ]]; then
+            $SUDO nmcli con add type vlan con-name "$conname" ifname "${parent}.${vid}" \
+                dev "$parent" id "$vid" ipv4.method manual ipv4.addresses "$cidr" \
+                ipv4.never-default yes ipv4.ignore-auto-routes yes ipv6.method ignore \
+                connection.autoconnect yes >/dev/null 2>&1 || true
+        else
+            # may-fail:yes so the sub-interface comes up immediately and DHCP runs in
+            # the BACKGROUND — a VLAN with no DHCP server must not block the apply
+            # (it just gets no lease, surfaced as "no data" on the dashboard).
+            $SUDO nmcli con add type vlan con-name "$conname" ifname "${parent}.${vid}" \
+                dev "$parent" id "$vid" ipv4.method auto ipv4.may-fail yes \
+                ipv4.never-default yes ipv4.ignore-auto-routes yes ipv6.method ignore \
+                connection.autoconnect yes >/dev/null 2>&1 || true
+        fi
+        # --wait caps activation so even a DHCP-less VLAN returns promptly.
+        $SUDO nmcli con up "$conname" --wait 10 >/dev/null 2>&1 || true
+        log "nmcli VLAN ${vid} on ${parent} (${cidr:-dhcp}, routes off)"
+    done
+
+    # Remove netmon-vlan<digits> connections we own that are no longer wanted.
+    local existing evid
+    while IFS= read -r existing; do
+        [[ "$existing" == netmon-vlan* ]] || continue
+        evid="${existing#netmon-vlan}"
+        [[ "$evid" =~ ^[0-9]+$ ]] || continue
+        if [[ " $want " != *" $evid "* ]]; then
+            $SUDO nmcli con delete "$existing" >/dev/null 2>&1 || true
+            $SUDO ip link delete "${parent}.${evid}" >/dev/null 2>&1 || true
+            log "removed stale VLAN connection ${existing}"
+        fi
+    done < <($SUDO nmcli -g NAME con show 2>/dev/null)
+
+    # Connectivity guard (belt-and-suspenders; never-default already blocks hijack).
+    after_default="$(ip route show default 2>/dev/null | head -1)"
+    if [[ -n "$before_default" && -z "$after_default" ]]; then
+        warn "default route lost after VLAN apply — REVERTING the nmcli VLANs."
+        for vid in ${vlans//,/ }; do
+            [[ "$vid" =~ ^[0-9]+$ ]] || continue
+            vid=$((10#$vid))
+            $SUDO nmcli con delete "netmon-vlan${vid}" >/dev/null 2>&1 || true
+            $SUDO ip link delete "${parent}.${vid}" >/dev/null 2>&1 || true
+        done
+        return 1
+    fi
+    ok "VLAN sub-interfaces up via NetworkManager on ${parent} (${vlans}); the collector scans them within a poll tick (~30s)."
+    return 0
+}
+
 # Non-interactive VLAN netplan apply with a connectivity guard — the headless
 # counterpart to prompt_trunk_config's `netplan try` (which needs a TTY). Writes
 # the sub-interface config, validates it, applies, and AUTO-REVERTS if the box's
@@ -109,12 +203,22 @@ apply_vlan_netplan_headless() {
     local parent="$1" vlans="$2" statics="${3:-}"
     local f="$NETMON_VLAN_NETPLAN"
 
-    if ! command -v netplan >/dev/null 2>&1; then
-        warn "netplan not found — cannot configure VLAN sub-interfaces on this box."
-        return 1
-    fi
     if [[ -z "$parent" || -z "$vlans" ]]; then
         warn "VLAN setup: missing parent interface or VLAN list — skipping."
+        return 1
+    fi
+
+    # Backend-aware: a NetworkManager-managed box CANNOT use our netplan vlans:
+    # stanza — `netplan generate` crashes (nm.c vlan_link assertion) because we
+    # never declare the parent. Build the VLANs with nmcli (NM-native) there.
+    if [[ "$(_vlan_backend)" == "nm" ]]; then
+        log "NetworkManager backend — configuring VLANs via nmcli instead of netplan."
+        _apply_vlan_nmcli "$parent" "$vlans" "$statics"
+        return $?
+    fi
+
+    if ! command -v netplan >/dev/null 2>&1; then
+        warn "netplan not found — cannot configure VLAN sub-interfaces on this box."
         return 1
     fi
 
