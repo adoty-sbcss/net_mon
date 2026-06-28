@@ -147,9 +147,13 @@ DOT3_DUPLEX          = "1.3.6.1.2.1.10.7.2.1.19"    # dot3StatsDuplexStatus (Eth
 # INV: PoE — POWER-ETHERNET-MIB (RFC 3621), pethPsePortTable. Indexed by
 # (pethPsePortGroupIndex, pethPsePortIndex) i.e. "group.port", NOT ifIndex — there
 # is no standard PsePort->ifIndex OID, so we best-effort join via ifName below.
-PETH_ADMIN           = "1.3.6.1.2.1.105.1.1.1.1.3"  # pethPsePortAdminEnable (TruthValue)
-PETH_DETECT          = "1.3.6.1.2.1.105.1.1.1.1.6"  # pethPsePortDetectionStatus
-PETH_CLASS           = "1.3.6.1.2.1.105.1.1.1.1.7"  # pethPsePortPowerClassifications
+# pethPsePortEntry = ...105.1.1.1 (index {groupIndex, portIndex}); columns hang
+# directly off it. NOTE: these were ...105.1.1.1.1.<col> (an extra .1, pointing
+# under the groupIndex column) → every walk returned 0, so per-port PoE was
+# silently empty on ALL switches. Corrected to ...105.1.1.1.<col> per RFC 3621.
+PETH_ADMIN           = "1.3.6.1.2.1.105.1.1.1.3"  # pethPsePortAdminEnable (TruthValue)
+PETH_DETECT          = "1.3.6.1.2.1.105.1.1.1.6"  # pethPsePortDetectionStatus
+PETH_CLASS           = "1.3.6.1.2.1.105.1.1.1.7"  # pethPsePortPowerClassifications
 # Per-port consumed power (mW). Vendor-specific (best-effort): Cisco
 # CISCO-POWER-ETHERNET-EXT-MIB AUGMENTS pethPsePortTable so it shares the index.
 CPE_EXT_PWR          = "1.3.6.1.4.1.9.9.402.1.2.1.7"  # cpeExtPsePortPwrConsumption (mW)
