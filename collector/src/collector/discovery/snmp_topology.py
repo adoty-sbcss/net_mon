@@ -783,6 +783,38 @@ def _walk_col(ip: str, community: str, base_oid: str) -> dict[str, str]:
     return out
 
 
+def _walk_columns(
+    ip: str, community: str, col_oids: tuple[str, ...],
+) -> dict[str, dict[str, str]]:
+    """Fetch several single-integer-indexed table columns in ONE snmpbulkwalk.
+
+    All `col_oids` must be columns of the SAME table entry (their OID minus the
+    last component — the column number). We walk that shared entry once and
+    demultiplex by column, returning {column_oid: {index_suffix: value}} — the
+    exact maps `_walk_col` would return one subprocess at a time. PERF: replaces
+    N per-column walks (N process spawns + SNMP sessions) with a single subtree
+    walk on the per-switch interface-health / PoE hot path. Columns we didn't ask
+    for are walked-over-the-wire but dropped, so the output is byte-identical.
+    """
+    bare = {oid: oid.strip(".") for oid in col_oids}
+    entries = {b.rsplit(".", 1)[0] for b in bare.values()}
+    if len(entries) != 1:
+        raise ValueError(
+            f"_walk_columns: OIDs span multiple table entries: {sorted(entries)}"
+        )
+    entry = entries.pop()
+    by_colnum = {b.rsplit(".", 1)[1]: oid for oid, b in bare.items()}
+    result: dict[str, dict[str, str]] = {oid: {} for oid in col_oids}
+    for oid, value in _snmp_walk(ip, community, entry):
+        b = oid.strip(".")
+        if not b.startswith(entry + "."):
+            continue
+        colnum, dot, idx = b[len(entry) + 1:].partition(".")
+        if dot and colnum in by_colnum:
+            result[by_colnum[colnum]][idx] = value
+    return result
+
+
 def _as_int(v: str | None) -> int | None:
     if v is None:
         return None
@@ -799,16 +831,22 @@ def _collect_interface_health(ip: str, community: str) -> dict[str, dict]:
     stay empty. Bounded by _IFACE_CAP. Utilization needs counter deltas across
     scans — a follow-up, not here.
     """
-    names = _walk_col(ip, community, IF_NAME)
+    # ifXTable (name/speed/alias) in ONE walk + ifTable (oper/admin/errors) in
+    # ONE walk, instead of 7 per-column subprocess walks (see _walk_columns).
+    ifx = _walk_columns(ip, community, (IF_NAME, IF_HIGH_SPEED, IF_ALIAS))
+    names = ifx[IF_NAME]
     if not names:
         return {}
-    speeds = _walk_col(ip, community, IF_HIGH_SPEED)
-    oper = _walk_col(ip, community, IF_OPER_STATUS)
-    admin = _walk_col(ip, community, IF_ADMIN_STATUS)
-    alias = _walk_col(ip, community, IF_ALIAS)
-    duplex = _walk_col(ip, community, DOT3_DUPLEX)
-    in_err = _walk_col(ip, community, IF_IN_ERRORS)
-    out_err = _walk_col(ip, community, IF_OUT_ERRORS)
+    speeds = ifx[IF_HIGH_SPEED]
+    alias = ifx[IF_ALIAS]
+    iftab = _walk_columns(
+        ip, community, (IF_OPER_STATUS, IF_ADMIN_STATUS, IF_IN_ERRORS, IF_OUT_ERRORS)
+    )
+    oper = iftab[IF_OPER_STATUS]
+    admin = iftab[IF_ADMIN_STATUS]
+    in_err = iftab[IF_IN_ERRORS]
+    out_err = iftab[IF_OUT_ERRORS]
+    duplex = _walk_col(ip, community, DOT3_DUPLEX)  # lone dot3StatsTable column
 
     # STP state is keyed by bridge port; map bridge port -> ifIndex to align it.
     stp_by_bp = _walk_col(ip, community, DOT1D_STP_PORT_STATE)
@@ -857,9 +895,11 @@ def _collect_poe(ip: str, community: str) -> dict[str, dict]:
     {admin: bool, status: str, class: str, power_w: float?}. Empty when the box
     isn't PoE / doesn't expose the MIB. power_w is best-effort (Cisco watts).
     """
-    admin = _walk_col(ip, community, PETH_ADMIN)
-    detect = _walk_col(ip, community, PETH_DETECT)
-    pclass = _walk_col(ip, community, PETH_CLASS)
+    # pethPsePortTable admin/detect/class in ONE walk (was 3 per-column walks).
+    peth = _walk_columns(ip, community, (PETH_ADMIN, PETH_DETECT, PETH_CLASS))
+    admin = peth[PETH_ADMIN]
+    detect = peth[PETH_DETECT]
+    pclass = peth[PETH_CLASS]
     if not (admin or detect or pclass):
         return {}
     watts = _walk_col(ip, community, CPE_EXT_PWR)  # best-effort, Cisco-only
