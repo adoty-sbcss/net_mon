@@ -68,6 +68,14 @@ jobs:
           print("all modules import cleanly")
           PY
 
+      - name: Console allow-list drift check
+        # The remote-console command registries (checkin.py) are the source of
+        # truth; the dashboard repo's broker ALLOWED_CMDS + console-config.ts
+        # hand-mirror them. This asserts the committed manifest still matches the
+        # registries, so adding/removing a console command without updating it
+        # (and, per the failure message, the dashboard mirror) fails CI.
+        run: python collector/scripts/check_console_allowlist.py --check
+
   shell:
     name: Shell scripts (bash -n)
     runs-on: ubuntu-latest

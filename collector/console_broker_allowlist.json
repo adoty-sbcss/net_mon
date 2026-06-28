@@ -1,0 +1,40 @@
+{
+  "_README": [
+    "Canonical list of remote-console command ids that the LIVE broker relays.",
+    "SOURCE OF TRUTH: collector/src/collector/checkin.py — the union of",
+    "_DIAG_COMMANDS + _CONTROL_COMMANDS + _LIVE_OPS, minus `queued_exceptions`.",
+    "",
+    "This file is the machine-readable mirror of those registries. The dashboard",
+    "repo (netmon-dashboard) must keep two things in sync with `live_broker_commands`:",
+    "  - broker/index.js            -> ALLOWED_CMDS  (defense-in-depth relay allow-list)",
+    "  - src/lib/admin/console-config.ts -> the offered command set (what the UI exposes)",
+    "If they diverge, a command the dashboard offers is silently rejected at the",
+    "broker (an availability bug). See the CON-7 audit note (2026-06-28).",
+    "",
+    "Regenerate after changing the registries with:",
+    "  python collector/scripts/check_console_allowlist.py --write",
+    "CI (.github/workflows/ci.yml) runs the same script in --check mode and fails on drift."
+  ],
+  "queued_exceptions": {
+    "_note": "Registry ids that are INTENTIONALLY off the live broker because they run via the queued check-in path, not the live console. Each must be a real id in one of the registries.",
+    "ids": [
+      "diag-detect-vlans"
+    ]
+  },
+  "live_broker_commands": [
+    "collect-logs",
+    "config-backup",
+    "ctl-flush-arp",
+    "diag-arp",
+    "diag-disk",
+    "diag-dns",
+    "diag-interfaces",
+    "diag-ping",
+    "diag-routes",
+    "diag-selftest",
+    "diag-sftp-test",
+    "diag-uptime",
+    "run-scan",
+    "upload-now"
+  ]
+}
