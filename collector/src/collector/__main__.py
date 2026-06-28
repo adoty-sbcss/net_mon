@@ -290,17 +290,24 @@ def cmd_console_poll() -> None:
 @cli.command("console-session", hidden=True)
 @click.option("--broker", required=True, help="Broker WSS base URL (…/console).")
 @click.option("--sid", required=True, help="Session id.")
-def cmd_console_session(broker: str, sid: str) -> None:
+@click.option(
+    "--mode",
+    type=click.Choice(["restricted", "full"]),
+    default="restricted",
+    help="restricted = allow-listed commands (default); full = interactive PTY (CON-7).",
+)
+def cmd_console_session(broker: str, sid: str, mode: str) -> None:
     """Run a remote-console session (browser-SSH, sensor side).
 
     Spawned as a DETACHED subprocess by the check-in `open-console` handler — not
     meant to be run by hand. The one-time token is read from NETMON_CONSOLE_TOKEN
-    (kept off the process argv). Dials the broker over WSS and services allow-
-    listed read-only diagnostics until the session ends.
+    (kept off the process argv). Dials the broker over WSS and either services
+    allow-listed diagnostics (restricted) or bridges an interactive PTY (shell,
+    CON-7 — only when the dashboard minted a step-up-verified full-shell session).
     """
     from . import remote_console
 
-    sys.exit(remote_console.run_from_env(broker, sid))
+    sys.exit(remote_console.run_from_env(broker, sid, mode=mode))
 
 
 @cli.command("config-list")

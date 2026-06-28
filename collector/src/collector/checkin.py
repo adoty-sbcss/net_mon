@@ -367,6 +367,10 @@ def _spawn_console_session(args: dict) -> tuple[str, dict]:
     broker = str(args.get("broker") or "")
     token = str(args.get("token") or "")
     sid = str(args.get("sid") or "")
+    # Full-shell mode (CON-7) is opt-in per session — the dashboard only sets it
+    # after an email one-time-code step-up. Default to the safe allow-listed path
+    # and never trust an unrecognized value.
+    mode = "full" if str(args.get("mode") or "") == "full" else "restricted"
     if not broker or not token or not sid:
         return "failed", {"error": "missing broker/token/sid"}
     try:
@@ -374,7 +378,7 @@ def _spawn_console_session(args: dict) -> tuple[str, dict]:
         env["NETMON_CONSOLE_TOKEN"] = token
         subprocess.Popen(
             [sys.executable, "-m", "collector", "console-session",
-             "--broker", broker, "--sid", sid],
+             "--broker", broker, "--sid", sid, "--mode", mode],
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
