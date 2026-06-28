@@ -5,9 +5,14 @@
 # but only the controls reviewed as safe for a NetMon sensor — and it is built to
 # never break the collector, the VLAN feature, or field access.
 #
-#   sudo ./cis-apply.sh --apply     # apply the safe subset (backs up every change)
-#   sudo ./cis-apply.sh --revert    # restore the most recent backup + undo
-#   sudo ./cis-apply.sh --dry-run   # print what it WOULD do, change nothing
+#   sudo ./cis-apply.sh --apply       # apply the safe subset (backs up every change)
+#   sudo ./cis-apply.sh --revert      # undo the safe subset (does NOT touch SSH)
+#   sudo ./cis-apply.sh --dry-run     # print what the safe subset WOULD do, change nothing
+#   sudo ./cis-apply.sh --ssh-harden [--dry-run]   # OPT-IN key-only SSH (see below)
+#   sudo ./cis-apply.sh --ssh-revert  # undo ONLY the SSH hardening (restore password login)
+#
+# The safe subset and the SSH hardening are INDEPENDENT — each has its own revert,
+# so undoing key-only SSH never tears down the firewall (and vice versa).
 #
 # DELIBERATELY APPLIED (safe):
 #   - ufw: allow 22/tcp FIRST, then default-deny INBOUND + allow-ALL-OUTBOUND,
@@ -16,24 +21,36 @@
 #   - time sync (systemd-timesyncd), auditd, AppArmor (docker-default only),
 #     core-dump restriction, libpam-pwquality (installed, not strict-enforced).
 #
-# DELIBERATELY NOT TOUCHED (would break NetMon / lock us out) — see docs/HARDENING.md:
-#   - SSH (root login, password auth, MaxAuthTries) — left exactly as-is so field
-#     access can't break during testing/deploy.
+# DELIBERATELY NOT TOUCHED by --apply (would break NetMon / lock us out) — see docs/HARDENING.md:
+#   - SSH (root login, password auth, MaxAuthTries) — the SAFE SUBSET never touches
+#     SSH so field access can't break. Key-only SSH is a SEPARATE, opt-in step
+#     (--ssh-harden, below) so ticking the normal "CIS hardened" box can never lock
+#     anyone out.
 #   - Docker privileged / host-network / NET_ADMIN+NET_RAW — the collector needs them.
 #   - Kernel modules (esp. 8021q for VLAN sub-interfaces), promiscuous mode, raw
 #     sockets — required for capture + VLAN monitoring.
 #   - Egress firewall filtering, strict reverse-path filtering (rp_filter).
+#
+# --ssh-harden (OPT-IN, key-only): writes a drop-in disabling password auth +
+# making root key-only (PasswordAuthentication no / PermitRootLogin prohibit-password
+# / KbdInteractive no / MaxAuthTries 3). It is LOCKOUT-GUARDED — it REFUSES unless a
+# shell user already has a usable SSH public key — validates with `sshd -t` before
+# `systemctl reload ssh` (reload, NOT restart, so the current session survives), and
+# is reverted by `--ssh-revert` (removes the drop-in + reloads). NOT part of --apply.
 #
 # Idempotent; every run is logged. Keep this list in lockstep with docs/HARDENING.md.
 
 set -uo pipefail
 
 MODE=""
+SSH_DRY=0
 case "${1:-}" in
-  --apply)   MODE=apply ;;
-  --revert)  MODE=revert ;;
-  --dry-run) MODE=dryrun ;;
-  *) echo "usage: $0 --apply | --revert | --dry-run" >&2; exit 2 ;;
+  --apply)      MODE=apply ;;
+  --revert)     MODE=revert ;;
+  --dry-run)    MODE=dryrun ;;
+  --ssh-harden) MODE=sshharden; [ "${2:-}" = "--dry-run" ] && SSH_DRY=1 ;;
+  --ssh-revert) MODE=sshrevert ;;
+  *) echo "usage: $0 --apply | --revert | --dry-run | --ssh-harden [--dry-run] | --ssh-revert" >&2; exit 2 ;;
 esac
 
 if [ "$(id -u)" != "0" ]; then
@@ -45,6 +62,11 @@ TS="$(date +%Y%m%dT%H%M%SZ)"
 BACKUP_ROOT="/var/lib/netmon/cis-backups"
 BACKUP_DIR="$BACKUP_ROOT/$TS"
 LATEST="$BACKUP_ROOT/latest"
+# Opt-in SSH hardening lives in a marker-named drop-in (additive — removing it
+# restores prior behavior, so revert needs no file backup). Ubuntu's stock
+# sshd_config has `Include /etc/ssh/sshd_config.d/*.conf` near the top, so this
+# drop-in wins over the defaults.
+SSH_DROPIN="/etc/ssh/sshd_config.d/60-netmon-ssh-harden.conf"
 
 log() { printf '[cis-apply] %s\n' "$*"; }
 run() {
@@ -68,9 +90,12 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # ---------------------------------------------------------------------------
 # REVERT
 # ---------------------------------------------------------------------------
+# Undo the SAFE SUBSET only. Deliberately does NOT touch SSH hardening — that has
+# its own --ssh-revert, so undoing the firewall/etc. and undoing key-only SSH are
+# independent operations (reverting one must never silently undo the other).
 do_revert() {
-  if [ ! -d "$LATEST" ]; then log "no backup at $LATEST — nothing to revert"; exit 0; fi
-  log "reverting from $(readlink -f "$LATEST")"
+  if [ ! -d "$LATEST" ]; then log "no safe-subset backup at $LATEST — nothing to revert (SSH hardening, if any, is undone with --ssh-revert)"; exit 0; fi
+  log "reverting safe subset from $(readlink -f "$LATEST")"
   # Restore any backed-up files.
   ( cd "$LATEST" && find . -type f 2>/dev/null | sed 's|^\.||' ) | while read -r f; do
     [ -n "$f" ] || continue
@@ -83,7 +108,86 @@ do_revert() {
         /etc/apt/apt.conf.d/52netmon-no-reboot 2>/dev/null || true
   sysctl --system >/dev/null 2>&1 || true
   if have ufw; then log "disabling ufw"; ufw --force disable >/dev/null 2>&1 || true; fi
-  log "revert done. (Installed packages — auditd, unattended-upgrades, pam_pwquality — are left in place; remove by hand if desired.)"
+  log "safe-subset revert done. (Installed packages — auditd, unattended-upgrades, pam_pwquality — are left in place; remove by hand if desired.) SSH hardening is separate (--ssh-revert)."
+}
+
+# Undo ONLY the opt-in SSH hardening: remove the drop-in + reload. Restores
+# password login. Leaves the safe subset untouched.
+do_ssh_revert() {
+  if [ ! -e "$SSH_DROPIN" ]; then log "no SSH hardening drop-in at $SSH_DROPIN — nothing to revert"; exit 0; fi
+  log "removing SSH hardening drop-in ($SSH_DROPIN) + reloading ssh (restores password login)"
+  rm -f "$SSH_DROPIN" 2>/dev/null || true
+  systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
+  log "SSH hardening reverted — verify with: sudo sshd -T | grep -i passwordauthentication"
+}
+
+# ---------------------------------------------------------------------------
+# OPT-IN SSH HARDENING (key-only) — separate from --apply; lockout-guarded.
+# ---------------------------------------------------------------------------
+
+# Lockout guard: is key-based SSH actually possible? Returns 0 if at least one
+# shell user (root or any /home user) has a non-empty authorized_keys with a real
+# public key. We NEVER disable password auth without this — it's the safety net.
+has_authorized_key() {
+  local f
+  for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+    [ -f "$f" ] || continue
+    if grep -qE '^[[:space:]]*(ssh-(rsa|ed25519|dss)|ecdsa-sha2-|sk-(ssh-ed25519|ecdsa))' "$f" 2>/dev/null; then
+      log "lockout guard: usable SSH public key found in $f"
+      return 0
+    fi
+  done
+  return 1
+}
+
+do_ssh_harden() {
+  log "SSH hardening (key-only) — OPT-IN, lockout-guarded, reversible"
+  if ! have sshd; then log "sshd not found — skipping (is this an SSH server?)"; exit 0; fi
+
+  # LOCKOUT GUARD — refuse to disable password auth unless a key login exists.
+  if ! has_authorized_key; then
+    log "REFUSING: no usable SSH public key in /root/.ssh/authorized_keys or /home/*/.ssh/authorized_keys."
+    log "  Install your admin user's public key FIRST (ssh-copy-id / authorized_keys), then re-run."
+    log "  (Disabling password auth now would lock you out — not doing that.)"
+    exit 3
+  fi
+
+  if [ "$SSH_DRY" = 1 ]; then
+    log "DRY-RUN — would write $SSH_DROPIN:"
+    printf '    PasswordAuthentication no\n    KbdInteractiveAuthentication no\n    ChallengeResponseAuthentication no\n    PermitRootLogin prohibit-password\n    PermitEmptyPasswords no\n    MaxAuthTries 3\n'
+    log "  would 'sshd -t' then 'systemctl reload ssh' (reload, NOT restart — current session survives)."
+    log "  revert with: sudo $0 --ssh-revert"
+    return 0
+  fi
+
+  mkdir -p /etc/ssh/sshd_config.d
+  # Write to a temp, then validate the WHOLE sshd config with the drop-in in place
+  # BEFORE committing, so a bad config never reaches a reload.
+  local tmp; tmp="$(mktemp)"
+  cat > "$tmp" <<'EOF'
+# NetMon SSH hardening (PROV-3, opt-in). Key-only access from here.
+# Revert: remove this file + `systemctl reload ssh`, or run cis-apply.sh --revert.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PermitRootLogin prohibit-password
+PermitEmptyPasswords no
+MaxAuthTries 3
+EOF
+  install -m 0644 "$tmp" "$SSH_DROPIN"; rm -f "$tmp"
+
+  local err; err="$(mktemp)"
+  if ! sshd -t 2>"$err"; then
+    log "sshd -t FAILED with the new drop-in — REMOVING it, SSH left unchanged:"
+    sed 's/^/    /' "$err" 2>/dev/null || true
+    rm -f "$SSH_DROPIN" "$err"
+    exit 4
+  fi
+  rm -f "$err"
+  log "sshd -t OK — reloading ssh (existing sessions stay up)"
+  systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
+  log "SSH is now KEY-ONLY: password auth disabled, root login key-only. Drop-in: $SSH_DROPIN"
+  log "REVERT anytime with: sudo $0 --ssh-revert  (removes the drop-in + reloads ssh)"
 }
 
 # ---------------------------------------------------------------------------
@@ -195,5 +299,7 @@ do_apply() {
 case "$MODE" in
   revert) do_revert ;;
   apply|dryrun) do_apply ;;
+  sshharden) do_ssh_harden ;;
+  sshrevert) do_ssh_revert ;;
 esac
 exit 0

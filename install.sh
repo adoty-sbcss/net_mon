@@ -104,6 +104,17 @@ if [[ "${cis_harden:-}" == "true" || "${cis_harden:-}" == "1" ]]; then
 else
     echo "(report-only — tick 'CIS hardened' on the deploy page to auto-apply the safe subset)"
 fi
+# Opt-in, key-only SSH hardening — SEPARATE from the safe subset (which never
+# touches SSH). Lockout-guarded: cis-apply.sh refuses unless a usable SSH public
+# key is already installed, so a misconfigured deploy can't lock the box out.
+ssh_harden="$(current_value NETMON_CIS_SSH_HARDEN 2>/dev/null || true)"
+if [[ "${ssh_harden:-}" == "true" || "${ssh_harden:-}" == "1" ]]; then
+    if [[ -x ./scripts/cis-apply.sh ]]; then
+        echo ""
+        log "NETMON_CIS_SSH_HARDEN set — applying key-only SSH (password auth off, root key-only; auto-skips if no authorized key is present)..."
+        ./scripts/cis-apply.sh --ssh-harden || warn "SSH hardening skipped/failed (non-fatal) — usually means no authorized key is installed yet; see the log above."
+    fi
+fi
 echo "=============================================================="
 echo ""
 
