@@ -23,7 +23,7 @@ that mode we DROP the fixed-argv allow-list and instead bridge an INTERACTIVE
 PTY (`bash -i`) to the operator's terminal — base64-framed stdin/stdout/resize.
 This removes the allow-list containment, so it is gated two independent ways
 (mirroring the allow-list's double-validation): the sensor only spawns the PTY
-when THIS process was launched with `--mode shell`, and the broker only relays
+when THIS process was launched with `--mode full`, and the broker only relays
 shell I/O frames when the dashboard's /validate reports `mode=full`. Every frame
 still flows through the broker's transcript recorder, so the whole session is
 captured. The shell runs INSIDE the (privileged) collector container; genuine
@@ -37,6 +37,8 @@ from __future__ import annotations
 import base64
 import json
 import os
+import select
+import signal
 import subprocess
 import threading
 import time
@@ -157,12 +159,21 @@ def _run_op_async(ws, cmd_id: str) -> None:
 # Bytes read from the PTY master per chunk; ~22 KB base64, well under the broker's
 # 256 KB max payload. Output framing: {type:"o", data:<base64>}.
 PTY_READ_BYTES = 16384
+# Coalesce burst output into fewer, larger frames: a chatty stream (e.g. `yes`,
+# `journalctl -f`) would otherwise emit thousands of tiny frames and quickly hit
+# the broker's per-session transcript cap, leaving a recording gap. We batch up to
+# COALESCE_MAX_BYTES of immediately-available output over a COALESCE_WINDOW window
+# before sending one frame. The cap keeps the base64-encoded frame well under the
+# broker's 256 KB WS max-payload (128 KB raw -> ~171 KB base64). The short window
+# adds no perceptible latency to interactive single-keystroke echo.
+COALESCE_MAX_BYTES = 128 * 1024
+COALESCE_WINDOW_SEC = 0.04
 
 
 class _PtyShell:
     """An interactive in-container PTY (`bash -i`) bridged to the operator (CON-7).
 
-    Only constructed for mode=="shell" sessions, AFTER the dashboard's email
+    Only constructed for mode=="full" sessions, AFTER the dashboard's email
     one-time-code step-up. stdin/stdout/resize are base64-framed JSON so raw
     (non-UTF-8) terminal bytes survive the JSON relay; every frame still rides the
     broker's transcript recorder. The PTY runs inside this (privileged) container,
@@ -218,7 +229,11 @@ class _PtyShell:
         log.info("remote console: PTY shell started", pid=self.proc.pid)
 
     def _pump_out(self) -> None:
-        """Read PTY output and stream it to the operator until EOF/shell-exit."""
+        """Read PTY output and stream it to the operator until EOF/shell-exit.
+
+        Coalesces a burst of immediately-available output into one frame so a noisy
+        command can't flood the broker's transcript cap, and stops if the operator
+        connection drops (a failed send means the session is going away)."""
         while not self._stop.is_set():
             try:
                 data = os.read(self.master_fd, PTY_READ_BYTES)
@@ -226,10 +241,30 @@ class _PtyShell:
                 break  # master closed (we're shutting down) or PTY went away
             if not data:
                 break  # EOF — the shell exited
-            _send(
+            # Batch any more output already waiting, up to the size/time window.
+            deadline = time.monotonic() + COALESCE_WINDOW_SEC
+            while len(data) < COALESCE_MAX_BYTES:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    break
+                try:
+                    ready, _, _ = select.select([self.master_fd], [], [], timeout)
+                except OSError:
+                    break
+                if not ready:
+                    break
+                try:
+                    more = os.read(self.master_fd, PTY_READ_BYTES)
+                except OSError:
+                    break
+                if not more:
+                    break
+                data += more
+            if not _send(
                 self._ws,
                 {"type": "o", "data": base64.b64encode(data).decode("ascii")},
-            )
+            ):
+                break  # operator/broker gone — stop streaming
         code = self.proc.poll()
         _send(self._ws, {"type": "shell-exit", "code": -1 if code is None else code})
 
@@ -252,13 +287,38 @@ class _PtyShell:
         return self.proc.poll() is None
 
     def close(self) -> None:
+        """Tear down the shell and EVERYTHING it spawned.
+
+        bash is its own session/process-group leader (setsid in _preexec), so we
+        signal the whole GROUP, not just bash — otherwise a child that ignores
+        SIGHUP/SIGTERM (a `trap '' HUP TERM`, a `nohup`, a backgrounded job) would
+        survive as an orphan running root-in-(privileged-)container after the
+        audited, time-boxed session ends. SIGTERM, brief grace, then SIGKILL, then
+        reap so nothing lingers. Falls back to per-process signals if killpg can't
+        be used."""
         self._stop.set()
+        pgid = self.proc.pid  # == process-group id thanks to setsid in _preexec
+
+        def _signal_group(sig: int) -> None:
+            try:
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, OSError):
+                try:
+                    self.proc.send_signal(sig)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        _signal_group(signal.SIGTERM)
         try:
-            self.proc.terminate()  # SIGTERM the shell; daemon reader unblocks on EOF
-        except Exception:  # noqa: BLE001
-            pass
+            self.proc.wait(timeout=2)
+        except Exception:  # noqa: BLE001 — still alive (or wait unavailable): force-kill
+            _signal_group(signal.SIGKILL)
+            try:
+                self.proc.wait(timeout=2)
+            except Exception:  # noqa: BLE001
+                pass
         try:
-            os.close(self.master_fd)
+            os.close(self.master_fd)  # unblocks the reader thread's os.read
         except Exception:  # noqa: BLE001
             pass
 
