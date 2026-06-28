@@ -170,6 +170,36 @@ COALESCE_MAX_BYTES = 128 * 1024
 COALESCE_WINDOW_SEC = 0.04
 
 
+def _kill_session(sid: int) -> None:
+    """SIGKILL every process in session `sid` (Linux /proc scan; best-effort).
+
+    Used at full-shell teardown to reach children bash put in their own process
+    groups via job control, which a killpg of bash's group alone would miss. A
+    process that did its own setsid (a real daemon) escapes — same as plain SSH.
+    No-op / silent on non-Linux or if /proc is unreadable."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", encoding="ascii", errors="replace") as fh:
+                stat = fh.read()
+            # Layout: pid (comm) state ppid pgrp session ...  `comm` can contain
+            # spaces/parens, so parse the fields AFTER the final ')'.
+            fields = stat[stat.rindex(")") + 1 :].split()
+            psid = int(fields[3])  # state, ppid, pgrp, session
+        except (OSError, ValueError, IndexError):
+            continue
+        if psid == sid:
+            try:
+                os.kill(int(entry), signal.SIGKILL)
+            except OSError:
+                pass
+
+
 class _PtyShell:
     """An interactive in-container PTY (`bash -i`) bridged to the operator (CON-7).
 
@@ -289,15 +319,17 @@ class _PtyShell:
     def close(self) -> None:
         """Tear down the shell and EVERYTHING it spawned.
 
-        bash is its own session/process-group leader (setsid in _preexec), so we
-        signal the whole GROUP, not just bash — otherwise a child that ignores
-        SIGHUP/SIGTERM (a `trap '' HUP TERM`, a `nohup`, a backgrounded job) would
-        survive as an orphan running root-in-(privileged-)container after the
-        audited, time-boxed session ends. SIGTERM, brief grace, then SIGKILL, then
-        reap so nothing lingers. Falls back to per-process signals if killpg can't
-        be used."""
+        bash is the SESSION leader (setsid in _preexec). First SIGTERM→grace→SIGKILL
+        bash's own process group, then SWEEP the whole session: bash's job control
+        puts backgrounded/foreground children in their OWN process groups, so a
+        killpg of bash's group alone misses a child that ignores SIGHUP/SIGTERM
+        (`trap '' HUP TERM`, `nohup`, a `&` job). Every process bash spawned shares
+        sid==bash.pid (unless it setsid'd itself — a real daemon, same caveat as
+        plain SSH), so we SIGKILL every process in that session. This stops an
+        orphan from lingering root-in-(privileged-)container after the audited,
+        time-boxed session ends."""
         self._stop.set()
-        pgid = self.proc.pid  # == process-group id thanks to setsid in _preexec
+        pgid = self.proc.pid  # == process-group AND session id thanks to setsid
 
         def _signal_group(sig: int) -> None:
             try:
@@ -317,6 +349,8 @@ class _PtyShell:
                 self.proc.wait(timeout=2)
             except Exception:  # noqa: BLE001
                 pass
+        # Sweep any session members left in their own process groups (job control).
+        _kill_session(pgid)
         try:
             os.close(self.master_fd)  # unblocks the reader thread's os.read
         except Exception:  # noqa: BLE001
