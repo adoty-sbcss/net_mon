@@ -230,8 +230,32 @@ def _local_net() -> tuple[str | None, str | None, str | None]:
         return (None, None, None)
 
 
+# Mask credential-looking values out of log tails before they leave the box.
+# `collect-logs` is the only console command that surfaces raw log content to the
+# operator AND records it into the broker transcript, so even though our logs
+# don't echo secrets today, scrub defensively (data-minimization): an SFTP
+# password / SNMP community / token / bootstrap key must never ride out in clear.
+_SECRET_KV_RE = re.compile(
+    r"(?i)([A-Za-z0-9_.\-]*"
+    r"(?:passwd|password|secret|token|community|api[_-]?key|bootstrap[_-]?key|auth[_-]?key|access[_-]?key)"
+    r"[A-Za-z0-9_.\-]*)"        # 1: the key, e.g. NETMON_SFTP_PASSWORD / community
+    r"[\"']?\s*[=:]\s*[\"']?"   # an = or : assignment (optionally quoted — env/JSON/CLI)
+    r"([^\s\"',;}]+)"           # 2: the value, up to the next delimiter
+)
+_BEARER_RE = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._\-]+")
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace credential VALUES (KEY=secret, KEY: "secret", Bearer <token>) with
+    ***, leaving the key + surrounding log text intact. Only masks assignment-style
+    secrets, so prose like "passwordauthentication no" is untouched."""
+    text = _SECRET_KV_RE.sub(lambda m: f"{m.group(1)}=***", text)
+    text = _BEARER_RE.sub(r"\1 ***", text)
+    return text
+
+
 def _collect_logs(lines: int = 250) -> tuple[str, dict]:
-    """Return the tail of the collector + audit logs for the dashboard to show."""
+    """Return the (secret-redacted) tail of the collector + audit logs for the dashboard."""
     from .logging_setup import LOG_DIR
 
     out: dict[str, str] = {}
@@ -242,7 +266,7 @@ def _collect_logs(lines: int = 250) -> tuple[str, dict]:
         p = LOG_DIR / fname
         try:
             tail = p.read_text(errors="replace").splitlines()[-lines:]
-            text = "\n".join(tail)
+            text = _redact_secrets("\n".join(tail))  # scrub before it leaves the box
             out[fname] = text[-20000:]  # cap size stored in the result
         except FileNotFoundError:
             out[fname] = "(no file)"
