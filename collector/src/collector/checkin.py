@@ -230,17 +230,19 @@ def _local_net() -> tuple[str | None, str | None, str | None]:
         return (None, None, None)
 
 
-# Mask credential-looking values out of log tails before they leave the box.
-# `collect-logs` is the only console command that surfaces raw log content to the
-# operator AND records it into the broker transcript, so even though our logs
+# Mask credential-looking values out of any text that leaves the box. The console
+# `collect-logs` (raw log tails) and the diagnostic commands both surface output to
+# the operator AND record it into the broker transcript, so even though our logs
 # don't echo secrets today, scrub defensively (data-minimization): an SFTP
 # password / SNMP community / token / bootstrap key must never ride out in clear.
 _SECRET_KV_RE = re.compile(
     r"(?i)([A-Za-z0-9_.\-]*"
-    r"(?:passwd|password|secret|token|community|api[_-]?key|bootstrap[_-]?key|auth[_-]?key|access[_-]?key)"
+    r"(?:passwd|password|secret|token|communit|api[_-]?key|bootstrap[_-]?key|auth[_-]?key|access[_-]?key)"
     r"[A-Za-z0-9_.\-]*)"        # 1: the key, e.g. NETMON_SFTP_PASSWORD / community
     r"[\"']?\s*[=:]\s*[\"']?"   # an = or : assignment (optionally quoted — env/JSON/CLI)
-    r"([^\s\"',;}]+)"           # 2: the value, up to the next delimiter
+    r"([^\s\"';}]+)"            # 2: value, to next delimiter. Allows ',' so a
+                                # comma-joined list (NETMON_SNMP_COMMUNITIES=
+                                # public,private) is fully masked, not just the head.
 )
 _BEARER_RE = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._\-]+")
 
@@ -367,7 +369,10 @@ def _run_diag(command: str) -> tuple[str, dict]:
         return "failed", {"error": f"unknown diagnostic {command!r}"}
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=20, check=False)
-        out = ((p.stdout or "") + (p.stderr or "")).strip()
+        # Scrub secrets (e.g. an SFTP/SNMP cred echoed by upload-test or a config
+        # dump) before this output reaches the operator / broker transcript. Same
+        # guard _collect_logs uses; redact first, then cap.
+        out = _redact_secrets(((p.stdout or "") + (p.stderr or "")).strip())
         return "done", {"command": command, "exit": p.returncode, "output": out[-16000:]}
     except subprocess.TimeoutExpired:
         return "failed", {"command": command, "error": "timed out"}

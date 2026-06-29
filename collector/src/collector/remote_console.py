@@ -45,7 +45,13 @@ import time
 
 import structlog
 
-from .checkin import _CONTROL_COMMANDS, _DIAG_COMMANDS, _LIVE_OPS, _run_command
+from .checkin import (
+    _CONTROL_COMMANDS,
+    _DIAG_COMMANDS,
+    _LIVE_OPS,
+    _redact_secrets,
+    _run_command,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -87,7 +93,10 @@ def _run_diag_stream(ws, cmd_id: str) -> None:
         p = subprocess.run(
             argv, capture_output=True, text=True, timeout=DIAG_TIMEOUT_SEC, check=False
         )
-        out = ((p.stdout or "") + (p.stderr or "")).strip()[-OUTPUT_CAP:]
+        # Scrub secrets before streaming to the operator + broker transcript;
+        # redact the full output first, THEN cap (same guard as checkin's diag/log
+        # paths). The collect-logs op path is already covered via _run_command.
+        out = _redact_secrets(((p.stdout or "") + (p.stderr or "")).strip())[-OUTPUT_CAP:]
         if not out:
             out = "(no output)"
         for i in range(0, len(out), CHUNK):
