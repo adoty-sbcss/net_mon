@@ -23,6 +23,7 @@ UNITS=(
     "netmon-config-backup"
     "netmon-checkin"
     "netmon-console-poll"
+    "netmon-wifi-survey"
 )
 
 # Legacy unit names from before the App_Mon → NetMon rename. We disable
@@ -79,6 +80,7 @@ for unit in "${UNITS[@]}"; do
         netmon-config-backup)  script="$REPO_DIR/scripts/netmon-config-backup.sh" ;;
         netmon-checkin)        script="$REPO_DIR/scripts/netmon-checkin.sh" ;;
         netmon-console-poll)   script="$REPO_DIR/scripts/netmon-console-poll.sh" ;;
+        netmon-wifi-survey)    script="$REPO_DIR/scripts/netmon-wifi-survey.sh" ;;
         *) echo "ERROR: no script mapping for unit $unit" >&2; exit 1 ;;
     esac
     if [[ ! -x "$script" ]]; then

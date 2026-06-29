@@ -1,0 +1,14 @@
+[Unit]
+Description=NetMon Wi-Fi RF/AP survey (WIFI-2)
+Documentation=https://github.com/adoty-sbcss/net_mon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=${USER}
+Group=${USER}
+WorkingDirectory=${REPO_DIR}
+ExecStart=${REPO_DIR}/scripts/netmon-wifi-survey.sh
+TimeoutStartSec=120
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

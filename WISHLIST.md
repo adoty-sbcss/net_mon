@@ -53,16 +53,44 @@ Ordered so foundations land before the things that depend on them. Status reflec
 - [ ] **VLAN-aware passive capture on raw trunk** (suggested)
   Alternative to sub-interfaces: capture once on `eth0`, decode 802.1Q tags inline. Lets you see tagged frames on access ports (which the Claude prompt already calls out as suspicious in [prompts.py:46](collector/src/collector/prompts.py:46)).
 
-## Wireless
+## Wireless ⭐ — registry area `WIFI-*` (revived 2026-06-29)
 
-- [ ] **Wireless connectivity** — associate to an SSID and scan it like any other LAN
-  Once `wlan0` has an IP, the existing poller treats it like any wired interface. Need wpa_supplicant config + credentials managed from the operator menu.
+Tracked in the feature registry as `WIFI-1..5`. **Key reframe (scoping 2026-06-29):** "join the Wi-Fi and scan it like a LAN" is *low* value — the poller already scans any interface with an IP ([poller.py:88](collector/src/collector/poller.py:88) literally calls out Wi-Fi), but on wireless **client isolation** means you mostly only see the gateway + yourself, and you're on a segment already visible from the wired side. The value is **characterizing the connection experience + security posture per SSID/location**, not host inventory. So the real engineering is *connectivity + credential management + RF survey*, not scanning.
 
-- [ ] **Wifi monitoring** — AP / spectrum survey
-  `iw dev wlanX scan` to enumerate nearby SSIDs, channels, RSSI, encryption, channel overlap. One new `discovery/wifi.py`. Works on any Wi-Fi NIC; no monitor mode required.
+**The #1 gotcha — backend management split (this is the VLAN bug again).** Multi-VLAN trunk monitoring silently died on NetworkManager boxes (see [poller/trunk lesson](lib/trunk.sh:107) `_vlan_backend` + the VLAN-NM-netplan lesson in project memory). Wi-Fi has the *exact same split*: NM boxes use `nmcli`, Server/networkd boxes use `wpa_supplicant`+netplan, some use `iwd`, and 802.1X/EAP config differs across them. **Build the backend-aware Wi-Fi layer first or it works on the bench and dies in the field.** Monitor1 is an NM box with a real Wi-Fi NIC (`wlp0s20f3`) → develop against it so the nmcli path is faced on day one.
 
-- [ ] **Passive 802.11 sniffing** (suggested)
-  Monitor mode + tshark for beacons, probe req/resp, retransmit rate, deauths, hidden SSIDs, rogue APs. Needs a known-good monitor-mode USB adapter (AR9271, MT76xx, RTL8812AU) and a separate scan flow because monitor mode disconnects from the network.
+**Recommended staging (survey before join — flip the obvious order):**
+
+- [ ] **WIFI-1 — Backend-aware Wi-Fi management layer (foundation)** ⭐ *do first*
+  Associate/configure `wlan0` across nmcli / wpa_supplicant+netplan / iwd, mirroring `_vlan_backend()`. Plus: a per-NIC **capability probe** (bands 2.4/5/6 GHz, channels, monitor-mode support, regulatory domain, max scan) reported to the dashboard; secure credential/cert storage through the existing `set_value`+`chmod 600` env path + desired-config push; and a hard **"analysis radio never becomes the default route"** guard — the Wi-Fi analog of the VLAN routes-off/never-default rule, so a bad join can never strand a remote box.
+  - **Supported topology = wired uplink + a Wi-Fi NIC dedicated to analysis** (the "trunk monitoring-only" analog). One radio = one association at a time, mutually exclusive with using it as the uplink; sharing the uplink loses the control plane mid-survey. Two-radio or shared-uplink are footguns — pick wired-uplink + survey-radio.
+
+- [ ] **WIFI-2 — Managed-mode RF / AP survey** ⭐ *highest value-for-effort; recommend BEFORE the credentialed join*
+  `iw dev wlanX scan` + `iw dev wlanX survey dump` → neighbor SSIDs/BSSIDs, channel + width, RSSI, encryption (WPA2/WPA3/TKIP/open, PMF, WPS), **real airtime utilization** (channel busy/active time), co-/adjacent-channel overlap, 2.4/5/6 GHz spread. One new `discovery/wifi.py`; **no credentials, no monitor mode, can't strand the box** — works today on Monitor1's `wlp0s20f3`. Ships in the hourly bundle like the other `discovery/*` modules. Pays off twice: an **encryption-posture audit** (weak/open SSIDs, TKIP still on, WPS on, district-wide PSK reuse) and a **measured RSSI overlay** that turns the existing modeled coverage map (`MAP-2`) into *measured* coverage. This is ~80% of "spectrum analysis" with zero special hardware.
+
+- [ ] **WIFI-3 — Credentialed join + client-experience battery**
+  Associate across auth methods — **WPA2-PSK → PEAP/802.1X → EAP-TLS → guest captive portal** — and run a per-SSID/per-location **experience scorecard** (the real deliverable; "Wi-Fi slow/broken in Room 12" is a top K-12 help-desk call and it's usually RADIUS/cert/DHCP/DNS, not RF):
+  - auth success + **time-to-associate** (catches broken RADIUS, expired or chain-broken server/client certs *before* they break every student device),
+  - time-to-DHCP + lease success (pool exhaustion),
+  - DNS health on that SSID (reuse `dns_health.py` — runs per interface for free),
+  - **captive-portal characterization** — its own sub-case: you're walled off until web-auth, so *characterize* it (redirect chain, walled-garden DNS, what's reachable pre-auth, portal TLS/headers) and **test whether it's bypassable** (a real security finding); only optionally automate the click-through. Don't bucket it as "join and scan."
+  - throughput / latency / jitter to internet + M365 / Google / instructional platforms (reuse `iperf.py`, `reachability.py`, `speedtest.py`),
+  - **guest↔internal isolation test** (can I reach staff subnets from the guest SSID?),
+  - RSSI at the location.
+  Serialized **SSID-hopping scheduler** (associate → DHCP → run battery → leave → next). Apply over the same dashboard host-action push path as `PROV-4`'s VLAN apply, but **monitoring-radio-only**.
+  - **Decisions to lock before building:** PSK first (simplest, no PKI), then PEAP, then EAP-TLS (needs per-box client cert + key — the hard + sensitive one), captive portal last. The LAN-scan falls out for free from the poller but is *not* the point.
+
+- [ ] **WIFI-4 — Monitor-mode passive 802.11 sniffing** *(later; needs hardware)*
+  Monitor mode + tshark for beacons, probe req/resp, **retry/retransmit rates**, **deauth/disassoc floods** (attack detection), hidden SSIDs, and **rogue / evil-twin AP** detection (an SSID broadcasting the district name that isn't theirs). Separate scan flow — monitor mode disconnects the NIC. Needs a known-good adapter (AR9271 / MT76xx / RTL8812AU) → keep a blessed-adapter list (the WIFI-1 capability probe reports per-box support). **Opt-in per site** (like the default-cred check) — capturing others' 802.11 frames has policy implications; keep to headers/metadata, not payloads; set the regulatory domain correctly.
+
+- [ ] **WIFI-5 — True RF spectrum via SDR (non-Wi-Fi interference)** *(deferred — hardware add-on)*
+  Energy-across-the-band analysis that sees **non-802.11** interferers a Wi-Fi NIC is blind to — microwaves, Bluetooth, video senders, cordless phones, jammers. Requires a dedicated SDR/spectrum dongle (Wi-Spy / RF Explorer / HackRF-class). Flagged so "spectrum analysis" isn't over-promised: `iw scan` only sees Wi-Fi; channel-utilization-from-survey (WIFI-2) is the no-hardware 80%; *true* spectrum is this separate, hardware-gated tier.
+
+**Security surface (needs a paired `SEC-*` entry — the security chat owns that prefix):** EAP-TLS puts per-box client certs + private keys on the sensor, and a stolen sensor with a valid 802.1X cert is a foothold onto the *staff* network (the exact pivot risk in the console threat model). Required work: extend the CON-7/SEC secret redaction to **never log PSKs / EAP passwords / key material**; scope the sensor's RADIUS identity to a **restricted "netmon-sensors" role**; and track **cert expiry + rotation** via desired-config push (like the SFTP credential rotation). Loop the security chat in before WIFI-3 ships EAP-TLS.
+
+**Dashboard surfacing (follow-on for each stage):** a per-school **Wireless page** — SSID list with auth type / encryption / last-join status, per-location signal + utilization, client-experience scorecards — plus the measured-RSSI overlay on the existing coverage map, and wireless tools for the in-app AI assistant ("why is Wi-Fi slow in Room 12?", "which SSIDs use weak encryption?", "is guest isolated?").
+
+**Hardware/driver reality:** the fleet is repurposed PCs + Pis, so Wi-Fi NIC capability varies wildly (bands, monitor mode, regulatory domain). The WIFI-1 capability probe is what makes per-box "what's even possible" knowable; keep a short blessed-adapter list for sites that want survey/monitor features.
 
 ## Discovery & inventory
 
