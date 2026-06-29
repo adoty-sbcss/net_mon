@@ -35,6 +35,7 @@ across both polling AND topology crawl.
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 import shutil
 import time
@@ -616,7 +617,13 @@ def _parse_lldp_rem_man_addrs(walk_rows: list[tuple[str, str]]) -> dict[tuple[st
         # IPv4 only for now.
         if addr_subtype != "1" or len(addr_bytes) != 4:
             continue
-        ip = ".".join(addr_bytes)
+        # The octets are raw OID-suffix tokens from an untrusted agent; accept only
+        # a well-formed IPv4 (each octet numeric and 0-255) before treating it as a
+        # management IP that later becomes a net-snmp host argument.
+        try:
+            ip = str(ipaddress.IPv4Address(".".join(addr_bytes)))
+        except ValueError:
+            continue
         rem_idx_key = (time_mark, local_port, rem_idx)
         out.setdefault(rem_idx_key, [])
         if ip not in out[rem_idx_key]:
@@ -670,10 +677,14 @@ def _normalize_cdp_address(raw: str | None) -> str | None:
         cleaned = cleaned[2:]
     if len(cleaned) == 8 and all(c in "0123456789abcdef" for c in cleaned):
         return ".".join(str(int(cleaned[i:i + 2], 16)) for i in range(0, 8, 2))
-    # Some agents already return dotted-quad; pass through if it looks IP-ish.
-    if v.count(".") == 3:
-        return v
-    return None
+    # Some agents already return dotted-quad; accept it ONLY if it parses as a
+    # real IPv4 literal. cdpCacheAddress is attacker-controlled neighbor data and
+    # the result is later used as a net-snmp host argument, so a junk value like
+    # "-On.1.2.3" (which satisfies count(".")==3) must not pass through.
+    try:
+        return str(ipaddress.IPv4Address(v.strip()))
+    except ValueError:
+        return None
 
 
 def _decode_lldp_caps(raw: str | None) -> list[str] | None:

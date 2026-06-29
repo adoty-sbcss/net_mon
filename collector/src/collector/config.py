@@ -232,10 +232,17 @@ class Settings(BaseSettings):
 
     @property
     def dsn(self) -> str:
-        return (
-            f"host={self.postgres_host} port={self.postgres_port} "
-            f"user={self.postgres_user} password={self.postgres_password} "
-            f"dbname={self.postgres_db}"
+        # Build via libpq's own quoting (make_conninfo) so credentials containing
+        # a space, single quote, or backslash — e.g. a strong/generated password —
+        # don't corrupt the conninfo string. A plain f-string silently broke those.
+        from psycopg.conninfo import make_conninfo
+
+        return make_conninfo(
+            host=self.postgres_host,
+            port=self.postgres_port,
+            user=self.postgres_user,
+            password=self.postgres_password,
+            dbname=self.postgres_db,
         )
 
     @property

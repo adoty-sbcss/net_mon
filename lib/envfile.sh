@@ -40,13 +40,16 @@ set_value() {
     env_ensure_file
     local f
     f="$(env_file)"
-    local escaped
-    escaped=$(printf '%s' "$value" | sed -e 's/[\/&|]/\\&/g')
+    # Rewrite by delete-then-append using ONLY the literal printf|tee writer.
+    # sed's REPLACEMENT side treats & and \ as metacharacters, so the previous
+    # sed-substitution path silently corrupted any value containing & or \
+    # (notably SFTP/Postgres passwords) on every re-write. The delete pattern
+    # below matches the key only (no value interpolation), and printf '%s' writes
+    # the value byte-for-byte.
     if $SUDO grep -qE "^${name}=" "$f"; then
-        $SUDO sed -i -E "s|^${name}=.*|${name}=\"${escaped}\"|" "$f"
-    else
-        printf '%s="%s"\n' "$name" "$value" | $SUDO tee -a "$f" >/dev/null
+        $SUDO sed -i -E "/^${name}=/d" "$f"
     fi
+    printf '%s="%s"\n' "$name" "$value" | $SUDO tee -a "$f" >/dev/null
     # Re-assert ownership/perms in case anyone touched it manually.
     $SUDO chmod 600 "$f"
     $SUDO chown "$NETMON_OWNER_USER:$NETMON_OWNER_USER" "$f"
