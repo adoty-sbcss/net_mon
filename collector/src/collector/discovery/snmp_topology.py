@@ -970,6 +970,14 @@ def _attach_poe(interfaces: dict[str, dict], poe: dict[str, dict]) -> int:
             cands = [ifidx for nums, ifidx in tokens if nums[-1] == port]
             if len(cands) == 1:
                 match = cands[0]
+        # 3) Fallback: the pethPsePortIndex IS the ifIndex. True on ArubaOS-CX,
+        #    where the port index is stack-GLOBAL (member 2 port 1 = index 65 =
+        #    ifIndex 65, member 3 +128, member 4 +192), so the ifName-number
+        #    heuristics above match only member 1 and drop the rest. This only
+        #    fires when (1)+(2) found nothing, so it can't override a name match
+        #    on switches where the two indices differ (e.g. Cisco stacks).
+        if match is None and str(port) in interfaces:
+            match = str(port)
         if match is not None:
             interfaces[match]["poe"] = prec
         else:
