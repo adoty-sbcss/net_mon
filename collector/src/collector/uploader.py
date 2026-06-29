@@ -24,6 +24,12 @@ from .logging_setup import audit
 # Adjust by editing here; not surfaced as env to keep config simple for v1.
 LOCAL_BUNDLE_RETENTION_DAYS = 30
 
+# Bound for the SFTP TCP connect, SSH banner wait, and every subsequent socket op
+# (the socket timeout from create_connection persists into the data phase). The
+# uploader is a single daemon thread, so an unbounded handshake to a blackholed or
+# filtered host would silently stall ALL hourly uploads while the box looks healthy.
+_SFTP_TIMEOUT_SEC = 30
+
 log = structlog.get_logger(__name__)
 
 
@@ -253,7 +259,11 @@ def upload_file(local_path: Path) -> str:
     log.info("sftp connecting", host=settings.sftp_host, port=settings.sftp_port,
              user=settings.sftp_user, remote_dir=target_dir)
 
-    transport = paramiko.Transport((settings.sftp_host, settings.sftp_port))
+    sock = socket.create_connection(
+        (settings.sftp_host, settings.sftp_port), timeout=_SFTP_TIMEOUT_SEC
+    )
+    transport = paramiko.Transport(sock)
+    transport.banner_timeout = _SFTP_TIMEOUT_SEC
     try:
         transport.connect(username=settings.sftp_user, password=settings.sftp_password)
         sftp = paramiko.SFTPClient.from_transport(transport)
@@ -310,7 +320,11 @@ def test_connection() -> tuple[bool, str]:
 
     target_dir = _remote_dir()
     try:
-        transport = paramiko.Transport((settings.sftp_host, settings.sftp_port))
+        sock = socket.create_connection(
+            (settings.sftp_host, settings.sftp_port), timeout=_SFTP_TIMEOUT_SEC
+        )
+        transport = paramiko.Transport(sock)
+        transport.banner_timeout = _SFTP_TIMEOUT_SEC
         transport.connect(username=settings.sftp_user, password=settings.sftp_password)
         sftp = paramiko.SFTPClient.from_transport(transport)
         if sftp is None:
