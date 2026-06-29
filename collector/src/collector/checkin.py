@@ -330,6 +330,8 @@ _HOST_ACTIONS: set[str] = {
     "host-reboot",    # systemctl reboot the box
     "host-rollback",  # scripts/rollback.sh -> last-known-good SHA + image + DB
     "host-apply-vlan", # apply NETMON_TRUNK_* netplan sub-interfaces (lib/trunk.sh)
+    "host-cis-apply",  # apply the CIS safe subset (scripts/cis-apply.sh --apply; self-healing guard auto-reverts on connectivity loss)
+    "host-cis-revert", # undo the CIS safe subset (scripts/cis-apply.sh --revert)
 }
 
 # State-changing "remote console" actions (CON-5). SAME safety model as
