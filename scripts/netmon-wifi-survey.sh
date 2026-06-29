@@ -20,6 +20,22 @@
 
 set -euo pipefail
 
+# Opt-in gate: the timer is installed fleet-wide, but the survey stays inert
+# until NETMON_WIFI_SURVEY_ENABLED is set true in the env file — the SAME flag
+# the collector reads to decide whether to ship the result. So "default OFF"
+# means the host genuinely does nothing (no scan, no file) until a sensor is
+# explicitly opted in (locally or via a dashboard desired-config push).
+ENV_FILE="${NETMON_ENV_FILE:-/etc/netmon/netmon.env}"
+# `|| true` so a NO-MATCH grep (the default state of every box that hasn't opted
+# in) doesn't trip `set -e`/`pipefail` and fail the oneshot service.
+_enabled="$( { grep -E '^[[:space:]]*NETMON_WIFI_SURVEY_ENABLED[[:space:]]*=' "$ENV_FILE" 2>/dev/null \
+    | tail -1 | cut -d= -f2- \
+    | tr -d '[:space:]' | tr -d '\042\047' | tr '[:upper:]' '[:lower:]'; } || true)"   # \042=" \047='
+if [[ "$_enabled" != "true" && "$_enabled" != "1" && "$_enabled" != "yes" ]]; then
+    echo "wifi survey disabled (NETMON_WIFI_SURVEY_ENABLED not true in ${ENV_FILE}) — skipping"
+    exit 0
+fi
+
 STATE_DIR="${NETMON_STATE_DIR:-/var/lib/netmon}"
 OUT="${STATE_DIR}/wifi_survey.json"
 TMP="$(mktemp)"
