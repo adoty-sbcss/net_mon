@@ -1,0 +1,16 @@
+[Unit]
+Description=NetMon Wi-Fi RF/AP survey (WIFI-2) — periodic passive scan
+Documentation=https://github.com/adoty-sbcss/net_mon
+
+[Timer]
+# Every 15 min so the envelope stays well inside NETMON_WIFI_SURVEY_MAX_AGE
+# (default 30 min) when the hourly bundle reads it. A passive scan is cheap and
+# the RF picture changes slowly. RandomizedDelaySec spreads fleet load slightly.
+OnBootSec=3min
+OnUnitActiveSec=15min
+RandomizedDelaySec=2min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

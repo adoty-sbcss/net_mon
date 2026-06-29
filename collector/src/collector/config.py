@@ -172,6 +172,21 @@ class Settings(BaseSettings):
         alias="NETMON_DNS_INCLUDE_NXDOMAIN_PROBE",
     )
 
+    # --- Wi-Fi RF / AP survey (WIFI-2) ---
+    # Passive neighbor-AP survey (SSIDs/BSSIDs/channels/signal/encryption). The
+    # scan itself runs HOST-side (scripts/netmon-wifi-survey.sh, on a timer)
+    # because the container has no iw/nmcli and NM owns the radio; the collector
+    # just reads + normalizes the envelope at /var/lib/netmon/wifi_survey.json and
+    # ships it in the hourly bundle. OFF by default — opt-in per sensor (a box
+    # needs a Wi-Fi NIC and the host timer installed for it to do anything).
+    wifi_survey_enabled: bool = Field(default=False, alias="NETMON_WIFI_SURVEY_ENABLED")
+    # Comma-separated SSIDs owned by the district — used to flag is_district_ssid
+    # (own APs vs. neighbors). Empty => the flag is left unknown (null).
+    wifi_district_ssids: str = Field(default="", alias="NETMON_WIFI_DISTRICT_SSIDS")
+    # Treat the envelope as stale past this age (sec); the bundle still ships it
+    # with stale=true so the dashboard can show "as of HH:MM". Default 30 min.
+    wifi_survey_max_age: int = Field(default=1800, alias="NETMON_WIFI_SURVEY_MAX_AGE")
+
     sftp_enabled: bool = Field(default=False, alias="NETMON_SFTP_ENABLED")
     sftp_host: str = Field(default="", alias="NETMON_SFTP_HOST")
     sftp_port: int = Field(default=22, alias="NETMON_SFTP_PORT")

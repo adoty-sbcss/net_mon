@@ -19,6 +19,7 @@ from .db import (
     list_inventory,
     list_snmp_credentials,
 )
+from .discovery import wifi as wifi_mod
 from .prompts import get_bundle_readme, get_bundle_readme_hourly
 
 log = structlog.get_logger(__name__)
@@ -100,6 +101,13 @@ def build_hourly_bundle(
         z.writestr("snmp_credentials.json", json.dumps(
             {"devices": list_snmp_credentials()},
             indent=2, default=_default))
+        # Wi-Fi RF/AP survey (WIFI-2) — box-global like inventory. Read + normalize
+        # the host-written envelope (scripts/netmon-wifi-survey.sh) via discovery/
+        # wifi.py. Present ONLY when NETMON_WIFI_SURVEY_ENABLED and an envelope
+        # exists, so a missing file means the survey is off / no Wi-Fi NIC.
+        wifi = wifi_mod.survey()
+        if wifi.get("available"):
+            z.writestr("wifi_survey.json", json.dumps(wifi, indent=2, default=_default))
         for sid in scan_ids:
             payload = _scan_payload(sid)
             for name, content in payload.items():
