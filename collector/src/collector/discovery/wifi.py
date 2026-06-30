@@ -182,11 +182,28 @@ def _split_terse(line: str) -> list[str]:
     r"""Split an `nmcli -t` line on unescaped ':' and unescape '\:' / '\\'.
 
     nmcli terse mode escapes ':' and '\' inside field values, so a BSSID comes
-    through as `98\:8F\:...`. Split only on separators not preceded by a
-    backslash, then unescape each field.
+    through as `98\:8F\:...`. Scan left-to-right consuming '\<char>' as one
+    completed escape pair (unescaping inline), so a value ending in a literal
+    backslash — emitted as '\\' right before the real ':' — does NOT defeat the
+    next separator (a lookbehind got this wrong and silently merged two fields).
     """
-    fields = re.split(r"(?<!\\):", line)
-    return [re.sub(r"\\(.)", r"\1", x) for x in fields]
+    out: list[str] = []
+    cur: list[str] = []
+    i, n = 0, len(line)
+    while i < n:
+        c = line[i]
+        if c == "\\" and i + 1 < n:
+            cur.append(line[i + 1])   # emit the escaped char, drop the backslash
+            i += 2
+        elif c == ":":
+            out.append("".join(cur))
+            cur = []
+            i += 1
+        else:
+            cur.append(c)
+            i += 1
+    out.append("".join(cur))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -224,10 +241,13 @@ def _parse_iw(raw: str, interface: str, district: set[str]) -> list[WifiBss]:
 
         has_rsn = "RSN:" in blk           # WPA2/WPA3
         has_wpa = re.search(r"(?m)^\s*WPA:", blk) is not None  # WPA1
-        low = blk.lower()
-        has_sae = "sae" in low and "authentication suites" in low
-        has_8021x = "ieee 802.1x" in low
-        has_psk = re.search(r"authentication suites:.*\bpsk\b", low) is not None
+        # Match security tokens against the block MINUS the SSID line — an SSID is
+        # neighbor-controlled free text (e.g. "sae-corp", "ccmp-cafe") and must not
+        # masquerade as an auth/cipher/PMF token. Anchor each to its IE line.
+        sec_text = re.sub(r"(?m)^\s*SSID:.*$", "", blk).lower()
+        has_sae = re.search(r"authentication suites:[^\n]*\bsae\b", sec_text) is not None
+        has_8021x = "ieee 802.1x" in sec_text
+        has_psk = re.search(r"authentication suites:[^\n]*\bpsk\b", sec_text) is not None
         if has_8021x:
             auth = "802.1x"
         elif has_sae and has_psk:
@@ -242,17 +262,15 @@ def _parse_iw(raw: str, interface: str, district: set[str]) -> list[WifiBss]:
             auth = "wep"
         else:
             auth = "open"
-        has_ccmp = "ccmp" in low
-        has_tkip = "tkip" in low
+        has_ccmp = "ccmp" in sec_text
+        has_tkip = "tkip" in sec_text
         cipher = ("ccmp+tkip" if has_ccmp and has_tkip
                   else "ccmp" if has_ccmp
                   else "tkip" if has_tkip
                   else "none" if auth == "open" else None)
         # RSN capabilities MFP bits (PMF). Present only when iw printed them.
         pmf: bool | None = None
-        if "mfp-required" in low:
-            pmf = True
-        elif "mfp-capable" in low:
+        if "mfp-required" in sec_text or "mfp-capable" in sec_text:
             pmf = True
         elif has_rsn:
             pmf = False
@@ -332,7 +350,9 @@ def _channel_from_freq(mhz: int | None) -> int | None:
         return 14
     if 2412 <= mhz <= 2472:
         return (mhz - 2407) // 5
-    if 5000 <= mhz <= 5895:
+    # Lowest real 5 GHz center is 5160 (ch 32); lower-bounding here makes a stray
+    # 5000 fall through to None instead of mapping to a bogus channel 0.
+    if 5160 <= mhz <= 5895:
         return (mhz - 5000) // 5
     if 5955 <= mhz <= 7115:
         return (mhz - 5950) // 5
