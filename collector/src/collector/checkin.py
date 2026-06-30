@@ -902,10 +902,11 @@ def _last_host_action() -> dict | None:
 
 
 def _interfaces() -> list[dict]:
-    """The box's live interface list (name / cidr / up / vlan / primary) so the
-    dashboard can show per-VLAN status PRECISELY — which sub-interfaces actually came
-    up and got a lease — instead of inferring it from scan data alone. Excludes
-    virtual/container NICs. Best-effort: [] on any failure."""
+    """The box's live interface list (name / mac / cidr / up / vlan / primary /
+    wireless) so the dashboard can show per-VLAN status PRECISELY — which
+    sub-interfaces actually came up and got a lease — and surface each NIC's MAC
+    (notably the Wi-Fi radio, which the operator needs to authorize on MPSK/MAC-
+    bound networks). Excludes virtual/container NICs. Best-effort: [] on failure."""
     try:
         from .discovery import interfaces as iface_mod
 
@@ -919,10 +920,13 @@ def _interfaces() -> list[dict]:
             out.append(
                 {
                     "name": st.name,
+                    "mac": st.mac,
                     "cidr": st.ipv4_addrs[0] if st.ipv4_addrs else None,
                     "up": bool(st.is_up),
                     "vlan": vlan,
                     "primary": st.name == primary,
+                    # A netdev is wireless iff it has an 802.11 phy.
+                    "wireless": Path(f"/sys/class/net/{st.name}/phy80211").exists(),
                 }
             )
         return out
