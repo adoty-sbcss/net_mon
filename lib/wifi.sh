@@ -105,10 +105,12 @@ wifi_keyfile_content() {
             printf 'identity=%s\n' "$identity"
             printf 'password=%s\n' "$secret"
             printf 'phase2-auth=mschapv2\n'
-            # v1 analysis join does NOT pin a CA cert (we're characterizing the
-            # network, not trusting it); skip server-cert validation explicitly so
-            # nmcli doesn't block. EAP-TLS + proper CA pinning = the SEC follow-up.
-            printf 'system-ca-certs=false\n\n'
+            # v1 analysis join sets NO ca-cert, so wpa_supplicant does NOT validate
+            # the RADIUS server cert — intentional for characterization (we are not
+            # trusting the network). A real deployment MUST pin the CA; EAP-TLS + CA
+            # pinning is the SEC follow-up. (Some NM builds warn about the missing CA;
+            # `system-ca-certs=false` does NOT disable validation, so it's omitted.)
+            printf '\n'
             ;;
         open|*)
             printf '\n'
@@ -151,7 +153,7 @@ _wifi_join_nm() {
         return 1
     fi
     # Associated iff the device reports this connection active.
-    if $SUDO nmcli -t -f GENERAL.STATE device show "$iface" 2>/dev/null | grep -q '100'; then
+    if $SUDO nmcli -t -f GENERAL.STATE device show "$iface" 2>/dev/null | grep -q '^GENERAL.STATE:100 '; then
         ok "joined ${ssid} on ${iface} (routes-off; uplink untouched)"
         return 0
     fi

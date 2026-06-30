@@ -42,20 +42,25 @@ _now_ms() { date +%s%3N 2>/dev/null || echo 0; }
 _ts()     { date -u +%Y-%m-%dT%H:%M:%SZ; }
 b64()     { base64 -w0 2>/dev/null || base64 | tr -d '\n'; }
 
-# Tear down our policy route + rule (idempotent). Always run on exit.
+# Tear down our policy route + rules (idempotent). Always run on exit.
 _routing_teardown() {
     local iface="$1"
     $SUDO ip rule del prio "$RT_RULE_PRIO" 2>/dev/null || true
+    $SUDO ip rule del prio "$((RT_RULE_PRIO + 1))" 2>/dev/null || true
     $SUDO ip route flush table "$RT_TABLE" 2>/dev/null || true
 }
 
-# Route traffic FROM the Wi-Fi source IP out via the Wi-Fi gateway (so probes
-# traverse the joined network, not the wired uplink). Reversible; uplink untouched.
+# Route probe traffic out via the Wi-Fi gateway (so it traverses the joined network,
+# not the wired uplink). Two rules: `from <wifi-ip>` (matches probes bound by source
+# IP) AND `oif <iface>` (matches anything egress-bound to the radio) — belt-and-
+# suspenders since SO_BINDTODEVICE sets the oif but NOT the source IP. Reversible;
+# the box's real default route is untouched.
 _routing_setup() {
     local iface="$1" ip="$2" gw="$3"
     [[ -z "$ip" || -z "$gw" ]] && return 1
     $SUDO ip route replace default via "$gw" dev "$iface" table "$RT_TABLE" 2>/dev/null || return 1
     $SUDO ip rule add from "$ip" table "$RT_TABLE" prio "$RT_RULE_PRIO" 2>/dev/null || true
+    $SUDO ip rule add oif "$iface" table "$RT_TABLE" prio "$((RT_RULE_PRIO + 1))" 2>/dev/null || true
     return 0
 }
 
@@ -66,8 +71,8 @@ _routing_setup() {
 #   portal  : 3xx or a 200 with a body (intercepted -> redirect_url is the portal)
 #   blocked : no response (timeout/refused)
 _captive_probe() {
-    local iface="$1" out code redir
-    out="$($SUDO curl -s -m 8 --interface "$iface" -o /dev/null \
+    local bind="$1" out code redir   # bind = Wi-Fi source IP (curl --interface takes an address)
+    out="$($SUDO curl -s -m 8 --interface "$bind" -o /dev/null \
             -w '%{http_code} %{redirect_url}' \
             http://connectivitycheck.gstatic.com/generate_204 2>/dev/null || true)"
     code="${out%% *}"; redir="${out#* }"
@@ -118,38 +123,46 @@ main() {
             sleep 0.5; tries=$((tries+1))
         done
         [[ -n "$ip4" ]] && dhcp_ms=$(( $(_now_ms) - d0 ))
-        gw="$(ip -4 route show table "$RT_TABLE" 2>/dev/null | awk '/default/{print $3; exit}')"
-        [[ -z "$gw" ]] && gw="$($SUDO nmcli -g IP4.GATEWAY dev show "$iface" 2>/dev/null | head -1)"
+        # Gateway: ask NM/the device directly — the analysis radio is never-default,
+        # so the MAIN table has no default via it. Fallback: any default for the
+        # device across all tables.
+        gw="$($SUDO nmcli -g IP4.GATEWAY dev show "$iface" 2>/dev/null | head -1)"
+        [[ -z "$gw" ]] && gw="$(ip -4 route show table all dev "$iface" 2>/dev/null | awk '/default/{print $3; exit}')"
     fi
 
-    # 3. RSSI (dBm).
+    # 3. Signal quality (nmcli SIGNAL is 0-100 link quality, NOT dBm — same unit the
+    #    WIFI-2 survey reports; tagged signal_unit="quality" in the artifact).
     local rssi=""
     rssi="$($SUDO nmcli -t -f IN-USE,SIGNAL,SSID dev wifi list ifname "$iface" 2>/dev/null \
-            | awk -F: '/^\*/{print $2; exit}')"   # nmcli SIGNAL is 0-100 quality here
+            | awk -F: '/^\*/{print $2; exit}')"
 
     # 4. Battery (only if we got an IP). Probes traverse the joined net via the
     #    dedicated route table.
     local cap_state="n/a" cap_code="" cap_redir_b64="" ping_ok=false rtt="" loss=""
     local dns_ok=false iso_tested="" iso_reachable=""
     if [[ -n "$ip4" && -n "$gw" ]]; then
-        _routing_setup "$iface" "${ip4%/*}" "$gw" || true
+        local srcip="${ip4%/*}"
+        _routing_setup "$iface" "$srcip" "$gw" || true
+        # Probes bind by SOURCE IP (not device): SO_BINDTODEVICE sets the oif but not
+        # the source, so binding to the Wi-Fi IP is what makes the `from <ip>` policy
+        # rule route them via the Wi-Fi gateway (the oif rule is the fallback).
         # captive portal
-        local cap; cap="$(_captive_probe "$iface")"
+        local cap; cap="$(_captive_probe "$srcip")"
         cap_state="$(printf '%s' "$cap" | cut -f1)"
         cap_code="$(printf '%s' "$cap" | cut -f2)"
         cap_redir_b64="$(printf '%s' "$cap" | cut -f3 | b64)"
         # internet reachability via the Wi-Fi
-        local png; png="$($SUDO ping -I "$iface" -c 3 -W 2 1.1.1.1 2>/dev/null || true)"
+        local png; png="$($SUDO ping -I "$srcip" -c 3 -W 2 1.1.1.1 2>/dev/null || true)"
         printf '%s' "$png" | grep -q ' 0% packet loss' && ping_ok=true
         rtt="$(printf '%s' "$png" | awk -F'/' '/rtt|round-trip/{print $5; exit}')"
         loss="$(printf '%s' "$png" | grep -oE '[0-9]+% packet loss' | grep -oE '[0-9]+' | head -1)"
         # DNS resolves through the Wi-Fi
-        $SUDO curl -s -m 6 --interface "$iface" -o /dev/null https://dns.google/resolve?name=example.com 2>/dev/null && dns_ok=true
+        $SUDO curl -s -m 6 --interface "$srcip" -o /dev/null https://dns.google/resolve?name=example.com 2>/dev/null && dns_ok=true
         # ISOLATION: from the guest/Wi-Fi, can we reach an INTERNAL host (the wired
         # uplink's gateway)? A properly isolated guest network should NOT.
         iso_tested="$(ip -4 route show default 2>/dev/null | awk '/default/{print $3; exit}')"
         if [[ -n "$iso_tested" ]]; then
-            if $SUDO ping -I "$iface" -c 1 -W 2 "$iso_tested" >/dev/null 2>&1; then iso_reachable=true; else iso_reachable=false; fi
+            if $SUDO ping -I "$srcip" -c 1 -W 2 "$iso_tested" >/dev/null 2>&1; then iso_reachable=true; else iso_reachable=false; fi
         fi
         _routing_teardown "$iface"
     fi
@@ -159,8 +172,8 @@ main() {
     {
         printf '{"schema":1,"generated_at":"%s","interface":"%s","results":[' "$(_ts)" "$iface"
         printf '{"ssid":"%s","auth":"%s","associated":%s,"assoc_ms":%s,"dhcp_ms":%s,' \
-            "$(printf '%s' "$ssid" | tr -d '"\\')" "${auth:-open}" "$associated" "$assoc_ms" "$dhcp_ms"
-        printf '"ip":"%s","gateway":"%s","signal":%s,' "${ip4:-}" "${gw:-}" "${rssi:-null}"
+            "$(printf '%s' "$ssid" | tr -d '\000-\037\042\134')" "${auth:-open}" "$associated" "$assoc_ms" "$dhcp_ms"
+        printf '"ip":"%s","gateway":"%s","signal":%s,"signal_unit":"quality",' "${ip4:-}" "${gw:-}" "${rssi:-null}"
         printf '"captive_portal":{"state":"%s","http_code":"%s","redirect_b64":"%s"},' \
             "$cap_state" "${cap_code:-}" "$cap_redir_b64"
         printf '"internet":{"ping_ok":%s,"rtt_ms":"%s","loss_pct":"%s"},' "$ping_ok" "${rtt:-}" "${loss:-}"
