@@ -25,7 +25,7 @@ import json
 import re
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -357,12 +357,15 @@ def _is_district(ssid: str | None, district: set[str]) -> bool | None:
 
 
 def _age_seconds(generated_at: str | None) -> int | None:
+    """Seconds since the envelope was generated. `generated_at` is UTC (`…Z`, from
+    the host script's `date -u`), so parse it as UTC and diff against epoch —
+    DST-safe (the old `time.timezone` math was an hour off during DST and mixed
+    naive-local with UTC)."""
     if not generated_at:
         return None
     try:
-        gen = datetime.strptime(generated_at, "%Y-%m-%dT%H:%M:%SZ")
-        return max(0, int(time.time() - gen.replace(tzinfo=None).timestamp()
-                          + time.timezone))
+        gen = datetime.strptime(generated_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        return max(0, int(time.time() - gen.timestamp()))
     except (ValueError, TypeError):
         return None
 

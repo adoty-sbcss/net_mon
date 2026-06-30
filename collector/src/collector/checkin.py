@@ -208,6 +208,13 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_TRUNK_VLANS"] = re.sub(r"[^0-9,]", "", str(data.get("trunk_vlans") or ""))
     if "trunk_statics" in data:
         mapping["NETMON_TRUNK_STATICS"] = str(data.get("trunk_statics") or "")
+    # Wi-Fi RF/AP survey (WIFI-2) toggle pushed from the dashboard. The same flag
+    # gates BOTH the host survey timer (netmon-wifi-survey.sh reads this env file)
+    # and the collector's bundle inclusion, so one push enables/disables both.
+    if "wifi_survey_enabled" in data:
+        mapping["NETMON_WIFI_SURVEY_ENABLED"] = "true" if data.get("wifi_survey_enabled") else "false"
+    if "wifi_district_ssids" in data:
+        mapping["NETMON_WIFI_DISTRICT_SSIDS"] = str(data.get("wifi_district_ssids") or "")
     if mapping:
         _update_env_file(ENV_FILE, mapping)
         log.info("applied desired config", keys=list(mapping))
