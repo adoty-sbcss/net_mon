@@ -33,7 +33,10 @@ done
 STATE_DIR="${NETMON_STATE_DIR:-/var/lib/netmon}"
 OUT="${STATE_DIR}/wifi_experience.json"
 RT_TABLE=51                       # dedicated policy-routing table for the analysis radio
-RT_RULE_PRIO=51000
+# Rule priority MUST be below the main-table rule (prio 32766), or the main table
+# matches first and the wifi-sourced probe leaves via the wired uplink. Validated
+# on Monitor1: at 5100 `ip route get <dst> from <wifi-ip>` routes via the wifi.
+RT_RULE_PRIO=5100
 
 # common.sh provides $SUDO; fall back if it wasn't sourced.
 if [ -z "${SUDO+x}" ]; then SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"; fi
@@ -123,11 +126,11 @@ main() {
             sleep 0.5; tries=$((tries+1))
         done
         [[ -n "$ip4" ]] && dhcp_ms=$(( $(_now_ms) - d0 ))
-        # Gateway: ask NM/the device directly — the analysis radio is never-default,
-        # so the MAIN table has no default via it. Fallback: any default for the
-        # device across all tables.
-        gw="$($SUDO nmcli -g IP4.GATEWAY dev show "$iface" 2>/dev/null | head -1)"
-        [[ -z "$gw" ]] && gw="$(ip -4 route show table all dev "$iface" 2>/dev/null | awk '/default/{print $3; exit}')"
+        # Gateway: ignore-auto-routes suppresses IP4.GATEWAY AND installs no default
+        # route, so the gateway comes from the DHCP lease's `routers` option (the
+        # only reliable source on a routes-off connection; validated on Monitor1).
+        gw="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null | tr ',' '\n' | sed -n 's/.*routers = \([0-9.]*\).*/\1/p' | head -1)"
+        [[ -z "$gw" ]] && gw="$($SUDO nmcli -g IP4.GATEWAY dev show "$iface" 2>/dev/null | head -1)"
     fi
 
     # 3. Signal quality (nmcli SIGNAL is 0-100 link quality, NOT dBm — same unit the
