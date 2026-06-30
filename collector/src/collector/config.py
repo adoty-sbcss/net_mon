@@ -187,6 +187,20 @@ class Settings(BaseSettings):
     # with stale=true so the dashboard can show "as of HH:MM". Default 30 min.
     wifi_survey_max_age: int = Field(default=1800, alias="NETMON_WIFI_SURVEY_MAX_AGE")
 
+    # --- Wi-Fi analysis-radio JOIN (WIFI-1) ---
+    # Join a spare Wi-Fi NIC to a network so the poller can analyze it like any other
+    # interface. OFF by default; applied HOST-side via the host-wifi-join action
+    # (lib/wifi.sh) with routes-off so the analysis radio can never become the uplink.
+    # Auth: open | psk | peap | ttls (peap/ttls = WPA2-Enterprise username+password;
+    # EAP-TLS client certs are a separate SEC-gated follow-up). The secret is written
+    # to a 0600 NM keyfile on apply, never passed on the nmcli command line.
+    wifi_join_enabled: bool = Field(default=False, alias="NETMON_WIFI_JOIN_ENABLED")
+    wifi_join_iface: str = Field(default="", alias="NETMON_WIFI_JOIN_IFACE")
+    wifi_join_ssid: str = Field(default="", alias="NETMON_WIFI_JOIN_SSID")
+    wifi_join_auth: str = Field(default="open", alias="NETMON_WIFI_JOIN_AUTH")
+    wifi_join_identity: str = Field(default="", alias="NETMON_WIFI_JOIN_IDENTITY")
+    wifi_join_secret: str = Field(default="", alias="NETMON_WIFI_JOIN_SECRET")
+
     sftp_enabled: bool = Field(default=False, alias="NETMON_SFTP_ENABLED")
     sftp_host: str = Field(default="", alias="NETMON_SFTP_HOST")
     sftp_port: int = Field(default=22, alias="NETMON_SFTP_PORT")

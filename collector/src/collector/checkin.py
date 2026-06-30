@@ -215,6 +215,24 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_WIFI_SURVEY_ENABLED"] = "true" if data.get("wifi_survey_enabled") else "false"
     if "wifi_district_ssids" in data:
         mapping["NETMON_WIFI_DISTRICT_SSIDS"] = str(data.get("wifi_district_ssids") or "")
+    # Wi-Fi analysis-radio JOIN (WIFI-1) pushed from the dashboard. The join runs on
+    # the HOST via the 'host-wifi-join' host-action (lib/wifi.sh, routes-off so it
+    # can't hijack the uplink); these keys just record the desired network. OFF by
+    # default. The secret lands in /etc/netmon/netmon.env (0600, log-redacted) and is
+    # written into a 0600 NM keyfile on apply — never passed on the nmcli argv.
+    if "wifi_join_enabled" in data:
+        mapping["NETMON_WIFI_JOIN_ENABLED"] = "true" if data.get("wifi_join_enabled") else "false"
+    if "wifi_join_iface" in data:
+        mapping["NETMON_WIFI_JOIN_IFACE"] = str(data.get("wifi_join_iface") or "")
+    if "wifi_join_ssid" in data:
+        mapping["NETMON_WIFI_JOIN_SSID"] = str(data.get("wifi_join_ssid") or "")
+    if "wifi_join_auth" in data:
+        _wauth = str(data.get("wifi_join_auth") or "open").lower()
+        mapping["NETMON_WIFI_JOIN_AUTH"] = _wauth if _wauth in ("open", "psk", "peap", "ttls") else "open"
+    if "wifi_join_identity" in data:
+        mapping["NETMON_WIFI_JOIN_IDENTITY"] = str(data.get("wifi_join_identity") or "")
+    if data.get("wifi_join_secret"):  # only overwrite when provided (like sftp_password)
+        mapping["NETMON_WIFI_JOIN_SECRET"] = str(data["wifi_join_secret"])
     if mapping:
         _update_env_file(ENV_FILE, mapping)
         log.info("applied desired config", keys=list(mapping))
@@ -244,7 +262,7 @@ def _local_net() -> tuple[str | None, str | None, str | None]:
 # password / SNMP community / token / bootstrap key must never ride out in clear.
 _SECRET_KV_RE = re.compile(
     r"(?i)([A-Za-z0-9_.\-]*"
-    r"(?:passwd|password|secret|token|communit|api[_-]?key|bootstrap[_-]?key|auth[_-]?key|access[_-]?key)"
+    r"(?:passwd|password|secret|token|communit|psk|api[_-]?key|bootstrap[_-]?key|auth[_-]?key|access[_-]?key)"
     r"[A-Za-z0-9_.\-]*)"        # 1: the key, e.g. NETMON_SFTP_PASSWORD / community
     r"[\"']?\s*[=:]\s*[\"']?"   # an = or : assignment (optionally quoted — env/JSON/CLI)
     r"([^\s\"';}]+)"            # 2: value, to next delimiter. Allows ',' so a
@@ -337,6 +355,8 @@ _HOST_ACTIONS: set[str] = {
     "host-reboot",    # systemctl reboot the box
     "host-rollback",  # scripts/rollback.sh -> last-known-good SHA + image + DB
     "host-apply-vlan", # apply NETMON_TRUNK_* netplan sub-interfaces (lib/trunk.sh)
+    "host-wifi-join",  # join NETMON_WIFI_JOIN_* on the analysis radio (lib/wifi.sh, routes-off)
+    "host-wifi-leave", # tear down all netmon-owned Wi-Fi connections (lib/wifi.sh)
 }
 
 # State-changing "remote console" actions (CON-5). SAME safety model as
