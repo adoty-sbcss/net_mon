@@ -143,8 +143,11 @@ _wifi_join_nm() {
     $SUDO install -m 600 -o root -g root "$tmp" "$keyfile"
     rm -f "$tmp"
     $SUDO nmcli con reload >/dev/null 2>&1 || true
-    # --wait caps activation so a failing auth/DHCP returns promptly instead of hanging.
-    $SUDO nmcli con up "$conname" --wait 25 >/dev/null 2>&1 || true
+    # --wait is a GLOBAL option and MUST precede the subcommand (`nmcli --wait N con
+    # up`); placed after, nmcli errors "invalid extra argument '--wait'" and the
+    # connection never activates (the VLAN path hid this with autoconnect=yes — we
+    # use autoconnect=false). Caps activation so a failing auth/DHCP returns promptly.
+    $SUDO nmcli --wait 25 con up "$conname" >/dev/null 2>&1 || true
 
     after_default="$(ip route show default 2>/dev/null | head -1)"
     if [[ -n "$before_default" && -z "$after_default" ]]; then
