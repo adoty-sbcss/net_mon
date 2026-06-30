@@ -113,6 +113,44 @@ run_action() {
                 apply_vlan_netplan_headless "$t_parent" "$t_vlans" "$t_statics"
             ) 2>&1 | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done
             ;;
+        wifi-join|host-wifi-join)
+            log "ACTION wifi-join: join NETMON_WIFI_JOIN_* on the analysis radio (lib/wifi.sh, routes-off)"
+            # Subshell so the sourced libs' log/ok/warn/SUDO don't clobber this script's.
+            # lib/wifi.sh joins with never-default + a default-route guard (auto-revert),
+            # so the analysis radio can never steal the box's uplink/SFTP path.
+            (
+                for lib in common.sh paths.sh envfile.sh wifi.sh; do
+                    # shellcheck source=/dev/null
+                    [ -f "$REPO_DIR/lib/$lib" ] && . "$REPO_DIR/lib/$lib"
+                done
+                w_enabled="$(current_value NETMON_WIFI_JOIN_ENABLED 2>/dev/null || true)"
+                case "${w_enabled,,}" in
+                    true|1|yes) ;;
+                    *) echo "NETMON_WIFI_JOIN_ENABLED not true — tearing down netmon Wi-Fi"; wifi_leave_all; exit 0 ;;
+                esac
+                w_ssid="$(current_value NETMON_WIFI_JOIN_SSID 2>/dev/null || true)"
+                [ -z "$w_ssid" ] && { echo "NETMON_WIFI_JOIN_SSID empty — nothing to join"; exit 1; }
+                w_iface="$(current_value NETMON_WIFI_JOIN_IFACE 2>/dev/null || true)"
+                [ -z "$w_iface" ] && w_iface="$(wifi_analysis_iface)"
+                [ -z "$w_iface" ] && { echo "no spare Wi-Fi NIC (only radio owns the default route) — refusing"; exit 1; }
+                w_auth="$(current_value NETMON_WIFI_JOIN_AUTH 2>/dev/null || true)"
+                w_id="$(current_value NETMON_WIFI_JOIN_IDENTITY 2>/dev/null || true)"
+                w_sec="$(current_value NETMON_WIFI_JOIN_SECRET 2>/dev/null || true)"
+                # Reconcile to exactly the wanted network: drop any prior netmon Wi-Fi first.
+                wifi_leave_all
+                wifi_join "$w_iface" "$w_ssid" "${w_auth:-open}" "$w_id" "$w_sec"
+            ) 2>&1 | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done
+            ;;
+        wifi-leave|host-wifi-leave)
+            log "ACTION wifi-leave: tear down all netmon-owned Wi-Fi connections"
+            (
+                for lib in common.sh paths.sh envfile.sh wifi.sh; do
+                    # shellcheck source=/dev/null
+                    [ -f "$REPO_DIR/lib/$lib" ] && . "$REPO_DIR/lib/$lib"
+                done
+                wifi_leave_all
+            ) 2>&1 | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done
+            ;;
         cis-apply|host-cis-apply)
             log "ACTION cis-apply: apply the CIS safe subset (scripts/cis-apply.sh --apply)"
             # The apply has its own self-healing guard: it auto-reverts if SSH or
