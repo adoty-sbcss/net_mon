@@ -75,8 +75,12 @@ NMCLI_FIELDS="IN-USE,SSID,BSSID,CHAN,FREQ,RATE,SIGNAL,SECURITY,WPA-FLAGS,RSN-FLA
 
 # GNU base64 wraps at 76 cols by default; -w0 keeps it one line. Fallback strips.
 b64() { base64 -w0 2>/dev/null || base64 | tr -d '\n'; }
-# JSON-safe a short error string: drop quotes, backslashes, and newlines.
-jsan() { tr -d '"\\\n\r' | head -c 200; }
+# JSON-safe a short error string. The error field is injected RAW into the
+# envelope (it bypasses the base64 path the rest of the output uses), so it must
+# carry no character that breaks strict JSON: drop ALL control bytes U+0000-U+001F
+# (incl. TAB, which a tool's stderr can emit), plus the double-quote and backslash.
+# (\000-\037 = the control range, \042 = ", \134 = \).
+jsan() { tr -d '\000-\037\042\134' | head -c 200; }
 
 ifaces_json=""
 sep=""
