@@ -38,6 +38,13 @@ RT_TABLE=51                       # dedicated policy-routing table for the analy
 # on Monitor1: at 5100 `ip route get <dst> from <wifi-ip>` routes via the wifi.
 RT_RULE_PRIO=5100
 
+# Cleanup targets for the EXIT trap. These MUST be globals: the trap fires after
+# main() returns, when main's `local iface`/`ssid` are out of scope — referencing
+# them there is an "unbound variable" under `set -u`, which aborts the trap before
+# the Wi-Fi is torn down (leaving the radio joined). Globals survive main's return.
+_TRAP_IFACE=""
+_TRAP_SSID=""
+
 # common.sh provides $SUDO; fall back if it wasn't sourced.
 if [ -z "${SUDO+x}" ]; then SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"; fi
 
@@ -106,7 +113,10 @@ main() {
     identity="$(current_value NETMON_WIFI_JOIN_IDENTITY 2>/dev/null || true)"
     secret="$(current_value NETMON_WIFI_JOIN_SECRET 2>/dev/null || true)"
 
-    trap '_routing_teardown "$iface"; wifi_leave "$ssid" 2>/dev/null || true' EXIT
+    # Hand the cleanup targets to the trap via globals (main's locals vanish before
+    # the EXIT trap runs — see _TRAP_IFACE/_TRAP_SSID above).
+    _TRAP_IFACE="$iface"; _TRAP_SSID="$ssid"
+    trap '_routing_teardown "$_TRAP_IFACE"; [ -n "$_TRAP_SSID" ] && wifi_leave "$_TRAP_SSID" >/dev/null 2>&1 || true' EXIT
 
     # 1. Associate (timed).
     local t0 assoc_ms associated=false
