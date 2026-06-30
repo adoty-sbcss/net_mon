@@ -151,6 +151,15 @@ run_action() {
                 wifi_leave_all
             ) 2>&1 | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done
             ;;
+        wifi-experience|host-wifi-experience)
+            log "ACTION wifi-experience: run the WIFI-3 client-experience battery (join->measure->leave, routes-off)"
+            if [ -x "$REPO_DIR/scripts/netmon-wifi-experience.sh" ]; then
+                "$REPO_DIR/scripts/netmon-wifi-experience.sh" 2>&1 | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done
+            else
+                log "  wifi-experience: scripts/netmon-wifi-experience.sh missing or not executable"
+                return 1
+            fi
+            ;;
         cis-apply|host-cis-apply)
             log "ACTION cis-apply: apply the CIS safe subset (scripts/cis-apply.sh --apply)"
             # The apply has its own self-healing guard: it auto-reverts if SSH or

@@ -20,6 +20,7 @@ from .db import (
     list_snmp_credentials,
 )
 from .discovery import wifi as wifi_mod
+from .discovery import wifi_experience as wifi_exp_mod
 from .prompts import get_bundle_readme, get_bundle_readme_hourly
 
 log = structlog.get_logger(__name__)
@@ -108,6 +109,12 @@ def build_hourly_bundle(
         wifi = wifi_mod.survey()
         if wifi.get("available"):
             z.writestr("wifi_survey.json", json.dumps(wifi, indent=2, default=_default))
+        # WIFI-3: the host-side client-experience battery (join -> measure -> leave),
+        # box-global like the survey. Present only when wifi-join is enabled + the
+        # battery has run.
+        wifi_exp = wifi_exp_mod.load()
+        if wifi_exp.get("available"):
+            z.writestr("wifi_experience.json", json.dumps(wifi_exp, indent=2, default=_default))
         for sid in scan_ids:
             payload = _scan_payload(sid)
             for name, content in payload.items():
