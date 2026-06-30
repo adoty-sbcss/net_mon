@@ -357,6 +357,8 @@ _HOST_ACTIONS: set[str] = {
     "host-apply-vlan", # apply NETMON_TRUNK_* netplan sub-interfaces (lib/trunk.sh)
     "host-wifi-join",  # join NETMON_WIFI_JOIN_* on the analysis radio (lib/wifi.sh, routes-off)
     "host-wifi-leave", # tear down all netmon-owned Wi-Fi connections (lib/wifi.sh)
+    "host-cis-apply",  # apply the CIS safe subset (scripts/cis-apply.sh --apply; self-healing guard auto-reverts on connectivity loss)
+    "host-cis-revert", # undo the CIS safe subset (scripts/cis-apply.sh --revert)
 }
 
 # State-changing "remote console" actions (CON-5). SAME safety model as

@@ -279,6 +279,29 @@ c_pwquality() {
   fi
 }
 
+# Self-healing guard for an UNATTENDED apply (e.g. the fleet host-cis-apply action):
+# after the safe subset lands, confirm we didn't break the two things that matter for
+# a remote box — SSH reachability + OUTBOUND connectivity (its check-in/SFTP path). If
+# either is gone, auto-revert so a box can never strand itself. The safe subset only
+# denies INBOUND + allows ALL outbound (and allows 22 before enabling ufw), so this
+# should always pass — it's the backstop that makes a hands-off rollout safe.
+_post_apply_guard() {
+  # 1) sshd still listening on :22 (don't lock the fleet out).
+  if command -v ss >/dev/null 2>&1 && ! ss -ltn 2>/dev/null | grep -qE ':22( |$)'; then
+    log "guard: sshd is NOT listening on :22 after apply"
+    return 1
+  fi
+  # 2) outbound still works. Multiple fallbacks; only fail if ALL are dead, so a
+  #    transient blip can't trigger a false-positive revert of good hardening.
+  if timeout 6 getent hosts one.one.one.one >/dev/null 2>&1; then return 0; fi
+  local ip
+  for ip in 1.1.1.1 8.8.8.8; do
+    if timeout 6 bash -c ": >/dev/tcp/$ip/443" 2>/dev/null; then return 0; fi
+  done
+  log "guard: no outbound connectivity (DNS + TLS to 1.1.1.1/8.8.8.8 all failed)"
+  return 1
+}
+
 do_apply() {
   log "applying NetMon-vetted CIS safe subset (mode=$MODE)"
   [ "$MODE" = apply ] && { mkdir -p "$BACKUP_DIR"; ln -sfn "$BACKUP_DIR" "$LATEST"; log "backups -> $BACKUP_DIR"; }
@@ -292,6 +315,18 @@ do_apply() {
   c_apparmor
   c_coredumps
   c_pwquality
+  # Backstop for unattended/remote applies: revert automatically if we broke SSH
+  # or egress. (No-op in dry-run, which changes nothing.)
+  if [ "$MODE" = apply ]; then
+    if _post_apply_guard; then
+      log "post-apply guard OK — sshd listening + outbound connectivity intact"
+    else
+      log "POST-APPLY GUARD FAILED — auto-reverting the safe subset so the box isn't left degraded"
+      do_revert
+      log "reverted to pre-apply state. Investigate before retrying (see docs/HARDENING.md)."
+      exit 5
+    fi
+  fi
   log "done."
   [ "$MODE" = apply ] && log "revert anytime with: sudo $0 --revert"
 }

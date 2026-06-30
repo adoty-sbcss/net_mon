@@ -151,6 +151,26 @@ run_action() {
                 wifi_leave_all
             ) 2>&1 | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done
             ;;
+        cis-apply|host-cis-apply)
+            log "ACTION cis-apply: apply the CIS safe subset (scripts/cis-apply.sh --apply)"
+            # The apply has its own self-healing guard: it auto-reverts if SSH or
+            # outbound connectivity is lost, so a remote box can't strand itself.
+            if [ -x "$REPO_DIR/scripts/cis-apply.sh" ]; then
+                "${SUDO[@]}" bash "$REPO_DIR/scripts/cis-apply.sh" --apply 2>&1 | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done
+            else
+                log "  cis-apply: scripts/cis-apply.sh missing or not executable"
+                return 1
+            fi
+            ;;
+        cis-revert|host-cis-revert)
+            log "ACTION cis-revert: undo the CIS safe subset (scripts/cis-apply.sh --revert)"
+            if [ -x "$REPO_DIR/scripts/cis-apply.sh" ]; then
+                "${SUDO[@]}" bash "$REPO_DIR/scripts/cis-apply.sh" --revert 2>&1 | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done
+            else
+                log "  cis-revert: scripts/cis-apply.sh missing or not executable"
+                return 1
+            fi
+            ;;
         *)
             log "REFUSED unknown host action: '$action' (not in allow-list)"
             return 1
