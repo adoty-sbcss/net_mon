@@ -42,6 +42,9 @@ done
 STATE_DIR="${NETMON_STATE_DIR:-/var/lib/netmon}"
 OUT="${STATE_DIR}/wifi_experience.json"
 PROFILES_FILE="${STATE_DIR}/wifi-profiles.json"   # dashboard-pushed profiles (0600)
+WEBPERF_URLS_FILE="${STATE_DIR}/webperf-urls.json"   # dashboard-pushed district URL list (PERF-5)
+# curl -w timing (mirrors collector/webperf.py _CURL_FMT); all times cumulative seconds.
+WEBPERF_FMT='%{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total} %{http_code} %{size_download} %{speed_download}'
 RT_TABLE=51                       # dedicated policy-routing table for the analysis radio
 # Rule priority MUST be below the main-table rule (prio 32766), or the main table
 # matches first and the wifi-sourced probe leaves via the wired uplink. Validated
@@ -142,6 +145,25 @@ _captive_try_accept() {
             --get --data 'accept=1&submit=Continue&agree=on&terms=agree' "$action" 2>/dev/null && return 0
     fi
     return 1
+}
+
+# Probe ONE URL's load waterfall source-bound over the Wi-Fi (curl --interface), and
+# emit a single JSON object matching collector/webperf.py's shape so the wired (live
+# POST) and Wi-Fi (bundle) runs are the SAME measurement. Cumulative curl seconds -> ms.
+_webperf_one() {
+    local srcip="$1" url="$2" out u
+    out="$($SUDO curl -sS -o /dev/null -L --proto '=http,https' --proto-redir '=http,https' \
+           --max-time 15 --interface "$srcip" -w "$WEBPERF_FMT" "$url" 2>/dev/null || true)"
+    u="$(printf '%s' "$url" | tr -d '\000-\037\042\134')"
+    awk -v url="$u" -v raw="$out" 'BEGIN{
+        n=split(raw, p, " ");
+        if (n < 8) { printf "{\"url\":\"%s\",\"ok\":false,\"error\":\"no timing\"}", url; exit }
+        code=p[6]+0; ok=(code>=200 && code<400)?"true":"false";
+        tls=(p[3]+0>0)?sprintf("%.1f", p[3]*1000):"null";
+        errf=(ok=="true")?"null":((code>0)?sprintf("\"HTTP %d\"", code):"\"no response\"");
+        printf "{\"url\":\"%s\",\"ok\":%s,\"dns_ms\":%.1f,\"tcp_ms\":%.1f,\"tls_ms\":%s,\"ttfb_ms\":%.1f,\"total_ms\":%.1f,\"http_status\":%d,\"size_bytes\":%d,\"speed_mbps\":%.2f,\"error\":%s}", \
+            url, ok, p[1]*1000, p[2]*1000, tls, p[4]*1000, p[5]*1000, code, p[7]+0, p[8]*8/1000000, errf;
+    }'
 }
 
 # Emit the join profiles as TSV rows: ssid \t auth \t identity \t secret \t cap_accept.
@@ -267,7 +289,7 @@ _run_profile() {
     #    dedicated route table.
     local cap_state="n/a" cap_code="" cap_redir="" cap_redir_b64="" cap_accepted="null"
     local ping_ok=false rtt="" loss="" dns_ok=false iso_tested="" iso_reachable=""
-    local dl_mbps="" tgt_json=""
+    local dl_mbps="" tgt_json="" wp_json=""
     if [[ -n "$ip4" && -n "$gw" ]]; then
         local srcip="${ip4%/*}"
         _routing_setup "$iface" "$srcip" "$gw" || true
@@ -307,6 +329,20 @@ _run_profile() {
             [[ -n "$tgt_json" ]] && tgt_json="${tgt_json},"
             tgt_json="${tgt_json}{\"host\":\"${_t}\",\"rtt_ms\":${_trtt:-null}}"
         done
+        # webperf: run the district URL waterfall source-bound over the Wi-Fi, so each
+        # site's DNS/TCP/TLS/TTFB/total is comparable to the WIRED run (same probe, both
+        # paths). Only when the district enabled web monitoring + pushed a URL list.
+        local webperf_on="0" _wpurl
+        case "$(current_value NETMON_WEBPERF_ENABLED 2>/dev/null | tr '[:upper:]' '[:lower:]')" in
+            true|1|yes) webperf_on=1 ;;
+        esac
+        if [[ "$webperf_on" == "1" && -s "$WEBPERF_URLS_FILE" ]]; then
+            while IFS= read -r _wpurl; do
+                [[ -z "$_wpurl" ]] && continue
+                [[ -n "$wp_json" ]] && wp_json="${wp_json},"
+                wp_json="${wp_json}$(_webperf_one "$srcip" "$_wpurl")"
+            done < <($SUDO grep -oE 'https?://[^"]+' "$WEBPERF_URLS_FILE" 2>/dev/null)
+        fi
         # ISOLATION: from the guest/Wi-Fi, can we reach an INTERNAL host (the wired
         # uplink's gateway)? A properly isolated guest network should NOT.
         iso_tested="$(ip -4 route show default 2>/dev/null | awk '/default/{print $3; exit}')"
@@ -329,6 +365,7 @@ _run_profile() {
     printf '"link":{"bssid":"%s","band":"%s","rx_rate_mbps":%s},' "${bssid:-}" "${band:-}" "${rx_rate:-null}"
     printf '"throughput":{"download_mbps":%s},' "${dl_mbps:-null}"
     printf '"targets":[%s],' "${tgt_json:-}"
+    printf '"webperf":[%s],' "${wp_json:-}"
     printf '"dns_ok":%s,' "$dns_ok"
     printf '"isolation":{"internal_target":"%s","internal_reachable":%s}}' \
         "${iso_tested:-}" "${iso_reachable:-null}"
