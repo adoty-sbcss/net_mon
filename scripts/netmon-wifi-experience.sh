@@ -171,21 +171,29 @@ for p in profs:
     secret = str(p.get("secret") or "")
     cap = "1" if p.get("captive_auto_accept") else "0"
     fields = [ssid, auth, ident, secret, cap]
-    rows.append("\t".join(f.replace("\t", " ").replace("\n", " ").replace("\r", " ") for f in fields))
-sys.stdout.write("\n".join(rows))
+    # Field sep = US (0x1f), NOT tab: tab is an IFS-whitespace char, so bash `read`
+    # COLLAPSES consecutive tabs and an empty field (e.g. a blank identity) vanishes,
+    # shifting every later field left (the PSK would land in `identity`). US never
+    # collapses and can't occur in an SSID/secret. Records get a trailing newline so
+    # `read` doesn't drop the last one.
+    rows.append("\x1f".join(
+        f.replace("\t", " ").replace("\n", " ").replace("\r", " ").replace("\x1f", " ")
+        for f in fields))
+sys.stdout.write("".join(r + "\n" for r in rows))
 PY
             return 0
         fi
         echo "python3 missing — cannot parse ${PROFILES_FILE}; single-config fallback" >&2
     fi
-    # Single-config fallback (file absent, or python3 unavailable).
+    # Single-config fallback (file absent, or python3 unavailable). US-separated to
+    # match the parser (\037 = 0x1f), trailing newline so `read` keeps the row.
     local ssid; ssid="$(current_value NETMON_WIFI_JOIN_SSID 2>/dev/null || true)"
     [[ -z "$ssid" ]] && return 0
     local auth ident secret
     auth="$(current_value NETMON_WIFI_JOIN_AUTH 2>/dev/null || echo open)"
     ident="$(current_value NETMON_WIFI_JOIN_IDENTITY 2>/dev/null || true)"
     secret="$(current_value NETMON_WIFI_JOIN_SECRET 2>/dev/null || true)"
-    printf '%s\t%s\t%s\t%s\t0\n' "$ssid" "${auth:-open}" "$ident" "$secret"
+    printf '%s\037%s\037%s\037%s\0370\n' "$ssid" "${auth:-open}" "$ident" "$secret"
 }
 
 # Join + measure + leave ONE profile; echo a single result JSON object. Runs the
@@ -305,7 +313,7 @@ main() {
     # Run each profile serialized (one radio = one association at a time), appending a
     # result object. Empty results[] if there are no profiles / none associated.
     local results="" n=0 obj
-    while IFS=$'\t' read -r p_ssid p_auth p_ident p_secret p_cap; do
+    while IFS=$'\037' read -r p_ssid p_auth p_ident p_secret p_cap; do
         [[ -z "${p_ssid:-}" ]] && continue
         obj="$(_run_profile "$iface" "$p_ssid" "${p_auth:-open}" "${p_ident:-}" "${p_secret:-}" "${p_cap:-0}")"
         [[ -z "$obj" ]] && continue
