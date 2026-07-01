@@ -241,10 +241,33 @@ _run_profile() {
     rssi="$($SUDO nmcli -t -f IN-USE,SIGNAL,SSID dev wifi list ifname "$iface" 2>/dev/null \
             | awk -F: '/^\*/{print $2; exit}')"
 
+    # 3b. Which AP (BSSID), band, and link rate the client got — e.g. "shoved onto
+    #     2.4GHz at a low rate" is a real finding, and the BSSID ties the experience to
+    #     a specific AP. Read from the SAME in-use (*) nmcli row the signal came from
+    #     (iw is not installed on every box; nmcli is a hard dependency we already use).
+    #     RATE here is the AP's advertised link rate, not the negotiated PHY rate.
+    local bssid="" band="" rx_rate="" apline freq
+    apline="$($SUDO nmcli -t -f IN-USE,BSSID,FREQ,RATE dev wifi list ifname "$iface" 2>/dev/null \
+              | awk '/^\*/{print; exit}')"
+    if [[ -n "$apline" ]]; then
+        # terse mode escapes value-internal colons as '\:'; unescape, then pattern-pull
+        # each piece (MAC / "NNNN MHz" / "NNN Mbit/s") rather than split on ':'.
+        apline="${apline//\\:/:}"
+        bssid="$(printf '%s' "$apline" | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)"
+        freq="$(printf '%s' "$apline" | grep -oE '[0-9]{3,5} MHz' | grep -oE '^[0-9]+' | head -1)"
+        rx_rate="$(printf '%s' "$apline" | grep -oE '[0-9]+ Mbit/s' | grep -oE '^[0-9]+' | head -1)"
+        if [[ "$freq" =~ ^[0-9]+$ ]]; then
+            if (( freq < 2500 )); then band="2.4GHz"
+            elif (( freq < 5900 )); then band="5GHz"
+            else band="6GHz"; fi
+        fi
+    fi
+
     # 4. Battery (only if we got an IP). Probes traverse the joined net via the
     #    dedicated route table.
     local cap_state="n/a" cap_code="" cap_redir="" cap_redir_b64="" cap_accepted="null"
     local ping_ok=false rtt="" loss="" dns_ok=false iso_tested="" iso_reachable=""
+    local dl_mbps="" tgt_json=""
     if [[ -n "$ip4" && -n "$gw" ]]; then
         local srcip="${ip4%/*}"
         _routing_setup "$iface" "$srcip" "$gw" || true
@@ -270,6 +293,20 @@ _run_profile() {
         loss="$(printf '%s' "$png" | grep -oE '[0-9]+% packet loss' | grep -oE '[0-9]+' | head -1)"
         # DNS resolves through the Wi-Fi
         $SUDO curl -s -m 6 --interface "$srcip" -o /dev/null https://dns.google/resolve?name=example.com 2>/dev/null && dns_ok=true
+        # throughput: a short source-bound download over the Wi-Fi (Cloudflare speed
+        # endpoint, capped at 12s); the analysis radio only, never the uplink.
+        local dl
+        dl="$($SUDO curl -s -m 12 --proto '=https' --interface "$srcip" -o /dev/null -w '%{speed_download}' 'https://speed.cloudflare.com/__down?bytes=25000000' 2>/dev/null || true)"
+        [[ "$dl" =~ ^[0-9.]+$ ]] && dl_mbps="$(awk "BEGIN{printf \"%.2f\", ($dl*8)/1000000}")"
+        # instructional-target latency over the Wi-Fi ("internet's fine but Google /
+        # M365 is slow" is a distinct, real signal). RTT is source-routed over the radio.
+        local _t _tp _trtt
+        for _t in www.google.com www.office.com; do
+            _tp="$($SUDO ping -I "$srcip" -c 2 -W 2 "$_t" 2>/dev/null || true)"
+            _trtt="$(printf '%s' "$_tp" | awk -F'/' '/rtt|round-trip/{print $5; exit}')"
+            [[ -n "$tgt_json" ]] && tgt_json="${tgt_json},"
+            tgt_json="${tgt_json}{\"host\":\"${_t}\",\"rtt_ms\":${_trtt:-null}}"
+        done
         # ISOLATION: from the guest/Wi-Fi, can we reach an INTERNAL host (the wired
         # uplink's gateway)? A properly isolated guest network should NOT.
         iso_tested="$(ip -4 route show default 2>/dev/null | awk '/default/{print $3; exit}')"
@@ -289,6 +326,9 @@ _run_profile() {
     printf '"captive_portal":{"state":"%s","http_code":"%s","redirect_b64":"%s","auto_accepted":%s},' \
         "$cap_state" "${cap_code:-}" "$cap_redir_b64" "$cap_accepted"
     printf '"internet":{"ping_ok":%s,"rtt_ms":"%s","loss_pct":"%s"},' "$ping_ok" "${rtt:-}" "${loss:-}"
+    printf '"link":{"bssid":"%s","band":"%s","rx_rate_mbps":%s},' "${bssid:-}" "${band:-}" "${rx_rate:-null}"
+    printf '"throughput":{"download_mbps":%s},' "${dl_mbps:-null}"
+    printf '"targets":[%s],' "${tgt_json:-}"
     printf '"dns_ok":%s,' "$dns_ok"
     printf '"isolation":{"internal_target":"%s","internal_reachable":%s}}' \
         "${iso_tested:-}" "${iso_reachable:-null}"
