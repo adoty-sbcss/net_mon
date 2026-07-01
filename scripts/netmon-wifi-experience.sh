@@ -202,10 +202,15 @@ for p in profs:
     # shifting every later field left (the PSK would land in `identity`). US never
     # collapses and can't occur in an SSID/secret. Records get a trailing newline so
     # `read` doesn't drop the last one.
-    rows.append("\x1f".join(
+    rows.append([
         f.replace("\t", " ").replace("\n", " ").replace("\r", " ").replace("\x1f", " ")
-        for f in fields))
-sys.stdout.write("".join(r + "\n" for r in rows))
+        for f in fields])
+# Default: if the dashboard didn't designate a speed-test primary, the FIRST network is
+# it — so a school gets the internet speed test without anyone picking one. The dashboard
+# overrides by flagging a specific profile (which then wins here).
+if rows and not any(r[5] == "1" for r in rows):
+    rows[0][5] = "1"
+sys.stdout.write("".join("\x1f".join(r) + "\n" for r in rows))
 PY
             return 0
         fi
