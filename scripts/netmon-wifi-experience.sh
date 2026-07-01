@@ -110,41 +110,131 @@ _captive_probe() {
     printf '%s\t%s\t%s' "$state" "${code:-000}" "$redir"
 }
 
-# Best-effort captive-portal "accept": many K-12 guest portals gate internet behind a
-# single click-through form. We fetch the portal page, extract the first <form> action,
-# and submit it with common accept fields; the caller then re-probes generate_204 to
-# see if internet opened. INTENTIONALLY generic/heuristic — a specific portal (e.g.
-# SBCSS-Guest) may need a tailored step; this handles the common "click Accept/Continue"
-# case. Bounded + source-bound so it traverses the Wi-Fi. Returns 0 if a form submit
-# HTTP-succeeded (NOT proof of internet — that's the caller's re-probe).
-_captive_try_accept() {
+# --- Captive-portal auto-accept (vendor-aware) -----------------------------------------
+# Many K-12 guest nets gate internet behind a single click-through AUP. We identify the
+# portal VENDOR (its login flow differs per platform) and run a tailored accept; the
+# caller re-probes generate_204 to confirm internet opened. All fetches are source-bound
+# + http(s)-pinned (the portal URL is the joined network's redirect — refuse file://,
+# gopher://, etc.). NOTE on validation: the Aruba Central flow was reverse-engineered live
+# on SBCSS-Guest 2026-07-01; the Cisco/Meraki routines follow each vendor's DOCUMENTED
+# web-auth pattern but are not yet hardware-validated (no test gear) — best-effort, and a
+# failed accept is harmless (the portal simply stays up and we record it blocked).
+_UA_BROWSER='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
+
+# Classify the portal vendor from the redirect host, then (if inconclusive) the page body.
+# Echoes: aruba_central | aruba | cisco_wlc | cisco_ise | meraki | generic
+_captive_vendor() {
+    local srcip="$1" redir="$2" page=""
+    case "$redir" in
+        *cloudguest*.arubanetworks.com*|*cloudguest.central.*) echo "aruba_central"; return;;
+        *securelogin.arubanetworks.com*|*securelogin.hpe.com*|*arubanetworks.com*) echo "aruba"; return;;
+        *network-auth.com*) echo "meraki"; return;;
+    esac
+    [[ -z "$redir" ]] && { echo "generic"; return; }
+    page="$($SUDO curl -s -m 8 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" "$redir" 2>/dev/null || true)"
+    case "$page" in
+        *portal_login_page_config*|*cloudguest*) echo "aruba_central";;
+        *network-auth.com*|*"Cisco Meraki"*|*meraki*) echo "meraki";;
+        *ClearPass*|*arubanetworks*|*Aruba*) echo "aruba";;
+        *buttonClicked*|*"/login.html"*|*Cisco*Systems*) echo "cisco_wlc";;
+        *_eventId*|*"self-registration"*|*ISE*|*sponsor*) echo "cisco_ise";;
+        *) echo "generic";;
+    esac
+}
+
+# Aruba Central Cloud Guest (Svelte SPA): generate_204 -> capture -> JS/META bounce to a
+# /login SPA -> anonymous "I accept" AUP. Replicate the accept POST (capture + csrf +
+# cmd=authenticate), then POLL — the AP opens the gateway ASYNC, several seconds after the
+# accept (a single fast re-probe misses it). Reverse-engineered live on SBCSS-Guest.
+_accept_aruba_central() {
+    local srcip="$1" cap_url="$2" cj bounce login host page csrf capture i code
+    cj="$(mktemp 2>/dev/null || echo /tmp/nm-cj.$$)"
+    bounce="$($SUDO curl -s -m 12 -L --interface "$srcip" -A "$_UA_BROWSER" -c "$cj" -b "$cj" "$cap_url" 2>/dev/null || true)"
+    login="$(printf '%s' "$bounce" | grep -oiE 'window\.top\.location\.href *= *"[^"]+"' | head -1 | sed -E 's/.*href *= *"([^"]+)".*/\1/')"
+    login="${login//&amp;/&}"; login="${login// /%20}"
+    [[ -z "$login" ]] && { rm -f "$cj"; return 1; }
+    host="$(printf '%s' "$login" | sed -E 's#^(https?://[^/]+).*#\1#')"
+    page="$($SUDO curl -s -m 12 -L --interface "$srcip" -A "$_UA_BROWSER" -c "$cj" -b "$cj" "$login" 2>/dev/null || true)"
+    csrf="$(printf '%s' "$page" | grep -oE '"csrf_token":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/')"
+    capture="$(printf '%s' "$page" | grep -oE '"capture":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/')"
+    [[ -z "$capture" ]] && capture="$(printf '%s' "$login" | sed -E 's/.*[?&]capture=([^&]*).*/\1/')"
+    $SUDO curl -s -m 15 -L --interface "$srcip" -A "$_UA_BROWSER" -c "$cj" -b "$cj" \
+        -H "Referer: $login" -H "Origin: $host" \
+        --data-urlencode "csrf_token=$csrf" --data-urlencode "capture=$capture" --data 'cmd=authenticate' \
+        -o /dev/null "$login" 2>/dev/null || true
+    rm -f "$cj"
+    for i in 1 2 3 4 5 6 7 8 9 10; do   # poll ~20s for the async gateway open
+        code="$($SUDO curl -s -m 5 --interface "$srcip" -o /dev/null -w '%{http_code}' http://connectivitycheck.gstatic.com/generate_204 2>/dev/null || echo 000)"
+        [[ "$code" == "204" ]] && return 0
+        sleep 2
+    done
+    return 1
+}
+
+# Cisco WLC internal web-auth (login.html): a consent/AUP page submits buttonClicked=4
+# (the "accept/continue" button) with the original redirect_url. Documented pattern.
+_accept_cisco_wlc() {
+    local srcip="$1" url="$2" host
+    host="$(printf '%s' "$url" | sed -E 's#^(https?://[^/]+).*#\1#')"
+    $SUDO curl -s -m 10 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" -o /dev/null \
+        --data-urlencode 'buttonClicked=4' \
+        --data-urlencode 'redirect_url=http://connectivitycheck.gstatic.com/generate_204' \
+        --data 'err_flag=0&username=&password=' "${host}/login.html" 2>/dev/null && return 0
+    return 1
+}
+
+# Meraki click-through splash: the "Continue" control grants access via a form POST that
+# carries a success/continue URL. Documented pattern (network-auth.com splash).
+_accept_meraki() {
+    local srcip="$1" url="$2" page action base
+    page="$($SUDO curl -s -m 10 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" "$url" 2>/dev/null || true)"
+    action="$(printf '%s' "$page" | grep -oiE '<form[^>]*action="[^"]*"' | head -1 | sed -E 's/.*[Aa]ction="([^"]*)".*/\1/')"
+    [[ -z "$action" ]] && return 1
+    base="$(printf '%s' "$url" | sed -E 's#^(https?://[^/]+).*#\1#')"
+    case "$action" in http://*|https://*) : ;; /*) action="${base}${action}";; *) action="${url%/*}/${action}";; esac
+    $SUDO curl -s -m 10 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" -o /dev/null \
+        --data-urlencode 'success_url=http://connectivitycheck.gstatic.com/generate_204' \
+        --data 'answer=1&accept=Accept' "$action" 2>/dev/null && return 0
+    return 1
+}
+
+# Generic click-through: fetch the portal, submit the first <form> with the usual accept
+# fields (+ cmd=authenticate, which many Aruba/Cisco on-prem AUP forms expect). Handles
+# aruba (on-prem/Instant), cisco_ise, and unknown portals.
+_accept_generic() {
     local srcip="$1" url="$2" page action method origin proto rest host
     [[ -z "$url" ]] && url="http://connectivitycheck.gstatic.com/generate_204"
-    # --proto/--proto-redir pin http(s): the portal URL is attacker-controlled (it's
-    # the joined network's redirect), so refuse file://, gopher://, etc. on the fetch
-    # AND on any redirect we follow.
-    page="$($SUDO curl -s -m 8 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" "$url" 2>/dev/null || true)"
+    page="$($SUDO curl -s -m 8 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" "$url" 2>/dev/null || true)"
     [[ -z "$page" ]] && return 1
     action="$(printf '%s' "$page" | grep -oiE '<form[^>]*action="[^"]*"' | head -1 | sed -E 's/.*[Aa]ction="([^"]*)".*/\1/')"
     method="$(printf '%s' "$page" | grep -oiE '<form[^>]*method="[^"]*"' | head -1 | sed -E 's/.*[Mm]ethod="([^"]*)".*/\1/' | tr 'A-Z' 'a-z')"
-    # No form found — some portals accept on a plain GET we already followed with -L.
-    [[ -z "$action" ]] && return 0
-    # Resolve a relative action against the portal URL's origin.
+    [[ -z "$action" ]] && return 0   # no form — some portals accept on the GET we followed
     proto="${url%%://*}"; rest="${url#*://}"; host="${rest%%/*}"; origin="${proto}://${host}"
     case "$action" in
         http://*|https://*) : ;;
         /*) action="${origin}${action}" ;;
         *)  action="${url%/*}/${action}" ;;
     esac
-    # Submit generic accept fields (covers the usual accept/agree/continue buttons).
+    local fields='accept=1&submit=Continue&agree=on&terms=agree&cmd=authenticate&buttonClicked=4'
     if [[ "$method" == "post" ]]; then
-        $SUDO curl -s -m 8 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -o /dev/null \
-            --data 'accept=1&submit=Continue&agree=on&terms=agree' "$action" 2>/dev/null && return 0
+        $SUDO curl -s -m 8 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" -o /dev/null --data "$fields" "$action" 2>/dev/null && return 0
     else
-        $SUDO curl -s -m 8 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -o /dev/null \
-            --get --data 'accept=1&submit=Continue&agree=on&terms=agree' "$action" 2>/dev/null && return 0
+        $SUDO curl -s -m 8 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" -o /dev/null --get --data "$fields" "$action" 2>/dev/null && return 0
     fi
     return 1
+}
+
+# Dispatch the accept to the vendor routine. Returns 0 if the accept HTTP-succeeded (the
+# caller re-probes generate_204 for the real proof).
+_captive_try_accept() {
+    local srcip="$1" url="$2" vendor="${3:-generic}"
+    [[ -z "$url" ]] && url="http://connectivitycheck.gstatic.com/generate_204"
+    case "$vendor" in
+        aruba_central) _accept_aruba_central "$srcip" "$url" ;;
+        cisco_wlc)     _accept_cisco_wlc "$srcip" "$url" ;;
+        meraki)        _accept_meraki "$srcip" "$url" ;;
+        *)             _accept_generic "$srcip" "$url" ;;   # aruba on-prem, cisco_ise, generic
+    esac
 }
 
 # Probe ONE URL's load waterfall source-bound over the Wi-Fi (curl --interface), and
@@ -294,7 +384,7 @@ _run_profile() {
 
     # 4. Battery (only if we got an IP). Probes traverse the joined net via the
     #    dedicated route table.
-    local cap_state="n/a" cap_code="" cap_redir="" cap_redir_b64="" cap_accepted="null"
+    local cap_state="n/a" cap_code="" cap_redir="" cap_redir_b64="" cap_accepted="null" cap_vendor=""
     local ping_ok=false rtt="" loss="" dns_ok=false iso_tested="" iso_reachable=""
     local dl_mbps="" tgt_json="" wp_json="" st_json=""
     if [[ -n "$ip4" && -n "$gw" ]]; then
@@ -306,9 +396,12 @@ _run_profile() {
         cap_state="$(printf '%s' "$cap" | cut -f1)"
         cap_code="$(printf '%s' "$cap" | cut -f2)"
         cap_redir="$(printf '%s' "$cap" | cut -f3)"
-        # optional best-effort click-through accept, then re-probe to see if it opened
+        # identify the portal platform (Aruba/Cisco/Meraki/…) whenever one intercepts —
+        # useful telemetry even when we don't attempt (or can't) accept.
+        [[ "$cap_state" == "portal" ]] && cap_vendor="$(_captive_vendor "$srcip" "$cap_redir")"
+        # optional best-effort click-through accept (vendor-tailored), then re-probe.
         if [[ "$cap_accept" == "1" && "$cap_state" == "portal" ]]; then
-            if _captive_try_accept "$srcip" "$cap_redir"; then cap_accepted=true; else cap_accepted=false; fi
+            if _captive_try_accept "$srcip" "$cap_redir" "$cap_vendor"; then cap_accepted=true; else cap_accepted=false; fi
             cap="$(_captive_probe "$srcip")"
             cap_state="$(printf '%s' "$cap" | cut -f1)"
             cap_code="$(printf '%s' "$cap" | cut -f2)"
@@ -385,8 +478,8 @@ _run_profile() {
     printf '{"ssid":"%s","auth":"%s","associated":%s,"assoc_ms":%s,"dhcp_ms":%s,' \
         "$(printf '%s' "$ssid" | tr -d '\000-\037\042\134')" "${auth:-open}" "$associated" "$assoc_ms" "$dhcp_ms"
     printf '"ip":"%s","gateway":"%s","signal":%s,"signal_unit":"quality",' "${ip4:-}" "${gw:-}" "${rssi:-null}"
-    printf '"captive_portal":{"state":"%s","http_code":"%s","redirect_b64":"%s","auto_accepted":%s},' \
-        "$cap_state" "${cap_code:-}" "$cap_redir_b64" "$cap_accepted"
+    printf '"captive_portal":{"state":"%s","http_code":"%s","redirect_b64":"%s","auto_accepted":%s,"vendor":"%s"},' \
+        "$cap_state" "${cap_code:-}" "$cap_redir_b64" "$cap_accepted" "${cap_vendor:-}"
     printf '"internet":{"ping_ok":%s,"rtt_ms":"%s","loss_pct":"%s"},' "$ping_ok" "${rtt:-}" "${loss:-}"
     printf '"link":{"bssid":"%s","band":"%s","rx_rate_mbps":%s},' "${bssid:-}" "${band:-}" "${rx_rate:-null}"
     printf '"throughput":{"download_mbps":%s},' "${dl_mbps:-null}"
