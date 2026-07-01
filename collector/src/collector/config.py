@@ -200,6 +200,13 @@ class Settings(BaseSettings):
     wifi_join_auth: str = Field(default="open", alias="NETMON_WIFI_JOIN_AUTH")
     wifi_join_identity: str = Field(default="", alias="NETMON_WIFI_JOIN_IDENTITY")
     wifi_join_secret: str = Field(default="", alias="NETMON_WIFI_JOIN_SECRET")
+    # WIFI-6 unattended scheduler: run the experience battery every N seconds
+    # (0 = manual / dashboard "Test now" only). Optional box-local quiet-hours window
+    # "START-END" (24h, may wrap midnight, e.g. "22-6") where it won't fire. The host
+    # timer + tick (scripts/netmon-wifi-experience-tick.sh) read these from netmon.env;
+    # the multi-profile list itself rides WIFI_PROFILES_FILE.
+    wifi_join_schedule_sec: int = Field(default=0, alias="NETMON_WIFI_JOIN_SCHEDULE_SEC")
+    wifi_join_quiet: str = Field(default="", alias="NETMON_WIFI_JOIN_QUIET")
 
     sftp_enabled: bool = Field(default=False, alias="NETMON_SFTP_ENABLED")
     sftp_host: str = Field(default="", alias="NETMON_SFTP_HOST")

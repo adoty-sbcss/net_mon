@@ -1,0 +1,15 @@
+[Unit]
+Description=NetMon Wi-Fi client-experience battery (WIFI-6)
+Documentation=https://github.com/adoty-sbcss/net_mon
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as ROOT (unlike the passive WIFI-2 survey): the battery drives the analysis
+# radio — nmcli con up, ip rule/route in a dedicated table — which needs privilege.
+WorkingDirectory=${REPO_DIR}
+ExecStart=${REPO_DIR}/scripts/netmon-wifi-experience-tick.sh
+# join -> measure -> leave PER profile, serialized; cap generously.
+TimeoutStartSec=600
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

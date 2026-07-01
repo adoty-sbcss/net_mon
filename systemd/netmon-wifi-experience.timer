@@ -1,0 +1,18 @@
+[Unit]
+Description=NetMon Wi-Fi client-experience battery (WIFI-6) — scheduled tick
+Documentation=https://github.com/adoty-sbcss/net_mon
+
+[Timer]
+# Fire every ~15 min; the tick (netmon-wifi-experience-tick.sh) self-gates on
+# NETMON_WIFI_JOIN_SCHEDULE_SEC (the real cadence, e.g. every 6h) + quiet hours, so
+# the DISRUPTIVE battery only actually runs on its schedule — not every tick. The
+# timer is installed fleet-wide but is inert until a cadence is pushed.
+# RandomizedDelaySec spreads fleet load.
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=3min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
