@@ -245,6 +245,13 @@ class Settings(BaseSettings):
     # CSV of internet targets to ping; gateway + DNS resolver are added automatically.
     latency_targets: str = Field(default="1.1.1.1,8.8.8.8", alias="NETMON_LATENCY_TARGETS")
 
+    # Website / end-user experience probes (PERF-5). Per configured URL, one curl
+    # captures the DNS/TCP/TLS/TTFB/total waterfall + status + speed. The URL LIST
+    # rides a JSON file (checkin.WEBPERF_URLS_FILE), pushed from the dashboard's
+    # district-managed website list; run on a cadence (default 15m) like speedtest.
+    webperf_enabled: bool = Field(default=False, alias="NETMON_WEBPERF_ENABLED")
+    webperf_schedule_sec: int = Field(default=900, alias="NETMON_WEBPERF_SCHEDULE_SEC")
+
     # Box identity (set by the first-boot wizard; empty on pre-wizard installs).
     # Used to tag scan_runs rows and, in a future phase, to drive the
     # hierarchical SFTP path and bundle filenames.

@@ -200,6 +200,14 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_LATENCY_ENABLED"] = "true" if data.get("latency_enabled") else "false"
     if "latency_targets" in data:
         mapping["NETMON_LATENCY_TARGETS"] = str(data.get("latency_targets") or "1.1.1.1,8.8.8.8")
+    # Website performance (PERF-5): enable + cadence are env; the URL list rides a
+    # 0644 JSON file (a real list — quotes/slashes don't belong in EnvironmentFile).
+    if "webperf_enabled" in data:
+        mapping["NETMON_WEBPERF_ENABLED"] = "true" if data.get("webperf_enabled") else "false"
+    if data.get("webperf_schedule_sec"):
+        mapping["NETMON_WEBPERF_SCHEDULE_SEC"] = str(int(data["webperf_schedule_sec"]))
+    if "webperf_urls" in data:
+        _write_webperf_urls(data.get("webperf_urls") or [])
     # VLAN trunk monitoring config. Writing these only records the desired sub-
     # interfaces; the actual netplan apply runs on the HOST via the
     # 'host-apply-vlan' host-action (the container can't create persistent NICs).
@@ -767,6 +775,12 @@ def _maybe_scheduled_iperf(url: str, token: str | None, settings) -> None:
 
 
 SPEEDTEST_LAST_FILE = Path("/var/lib/netmon/speedtest-last-run")
+# PERF-5 website performance: the URL list (a real list → JSON file, not env) + the
+# scheduler's last-run ledger. The list is pushed from the dashboard's district-
+# managed website config; the dashboard always sends a non-empty list (its defaults
+# if the district hasn't customized), so the collector needs no built-in defaults.
+WEBPERF_URLS_FILE = Path("/var/lib/netmon/webperf-urls.json")
+WEBPERF_LAST_FILE = Path("/var/lib/netmon/webperf-last-run")
 
 
 def _report_speedtest(url: str, token: str | None, res: dict, trigger: str) -> None:
@@ -856,6 +870,79 @@ def _report_latency(url: str, token: str | None, results: list[dict], trigger: s
                 "startedAt": ts,
             },
         )
+
+
+def _write_webperf_urls(urls: list) -> None:
+    """Persist the pushed website list (PERF-5) to the JSON file the prober reads —
+    a real list, so it rides a file not the env (cf. _write_iperf_schedules)."""
+    try:
+        WEBPERF_URLS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        WEBPERF_URLS_FILE.write_text(json.dumps(urls if isinstance(urls, list) else []))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not persist webperf urls", error=str(exc))
+
+
+def _load_webperf_urls() -> list[str]:
+    try:
+        data = json.loads(WEBPERF_URLS_FILE.read_text())
+        return [str(u) for u in data if str(u).strip()] if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _report_webperf(url: str, token: str | None, results: list[dict], trigger: str) -> None:
+    """POST each website-performance result to the dashboard (best-effort)."""
+    from datetime import UTC, datetime
+
+    ts = datetime.now(UTC).isoformat()
+    for r in results:
+        _post(
+            f"{url}/api/sensor/webperf-result",
+            token,
+            {
+                "trigger": trigger,
+                "url": r.get("url"),
+                "dnsMs": r.get("dns_ms"),
+                "tcpMs": r.get("tcp_ms"),
+                "tlsMs": r.get("tls_ms"),
+                "ttfbMs": r.get("ttfb_ms"),
+                "totalMs": r.get("total_ms"),
+                "httpStatus": r.get("http_status"),
+                "sizeBytes": r.get("size_bytes"),
+                "speedMbps": r.get("speed_mbps"),
+                "ok": r.get("ok", False),
+                "error": r.get("error"),
+                "startedAt": ts,
+            },
+        )
+
+
+def _maybe_webperf(url: str, token: str | None, settings) -> None:
+    """Run the website-performance probes if enabled + the interval elapsed (5-min
+    floor; the URLs are the dashboard-pushed district list)."""
+    import time
+
+    if not settings.webperf_enabled:
+        return
+    urls = _load_webperf_urls()
+    if not urls:
+        return
+    now = time.time()
+    try:
+        last = float(WEBPERF_LAST_FILE.read_text().strip())
+    except Exception:
+        last = 0.0
+    if now - last < max(300, settings.webperf_schedule_sec):
+        return
+    from .webperf import probe_urls
+
+    results = probe_urls(urls)
+    _report_webperf(url, token, results, "scheduled")
+    try:
+        WEBPERF_LAST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        WEBPERF_LAST_FILE.write_text(str(now))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not persist webperf last-run", error=str(exc))
 
 
 def _dns_resolver() -> str | None:
@@ -1126,10 +1213,12 @@ def run_checkin() -> int:
             {"commandId": cid, "status": status, "result": result, "configVersion": applied},
         )
 
-    # Scheduled iperf + public speedtests + latency probes piggyback on check-in.
+    # Scheduled iperf + public speedtests + latency + web-performance probes piggyback
+    # on check-in.
     _maybe_scheduled_iperf(url, token, settings)
     _maybe_scheduled_speedtest(url, token, settings)
     _maybe_latency(url, token, settings)
+    _maybe_webperf(url, token, settings)
 
     # Exit precedence: update (11) already recreates + may host-reboot via the
     # update path, so it wins; then host actions (12); then a plain config
