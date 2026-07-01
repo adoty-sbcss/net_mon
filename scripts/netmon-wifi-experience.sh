@@ -195,7 +195,8 @@ for p in profs:
     ident = str(p.get("identity") or "")
     secret = str(p.get("secret") or "")
     cap = "1" if p.get("captive_auto_accept") else "0"
-    fields = [ssid, auth, ident, secret, cap]
+    st = "1" if (p.get("speedtest") or p.get("primary")) else "0"
+    fields = [ssid, auth, ident, secret, cap, st]
     # Field sep = US (0x1f), NOT tab: tab is an IFS-whitespace char, so bash `read`
     # COLLAPSES consecutive tabs and an empty field (e.g. a blank identity) vanishes,
     # shifting every later field left (the PSK would land in `identity`). US never
@@ -218,7 +219,8 @@ PY
     auth="$(current_value NETMON_WIFI_JOIN_AUTH 2>/dev/null || echo open)"
     ident="$(current_value NETMON_WIFI_JOIN_IDENTITY 2>/dev/null || true)"
     secret="$(current_value NETMON_WIFI_JOIN_SECRET 2>/dev/null || true)"
-    printf '%s\037%s\037%s\037%s\0370\n' "$ssid" "${auth:-open}" "$ident" "$secret"
+    # Single-config box = one network, so it IS the speed-test primary (6th field = 1).
+    printf '%s\037%s\037%s\037%s\0370\0371\n' "$ssid" "${auth:-open}" "$ident" "$secret"
 }
 
 # Join + measure + leave ONE profile; echo a single result JSON object. Runs the
@@ -228,7 +230,7 @@ PY
 # still cleans up if we're killed mid-profile.
 #   args: iface ssid auth [identity] [secret] [cap_accept]
 _run_profile() {
-    local iface="$1" ssid="$2" auth="$3" identity="${4:-}" secret="${5:-}" cap_accept="${6:-0}"
+    local iface="$1" ssid="$2" auth="$3" identity="${4:-}" secret="${5:-}" cap_accept="${6:-0}" speedtest="${7:-0}"
 
     # 1. Associate (timed).
     local t0 assoc_ms associated=false
@@ -289,7 +291,7 @@ _run_profile() {
     #    dedicated route table.
     local cap_state="n/a" cap_code="" cap_redir="" cap_redir_b64="" cap_accepted="null"
     local ping_ok=false rtt="" loss="" dns_ok=false iso_tested="" iso_reachable=""
-    local dl_mbps="" tgt_json="" wp_json=""
+    local dl_mbps="" tgt_json="" wp_json="" st_json=""
     if [[ -n "$ip4" && -n "$gw" ]]; then
         local srcip="${ip4%/*}"
         _routing_setup "$iface" "$srcip" "$gw" || true
@@ -343,6 +345,25 @@ _run_profile() {
                 wp_json="${wp_json}$(_webperf_one "$srcip" "$_wpurl")"
             done < <($SUDO grep -oE 'https?://[^"]+' "$WEBPERF_URLS_FILE" 2>/dev/null)
         fi
+        # Internet SPEED TEST — only for the PRIMARY network (saturating up/down is
+        # airtime-expensive on a live AP, so we designate ONE SSID per school for it).
+        # Download reuses the throughput pull above; add a source-bound upload + a longer
+        # ping burst for latency/jitter(mdev)/loss. Teams/Zoom/online-testing pain is
+        # upload- and jitter-bound, so a download-only number would hide the real problem.
+        if [[ "$speedtest" == "1" ]]; then
+            local up ul_mbps="" zf stp st_lat="" st_jit="" st_loss=""
+            zf="$(mktemp 2>/dev/null || echo /tmp/netmon-ul.$$)"
+            head -c 10000000 /dev/zero > "$zf" 2>/dev/null
+            up="$($SUDO curl -s -m 15 --proto '=https' --interface "$srcip" -o /dev/null \
+                  -w '%{speed_upload}' --data-binary "@$zf" 'https://speed.cloudflare.com/__up' 2>/dev/null || true)"
+            rm -f "$zf"
+            [[ "$up" =~ ^[0-9.]+$ ]] && ul_mbps="$(awk "BEGIN{printf \"%.2f\", ($up*8)/1000000}")"
+            stp="$($SUDO ping -I "$srcip" -c 10 -W 2 1.1.1.1 2>/dev/null || true)"
+            st_lat="$(printf '%s' "$stp" | awk -F'/' '/rtt|round-trip/{print $5; exit}')"
+            st_jit="$(printf '%s' "$stp" | awk -F'/' '/rtt|round-trip/{split($7,a," "); print a[1]; exit}')"
+            st_loss="$(printf '%s' "$stp" | grep -oE '[0-9]+% packet loss' | grep -oE '[0-9]+' | head -1)"
+            st_json="{\"download_mbps\":${dl_mbps:-null},\"upload_mbps\":${ul_mbps:-null},\"latency_ms\":${st_lat:-null},\"jitter_ms\":${st_jit:-null},\"loss_pct\":${st_loss:-null}}"
+        fi
         # ISOLATION: from the guest/Wi-Fi, can we reach an INTERNAL host (the wired
         # uplink's gateway)? A properly isolated guest network should NOT.
         iso_tested="$(ip -4 route show default 2>/dev/null | awk '/default/{print $3; exit}')"
@@ -364,6 +385,7 @@ _run_profile() {
     printf '"internet":{"ping_ok":%s,"rtt_ms":"%s","loss_pct":"%s"},' "$ping_ok" "${rtt:-}" "${loss:-}"
     printf '"link":{"bssid":"%s","band":"%s","rx_rate_mbps":%s},' "${bssid:-}" "${band:-}" "${rx_rate:-null}"
     printf '"throughput":{"download_mbps":%s},' "${dl_mbps:-null}"
+    printf '"speedtest":%s,' "${st_json:-null}"
     printf '"targets":[%s],' "${tgt_json:-}"
     printf '"webperf":[%s],' "${wp_json:-}"
     printf '"dns_ok":%s,' "$dns_ok"
@@ -395,9 +417,9 @@ main() {
     # Run each profile serialized (one radio = one association at a time), appending a
     # result object. Empty results[] if there are no profiles / none associated.
     local results="" n=0 obj
-    while IFS=$'\037' read -r p_ssid p_auth p_ident p_secret p_cap; do
+    while IFS=$'\037' read -r p_ssid p_auth p_ident p_secret p_cap p_st; do
         [[ -z "${p_ssid:-}" ]] && continue
-        obj="$(_run_profile "$iface" "$p_ssid" "${p_auth:-open}" "${p_ident:-}" "${p_secret:-}" "${p_cap:-0}")"
+        obj="$(_run_profile "$iface" "$p_ssid" "${p_auth:-open}" "${p_ident:-}" "${p_secret:-}" "${p_cap:-0}" "${p_st:-0}")"
         [[ -z "$obj" ]] && continue
         [[ -n "$results" ]] && results="${results},"
         results="${results}${obj}"
