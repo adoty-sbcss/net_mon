@@ -1,23 +1,32 @@
 #!/usr/bin/env bash
-# scripts/netmon-wifi-experience.sh — WIFI-3: client-experience battery.
+# scripts/netmon-wifi-experience.sh — WIFI-3/WIFI-6: client-experience battery.
 #
-# Joins the configured network on the analysis radio (lib/wifi.sh, routes-off),
-# then measures what a real client experiences ON THAT network and tears down.
-# Emits /var/lib/netmon/wifi_experience.json for the collector to bundle.
+# For EACH configured network profile, join it on the analysis radio (lib/wifi.sh,
+# routes-off), measure what a real client experiences ON THAT network, then leave —
+# serialized (one radio = one association at a time). Emits
+# /var/lib/netmon/wifi_experience.json (a results[] array, one object per profile)
+# for the collector to bundle.
 #
-# Battery: time-to-associate, time-to-DHCP, RSSI, captive-portal characterization,
-# DNS, internet reachability, and a guest->internal ISOLATION probe.
+# Profiles come from the dashboard-pushed 0600 JSON file
+# (checkin.WIFI_PROFILES_FILE = /var/lib/netmon/wifi-profiles.json), each:
+#   {"ssid","auth","identity","secret","captive_auto_accept"}
+# If that file is ABSENT we fall back to the single NETMON_WIFI_JOIN_* env keys as
+# one profile (legacy / pre-portal boxes). A present-but-empty file means "no
+# profiles" (feature stays gated by NETMON_WIFI_JOIN_ENABLED).
+#
+# Battery per profile: time-to-associate, time-to-DHCP, RSSI, captive-portal
+# characterization (+ optional best-effort click-through accept), DNS, internet
+# reachability, and a guest->internal ISOLATION probe.
 #
 # SOURCE ROUTING — the crux: the analysis radio is routes-off (never-default), so
 # by default traffic would leave via the WIRED uplink, not the Wi-Fi we want to
-# test. We install a dedicated policy-routing table (from the Wi-Fi source IP ->
-# default via the Wi-Fi gateway) for the duration of the battery, so the probes
-# actually traverse the joined network, then remove it. The box's real uplink/
-# default route is never touched.
+# test. For the duration of each profile's battery we install a dedicated policy-
+# routing table (from the Wi-Fi source IP -> default via the Wi-Fi gateway) so the
+# probes actually traverse the joined network, then remove it. The box's real
+# uplink / default route is never touched.
 #
-# ⚠️ NOT yet hardware-validated (built static-only per scoping; the policy-routing
-# + per-interface probes need a live association to confirm). Single network in v1;
-# the SSID-hopping scheduler is a loop over a configured list — a later increment.
+# Validated live on Monitor1 2026-06-30 (PSK sbcss-mpsk): join, DHCP, gateway (from
+# the DHCP `routers` option), source-routed probes, and clean teardown all confirmed.
 #
 # Source AFTER common.sh, paths.sh, envfile.sh, wifi.sh (the host-action does this).
 
@@ -32,18 +41,20 @@ done
 
 STATE_DIR="${NETMON_STATE_DIR:-/var/lib/netmon}"
 OUT="${STATE_DIR}/wifi_experience.json"
+PROFILES_FILE="${STATE_DIR}/wifi-profiles.json"   # dashboard-pushed profiles (0600)
 RT_TABLE=51                       # dedicated policy-routing table for the analysis radio
 # Rule priority MUST be below the main-table rule (prio 32766), or the main table
 # matches first and the wifi-sourced probe leaves via the wired uplink. Validated
 # on Monitor1: at 5100 `ip route get <dst> from <wifi-ip>` routes via the wifi.
 RT_RULE_PRIO=5100
 
-# Cleanup targets for the EXIT trap. These MUST be globals: the trap fires after
-# main() returns, when main's `local iface`/`ssid` are out of scope — referencing
-# them there is an "unbound variable" under `set -u`, which aborts the trap before
-# the Wi-Fi is torn down (leaving the radio joined). Globals survive main's return.
+# Cleanup target for the EXIT trap. MUST be a global: the trap fires after main()
+# returns, when main's locals are out of scope — referencing them there is an
+# "unbound variable" under `set -u`, which aborts the trap before cleanup runs.
+# The trap tears down routing + leaves EVERY netmon-owned Wi-Fi connection
+# (wifi_leave_all), so it needs no per-profile SSID state even though each profile
+# is measured inside a command-substitution subshell.
 _TRAP_IFACE=""
-_TRAP_SSID=""
 
 # common.sh provides $SUDO; fall back if it wasn't sourced.
 if [ -z "${SUDO+x}" ]; then SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"; fi
@@ -54,7 +65,7 @@ b64()     { base64 -w0 2>/dev/null || base64 | tr -d '\n'; }
 
 # Tear down our policy route + rules (idempotent). Always run on exit.
 _routing_teardown() {
-    local iface="$1"
+    local iface="${1:-}"
     $SUDO ip rule del prio "$RT_RULE_PRIO" 2>/dev/null || true
     $SUDO ip rule del prio "$((RT_RULE_PRIO + 1))" 2>/dev/null || true
     $SUDO ip route flush table "$RT_TABLE" 2>/dev/null || true
@@ -96,27 +107,103 @@ _captive_probe() {
     printf '%s\t%s\t%s' "$state" "${code:-000}" "$redir"
 }
 
-# ---- main ----------------------------------------------------------------
+# Best-effort captive-portal "accept": many K-12 guest portals gate internet behind a
+# single click-through form. We fetch the portal page, extract the first <form> action,
+# and submit it with common accept fields; the caller then re-probes generate_204 to
+# see if internet opened. INTENTIONALLY generic/heuristic — a specific portal (e.g.
+# SBCSS-Guest) may need a tailored step; this handles the common "click Accept/Continue"
+# case. Bounded + source-bound so it traverses the Wi-Fi. Returns 0 if a form submit
+# HTTP-succeeded (NOT proof of internet — that's the caller's re-probe).
+_captive_try_accept() {
+    local srcip="$1" url="$2" page action method origin proto rest host
+    [[ -z "$url" ]] && url="http://connectivitycheck.gstatic.com/generate_204"
+    page="$($SUDO curl -s -m 8 -L --interface "$srcip" "$url" 2>/dev/null || true)"
+    [[ -z "$page" ]] && return 1
+    action="$(printf '%s' "$page" | grep -oiE '<form[^>]*action="[^"]*"' | head -1 | sed -E 's/.*[Aa]ction="([^"]*)".*/\1/')"
+    method="$(printf '%s' "$page" | grep -oiE '<form[^>]*method="[^"]*"' | head -1 | sed -E 's/.*[Mm]ethod="([^"]*)".*/\1/' | tr 'A-Z' 'a-z')"
+    # No form found — some portals accept on a plain GET we already followed with -L.
+    [[ -z "$action" ]] && return 0
+    # Resolve a relative action against the portal URL's origin.
+    proto="${url%%://*}"; rest="${url#*://}"; host="${rest%%/*}"; origin="${proto}://${host}"
+    case "$action" in
+        http://*|https://*) : ;;
+        /*) action="${origin}${action}" ;;
+        *)  action="${url%/*}/${action}" ;;
+    esac
+    # Submit generic accept fields (covers the usual accept/agree/continue buttons).
+    if [[ "$method" == "post" ]]; then
+        $SUDO curl -s -m 8 -L --interface "$srcip" -o /dev/null \
+            --data 'accept=1&submit=Continue&agree=on&terms=agree' "$action" 2>/dev/null && return 0
+    else
+        $SUDO curl -s -m 8 -L --interface "$srcip" -o /dev/null \
+            --get --data 'accept=1&submit=Continue&agree=on&terms=agree' "$action" 2>/dev/null && return 0
+    fi
+    return 1
+}
 
-main() {
-    command -v ip >/dev/null 2>&1 || { echo "ip(8) missing"; exit 1; }
-
-    local enabled iface ssid auth identity secret
-    enabled="$(current_value NETMON_WIFI_JOIN_ENABLED 2>/dev/null || true)"
-    case "${enabled,,}" in true|1|yes) ;; *) echo "NETMON_WIFI_JOIN_ENABLED not true — skipping"; exit 0 ;; esac
-    ssid="$(current_value NETMON_WIFI_JOIN_SSID 2>/dev/null || true)"
-    [[ -z "$ssid" ]] && { echo "no NETMON_WIFI_JOIN_SSID — nothing to test"; exit 0; }
-    iface="$(current_value NETMON_WIFI_JOIN_IFACE 2>/dev/null || true)"
-    [[ -z "$iface" ]] && iface="$(wifi_analysis_iface)"
-    [[ -z "$iface" ]] && { echo "no spare Wi-Fi NIC — refusing"; exit 1; }
+# Emit the join profiles as TSV rows: ssid \t auth \t identity \t secret \t cap_accept.
+# Source: the dashboard-pushed 0600 JSON file; if that file is ABSENT, fall back to the
+# single NETMON_WIFI_JOIN_* env keys as one profile. A present-but-empty file ([]) means
+# "no profiles" (an authoritative empty list, NOT a fallback trigger).
+_wifi_profiles_tsv() {
+    local raw=""
+    [[ -f "$PROFILES_FILE" ]] && raw="$($SUDO cat "$PROFILES_FILE" 2>/dev/null || true)"
+    if [[ -n "$raw" ]]; then
+        if command -v python3 >/dev/null 2>&1; then
+            # Pass the JSON (with secrets) via ENV, never argv (keeps it out of `ps`).
+            NETMON_WJP="$raw" python3 - <<'PY' 2>/dev/null
+import json, os, sys
+try:
+    profs = json.loads(os.environ.get("NETMON_WJP") or "[]")
+except Exception:
+    sys.exit(0)
+if not isinstance(profs, list):
+    sys.exit(0)
+rows = []
+for p in profs:
+    if not isinstance(p, dict):
+        continue
+    ssid = str(p.get("ssid") or "").strip()
+    if not ssid:
+        continue
+    auth = str(p.get("auth") or "open").strip() or "open"
+    ident = str(p.get("identity") or "")
+    secret = str(p.get("secret") or "")
+    cap = "1" if p.get("captive_auto_accept") else "0"
+    fields = [ssid, auth, ident, secret, cap]
+    # Field sep = US (0x1f), NOT tab: tab is an IFS-whitespace char, so bash `read`
+    # COLLAPSES consecutive tabs and an empty field (e.g. a blank identity) vanishes,
+    # shifting every later field left (the PSK would land in `identity`). US never
+    # collapses and can't occur in an SSID/secret. Records get a trailing newline so
+    # `read` doesn't drop the last one.
+    rows.append("\x1f".join(
+        f.replace("\t", " ").replace("\n", " ").replace("\r", " ").replace("\x1f", " ")
+        for f in fields))
+sys.stdout.write("".join(r + "\n" for r in rows))
+PY
+            return 0
+        fi
+        echo "python3 missing — cannot parse ${PROFILES_FILE}; single-config fallback" >&2
+    fi
+    # Single-config fallback (file absent, or python3 unavailable). US-separated to
+    # match the parser (\037 = 0x1f), trailing newline so `read` keeps the row.
+    local ssid; ssid="$(current_value NETMON_WIFI_JOIN_SSID 2>/dev/null || true)"
+    [[ -z "$ssid" ]] && return 0
+    local auth ident secret
     auth="$(current_value NETMON_WIFI_JOIN_AUTH 2>/dev/null || echo open)"
-    identity="$(current_value NETMON_WIFI_JOIN_IDENTITY 2>/dev/null || true)"
+    ident="$(current_value NETMON_WIFI_JOIN_IDENTITY 2>/dev/null || true)"
     secret="$(current_value NETMON_WIFI_JOIN_SECRET 2>/dev/null || true)"
+    printf '%s\037%s\037%s\037%s\0370\n' "$ssid" "${auth:-open}" "$ident" "$secret"
+}
 
-    # Hand the cleanup targets to the trap via globals (main's locals vanish before
-    # the EXIT trap runs — see _TRAP_IFACE/_TRAP_SSID above).
-    _TRAP_IFACE="$iface"; _TRAP_SSID="$ssid"
-    trap '_routing_teardown "$_TRAP_IFACE"; [ -n "$_TRAP_SSID" ] && wifi_leave "$_TRAP_SSID" >/dev/null 2>&1 || true' EXIT
+# Join + measure + leave ONE profile; echo a single result JSON object. Runs the
+# battery through the dedicated route table so probes traverse the joined network.
+# Called in a command-substitution subshell (its stdout is the JSON); the NM
+# connection it creates/removes is system state, so the EXIT trap's wifi_leave_all
+# still cleans up if we're killed mid-profile.
+#   args: iface ssid auth [identity] [secret] [cap_accept]
+_run_profile() {
+    local iface="$1" ssid="$2" auth="$3" identity="${4:-}" secret="${5:-}" cap_accept="${6:-0}"
 
     # 1. Associate (timed).
     local t0 assoc_ms associated=false
@@ -151,19 +238,26 @@ main() {
 
     # 4. Battery (only if we got an IP). Probes traverse the joined net via the
     #    dedicated route table.
-    local cap_state="n/a" cap_code="" cap_redir_b64="" ping_ok=false rtt="" loss=""
-    local dns_ok=false iso_tested="" iso_reachable=""
+    local cap_state="n/a" cap_code="" cap_redir="" cap_redir_b64="" cap_accepted="null"
+    local ping_ok=false rtt="" loss="" dns_ok=false iso_tested="" iso_reachable=""
     if [[ -n "$ip4" && -n "$gw" ]]; then
         local srcip="${ip4%/*}"
         _routing_setup "$iface" "$srcip" "$gw" || true
-        # Probes bind by SOURCE IP (not device): SO_BINDTODEVICE sets the oif but not
-        # the source, so binding to the Wi-Fi IP is what makes the `from <ip>` policy
-        # rule route them via the Wi-Fi gateway (the oif rule is the fallback).
-        # captive portal
+        # captive portal (probes bind by SOURCE IP so the `from <ip>` rule routes them
+        # via the Wi-Fi gateway; SO_BINDTODEVICE would set oif but not the source IP).
         local cap; cap="$(_captive_probe "$srcip")"
         cap_state="$(printf '%s' "$cap" | cut -f1)"
         cap_code="$(printf '%s' "$cap" | cut -f2)"
-        cap_redir_b64="$(printf '%s' "$cap" | cut -f3 | b64)"
+        cap_redir="$(printf '%s' "$cap" | cut -f3)"
+        # optional best-effort click-through accept, then re-probe to see if it opened
+        if [[ "$cap_accept" == "1" && "$cap_state" == "portal" ]]; then
+            if _captive_try_accept "$srcip" "$cap_redir"; then cap_accepted=true; else cap_accepted=false; fi
+            cap="$(_captive_probe "$srcip")"
+            cap_state="$(printf '%s' "$cap" | cut -f1)"
+            cap_code="$(printf '%s' "$cap" | cut -f2)"
+            cap_redir="$(printf '%s' "$cap" | cut -f3)"
+        fi
+        cap_redir_b64="$(printf '%s' "$cap_redir" | b64)"
         # internet reachability via the Wi-Fi
         local png; png="$($SUDO ping -I "$srcip" -c 3 -W 2 1.1.1.1 2>/dev/null || true)"
         printf '%s' "$png" | grep -q ' 0% packet loss' && ping_ok=true
@@ -180,24 +274,61 @@ main() {
         _routing_teardown "$iface"
     fi
 
-    # 5. Emit the artifact (single-network result list; scheduler will append).
+    # 5. Leave THIS network so the next profile can take the radio.
+    wifi_leave "$ssid" >/dev/null 2>&1 || true
+
+    # 6. Echo the single result object (SSID stripped of control chars + " and \).
+    printf '{"ssid":"%s","auth":"%s","associated":%s,"assoc_ms":%s,"dhcp_ms":%s,' \
+        "$(printf '%s' "$ssid" | tr -d '\000-\037\042\134')" "${auth:-open}" "$associated" "$assoc_ms" "$dhcp_ms"
+    printf '"ip":"%s","gateway":"%s","signal":%s,"signal_unit":"quality",' "${ip4:-}" "${gw:-}" "${rssi:-null}"
+    printf '"captive_portal":{"state":"%s","http_code":"%s","redirect_b64":"%s","auto_accepted":%s},' \
+        "$cap_state" "${cap_code:-}" "$cap_redir_b64" "$cap_accepted"
+    printf '"internet":{"ping_ok":%s,"rtt_ms":"%s","loss_pct":"%s"},' "$ping_ok" "${rtt:-}" "${loss:-}"
+    printf '"dns_ok":%s,' "$dns_ok"
+    printf '"isolation":{"internal_target":"%s","internal_reachable":%s}}' \
+        "${iso_tested:-}" "${iso_reachable:-null}"
+}
+
+# ---- main ----------------------------------------------------------------
+
+main() {
+    command -v ip >/dev/null 2>&1 || { echo "ip(8) missing"; exit 1; }
+
+    local enabled
+    enabled="$(current_value NETMON_WIFI_JOIN_ENABLED 2>/dev/null || true)"
+    case "${enabled,,}" in true|1|yes) ;; *) echo "NETMON_WIFI_JOIN_ENABLED not true — skipping"; exit 0 ;; esac
+
+    # One analysis radio per box (never the uplink). Profiles are the networks to test
+    # on it; the iface is box-level, not per-profile.
+    local iface
+    iface="$(current_value NETMON_WIFI_JOIN_IFACE 2>/dev/null || true)"
+    [[ -z "$iface" ]] && iface="$(wifi_analysis_iface)"
+    [[ -z "$iface" ]] && { echo "no spare Wi-Fi NIC — refusing"; exit 1; }
+
+    # The EXIT trap tears down routing + leaves EVERY netmon-owned Wi-Fi connection,
+    # so a mid-run death (even inside a profile subshell) can't strand the radio.
+    _TRAP_IFACE="$iface"
+    trap '_routing_teardown "$_TRAP_IFACE"; wifi_leave_all >/dev/null 2>&1 || true' EXIT
+
+    # Run each profile serialized (one radio = one association at a time), appending a
+    # result object. Empty results[] if there are no profiles / none associated.
+    local results="" n=0 obj
+    while IFS=$'\037' read -r p_ssid p_auth p_ident p_secret p_cap; do
+        [[ -z "${p_ssid:-}" ]] && continue
+        obj="$(_run_profile "$iface" "$p_ssid" "${p_auth:-open}" "${p_ident:-}" "${p_secret:-}" "${p_cap:-0}")"
+        [[ -z "$obj" ]] && continue
+        [[ -n "$results" ]] && results="${results},"
+        results="${results}${obj}"
+        n=$((n+1))
+    done < <(_wifi_profiles_tsv)
+
+    # Emit the artifact (single JSON, results[] with one object per profile).
     local tmp; tmp="$(mktemp)"
-    {
-        printf '{"schema":1,"generated_at":"%s","interface":"%s","results":[' "$(_ts)" "$iface"
-        printf '{"ssid":"%s","auth":"%s","associated":%s,"assoc_ms":%s,"dhcp_ms":%s,' \
-            "$(printf '%s' "$ssid" | tr -d '\000-\037\042\134')" "${auth:-open}" "$associated" "$assoc_ms" "$dhcp_ms"
-        printf '"ip":"%s","gateway":"%s","signal":%s,"signal_unit":"quality",' "${ip4:-}" "${gw:-}" "${rssi:-null}"
-        printf '"captive_portal":{"state":"%s","http_code":"%s","redirect_b64":"%s"},' \
-            "$cap_state" "${cap_code:-}" "$cap_redir_b64"
-        printf '"internet":{"ping_ok":%s,"rtt_ms":"%s","loss_pct":"%s"},' "$ping_ok" "${rtt:-}" "${loss:-}"
-        printf '"dns_ok":%s,' "$dns_ok"
-        printf '"isolation":{"internal_target":"%s","internal_reachable":%s}}' \
-            "${iso_tested:-}" "${iso_reachable:-null}"
-        printf ']}\n'
-    } > "$tmp"
+    printf '{"schema":1,"generated_at":"%s","interface":"%s","results":[%s]}\n' \
+        "$(_ts)" "$iface" "$results" > "$tmp"
     $SUDO install -m 0644 "$tmp" "$OUT"
     rm -f "$tmp"
-    echo "wrote $OUT (ssid=$ssid associated=$associated portal=$cap_state)"
+    echo "wrote $OUT (interface=$iface profiles=$n)"
 }
 
 main "$@"
