@@ -117,7 +117,10 @@ _captive_probe() {
 _captive_try_accept() {
     local srcip="$1" url="$2" page action method origin proto rest host
     [[ -z "$url" ]] && url="http://connectivitycheck.gstatic.com/generate_204"
-    page="$($SUDO curl -s -m 8 -L --interface "$srcip" "$url" 2>/dev/null || true)"
+    # --proto/--proto-redir pin http(s): the portal URL is attacker-controlled (it's
+    # the joined network's redirect), so refuse file://, gopher://, etc. on the fetch
+    # AND on any redirect we follow.
+    page="$($SUDO curl -s -m 8 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" "$url" 2>/dev/null || true)"
     [[ -z "$page" ]] && return 1
     action="$(printf '%s' "$page" | grep -oiE '<form[^>]*action="[^"]*"' | head -1 | sed -E 's/.*[Aa]ction="([^"]*)".*/\1/')"
     method="$(printf '%s' "$page" | grep -oiE '<form[^>]*method="[^"]*"' | head -1 | sed -E 's/.*[Mm]ethod="([^"]*)".*/\1/' | tr 'A-Z' 'a-z')"
@@ -132,10 +135,10 @@ _captive_try_accept() {
     esac
     # Submit generic accept fields (covers the usual accept/agree/continue buttons).
     if [[ "$method" == "post" ]]; then
-        $SUDO curl -s -m 8 -L --interface "$srcip" -o /dev/null \
+        $SUDO curl -s -m 8 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -o /dev/null \
             --data 'accept=1&submit=Continue&agree=on&terms=agree' "$action" 2>/dev/null && return 0
     else
-        $SUDO curl -s -m 8 -L --interface "$srcip" -o /dev/null \
+        $SUDO curl -s -m 8 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -o /dev/null \
             --get --data 'accept=1&submit=Continue&agree=on&terms=agree' "$action" 2>/dev/null && return 0
     fi
     return 1
@@ -226,7 +229,9 @@ _run_profile() {
         # Gateway: ignore-auto-routes suppresses IP4.GATEWAY AND installs no default
         # route, so the gateway comes from the DHCP lease's `routers` option (the
         # only reliable source on a routes-off connection; validated on Monitor1).
-        gw="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null | tr ',' '\n' | sed -n 's/.*routers = \([0-9.]*\).*/\1/p' | head -1)"
+        # grep-gate to `routers` at a word boundary so a dhclient box's
+        # `requested_routers = 1` option can't be captured as gw="1".
+        gw="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null | tr ',' '\n' | grep -E '(^|[[:space:]])routers = ' | sed -n 's/.*routers = \([0-9.]*\).*/\1/p' | head -1)"
         [[ -z "$gw" ]] && gw="$($SUDO nmcli -g IP4.GATEWAY dev show "$iface" 2>/dev/null | head -1)"
     fi
 

@@ -949,10 +949,15 @@ def _interfaces() -> list[dict]:
             out.append(
                 {
                     "name": st.name,
+                    "mac": st.mac,
                     "cidr": st.ipv4_addrs[0] if st.ipv4_addrs else None,
                     "up": bool(st.is_up),
                     "vlan": vlan,
                     "primary": st.name == primary,
+                    # A netdev is wireless iff it has an 802.11 phy. Lets the dashboard
+                    # surface the radio MAC (to authorize on MPSK / MAC-ACLs) + pick the
+                    # analysis radio for the Wi-Fi join config (WIFI-1 / WIFI-6).
+                    "wireless": Path(f"/sys/class/net/{st.name}/phy80211").exists(),
                 }
             )
         return out
