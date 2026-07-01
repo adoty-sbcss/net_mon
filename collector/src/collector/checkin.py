@@ -239,6 +239,11 @@ def _apply_config(data: dict) -> None:
     # schedules; an empty list clears it (the feature stays gated by wifi_join_enabled).
     if "wifi_join_profiles" in data:
         _write_wifi_profiles(data.get("wifi_join_profiles") or [])
+    # WIFI-6 unattended scheduler cadence (0 = manual only) + optional quiet hours.
+    if "wifi_join_schedule_sec" in data and data.get("wifi_join_schedule_sec") is not None:
+        mapping["NETMON_WIFI_JOIN_SCHEDULE_SEC"] = str(int(data["wifi_join_schedule_sec"]))
+    if "wifi_join_quiet" in data:
+        mapping["NETMON_WIFI_JOIN_QUIET"] = re.sub(r"[^0-9\-]", "", str(data.get("wifi_join_quiet") or ""))
     if mapping:
         _update_env_file(ENV_FILE, mapping)
         log.info("applied desired config", keys=list(mapping))
