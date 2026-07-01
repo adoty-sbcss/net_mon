@@ -241,15 +241,21 @@ _run_profile() {
     rssi="$($SUDO nmcli -t -f IN-USE,SIGNAL,SSID dev wifi list ifname "$iface" 2>/dev/null \
             | awk -F: '/^\*/{print $2; exit}')"
 
-    # 3b. Negotiated link: which AP (BSSID), band, and PHY rate the client got — e.g.
-    #     "shoved onto 2.4GHz at a low rate" is a real finding, and the BSSID ties the
-    #     experience to a specific AP. Local (no routing); prefer iw, no-op if absent.
-    local bssid="" band="" rx_rate="" link freq
-    link="$($SUDO iw dev "$iface" link 2>/dev/null || true)"
-    if [[ -n "$link" ]]; then
-        bssid="$(printf '%s' "$link" | sed -n 's/^[[:space:]]*Connected to \([0-9a-fA-F:]\{17\}\).*/\1/p' | head -1)"
-        rx_rate="$(printf '%s' "$link" | sed -n 's/.*rx bitrate:[[:space:]]*\([0-9.]\+\).*/\1/p' | head -1)"
-        freq="$(printf '%s' "$link" | sed -n 's/.*freq:[[:space:]]*\([0-9]\+\).*/\1/p' | head -1)"
+    # 3b. Which AP (BSSID), band, and link rate the client got — e.g. "shoved onto
+    #     2.4GHz at a low rate" is a real finding, and the BSSID ties the experience to
+    #     a specific AP. Read from the SAME in-use (*) nmcli row the signal came from
+    #     (iw is not installed on every box; nmcli is a hard dependency we already use).
+    #     RATE here is the AP's advertised link rate, not the negotiated PHY rate.
+    local bssid="" band="" rx_rate="" apline freq
+    apline="$($SUDO nmcli -t -f IN-USE,BSSID,FREQ,RATE dev wifi list ifname "$iface" 2>/dev/null \
+              | awk '/^\*/{print; exit}')"
+    if [[ -n "$apline" ]]; then
+        # terse mode escapes value-internal colons as '\:'; unescape, then pattern-pull
+        # each piece (MAC / "NNNN MHz" / "NNN Mbit/s") rather than split on ':'.
+        apline="${apline//\\:/:}"
+        bssid="$(printf '%s' "$apline" | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)"
+        freq="$(printf '%s' "$apline" | grep -oE '[0-9]{3,5} MHz' | grep -oE '^[0-9]+' | head -1)"
+        rx_rate="$(printf '%s' "$apline" | grep -oE '[0-9]+ Mbit/s' | grep -oE '^[0-9]+' | head -1)"
         if [[ "$freq" =~ ^[0-9]+$ ]]; then
             if (( freq < 2500 )); then band="2.4GHz"
             elif (( freq < 5900 )); then band="5GHz"
