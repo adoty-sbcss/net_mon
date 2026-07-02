@@ -68,6 +68,14 @@ jobs:
           print("all modules import cleanly")
           PY
 
+      - name: Unit tests (pytest)
+        # First unit tests — Fable audit 01 #3 (scheduled-result delivery spool).
+        # Run from the collector dir for a stable pytest rootdir; the package is
+        # importable via the editable install above. DB-backed tests come later.
+        run: |
+          cd collector
+          pytest tests -q
+
       - name: Console allow-list drift check
         # The remote-console command registries (checkin.py) are the source of
         # truth; the dashboard repo's broker ALLOWED_CMDS + console-config.ts
