@@ -103,15 +103,24 @@ if [[ -e "$LATEST_SNAP" ]]; then
     done
 
     log "restoring DB snapshot: $(readlink "$LATEST_SNAP")"
-    # Drop + recreate the db, then load. This is the safest restore for
-    # a schema that may have ALTER TABLE'd between then and now.
+    # Reset the schema, then load, in ONE transaction. The plain pg_dump carries
+    # no DROP statements, so loading it into the current (post-update) schema used
+    # to collide on the first CREATE and abort under ON_ERROR_STOP — a silent
+    # no-op restore that left old code running on the new schema. Prepending
+    # "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" clears the target so the
+    # dump loads cleanly; --single-transaction makes the whole thing atomic, so a
+    # bad/truncated snapshot rolls back and leaves the DB exactly as it was (never
+    # half-restored, never emptied). netmon is the DB superuser/owner so the reset
+    # is permitted, and the collector is down (compose down, above) so nothing
+    # else is connected.
     PG_PW="$(sudo grep -E '^POSTGRES_PASSWORD=' /etc/netmon/netmon.env 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/^"//; s/"$//')"
-    if ! gunzip -c "$LATEST_SNAP" | "${DC[@]}" exec -T -e "PGPASSWORD=$PG_PW" postgres \
-            psql -U netmon -d netmon -v ON_ERROR_STOP=1 >/dev/null 2>&1; then
-        log "WARN: snapshot restore reported errors — see psql output above"
-        log "      proceeding to container restart anyway"
+    if { printf 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;\n'; gunzip -c "$LATEST_SNAP"; } \
+            | "${DC[@]}" exec -T -e "PGPASSWORD=$PG_PW" postgres \
+              psql -U netmon -d netmon --single-transaction -v ON_ERROR_STOP=1 >/dev/null; then
+        log "snapshot restored (schema reset + reload, atomic)"
     else
-        log "snapshot restored"
+        log "WARN: snapshot restore failed and was rolled back — DB left on the"
+        log "      post-update schema unchanged; investigate the snapshot before retrying"
     fi
 else
     log "no snapshot at $LATEST_SNAP — DB will continue with current state"
