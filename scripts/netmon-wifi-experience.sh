@@ -120,6 +120,14 @@ _captive_probe() {
 # web-auth pattern but are not yet hardware-validated (no test gear) — best-effort, and a
 # failed accept is harmless (the portal simply stays up and we record it blocked).
 _UA_BROWSER='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
+# How long to hold the association after a captive accept, polling for the gateway to
+# open. Aruba Central grants the MAC ASYNC — seconds to a minute+ AFTER the AUP POST — so
+# a fast re-probe misses it. Bounded so a guest profile can't stall the battery forever;
+# tune per-deploy via NETMON_WIFI_CAPTIVE_POLL_SEC. If the grant lands AFTER this budget,
+# the NEXT battery run still measures it (Aruba's guest MAC grant persists across runs), so
+# the accept is worthwhile even when this run records the portal. Default 45s.
+CAPTIVE_ACCEPT_POLL_SEC="$(current_value NETMON_WIFI_CAPTIVE_POLL_SEC 2>/dev/null || echo 45)"
+[[ "$CAPTIVE_ACCEPT_POLL_SEC" =~ ^[0-9]+$ ]] || CAPTIVE_ACCEPT_POLL_SEC=45
 
 # Classify the portal vendor from the redirect host, then (if inconclusive) the page body.
 # Echoes: aruba_central | aruba | cisco_wlc | cisco_ise | meraki | generic
@@ -144,10 +152,12 @@ _captive_vendor() {
 
 # Aruba Central Cloud Guest (Svelte SPA): generate_204 -> capture -> JS/META bounce to a
 # /login SPA -> anonymous "I accept" AUP. Replicate the accept POST (capture + csrf +
-# cmd=authenticate), then POLL — the AP opens the gateway ASYNC, several seconds after the
-# accept (a single fast re-probe misses it). Reverse-engineered live on SBCSS-Guest.
+# cmd=authenticate), then POLL up to CAPTIVE_ACCEPT_POLL_SEC — the AP opens the gateway
+# ASYNC (seconds to a minute+) after the POST. Reverse-engineered live on SBCSS-Guest;
+# grant timing is being measured to tune the budget. If the grant lands after the budget,
+# the next battery run measures it (grant persists). Returns 0 iff internet opened here.
 _accept_aruba_central() {
-    local srcip="$1" cap_url="$2" cj bounce login host page csrf capture i code
+    local srcip="$1" cap_url="$2" cj bounce login host page csrf capture code waited
     cj="$(mktemp 2>/dev/null || echo /tmp/nm-cj.$$)"
     bounce="$($SUDO curl -s -m 12 -L --interface "$srcip" -A "$_UA_BROWSER" -c "$cj" -b "$cj" "$cap_url" 2>/dev/null || true)"
     login="$(printf '%s' "$bounce" | grep -oiE 'window\.top\.location\.href *= *"[^"]+"' | head -1 | sed -E 's/.*href *= *"([^"]+)".*/\1/')"
@@ -163,10 +173,11 @@ _accept_aruba_central() {
         --data-urlencode "csrf_token=$csrf" --data-urlencode "capture=$capture" --data 'cmd=authenticate' \
         -o /dev/null "$login" 2>/dev/null || true
     rm -f "$cj"
-    for i in 1 2 3 4 5 6 7 8 9 10; do   # poll ~20s for the async gateway open
+    waited=0
+    while (( waited < CAPTIVE_ACCEPT_POLL_SEC )); do   # poll for the async gateway open
         code="$($SUDO curl -s -m 5 --interface "$srcip" -o /dev/null -w '%{http_code}' http://connectivitycheck.gstatic.com/generate_204 2>/dev/null || echo 000)"
         [[ "$code" == "204" ]] && return 0
-        sleep 2
+        sleep 3; waited=$((waited + 3))
     done
     return 1
 }
