@@ -25,7 +25,22 @@ Audits run **sequentially, highest-value first**, so a partial run still banks t
 | 1 | Silent data-loss hunt (collector → dashboard delivery seam) | [01-silent-data-loss.md](01-silent-data-loss.md) | ✅ done — 10 findings (1 Critical, 3 High) |
 | 2 | Deploy / infra safety (bicep drift, blind-apply blast radius, pipeline fragility) | [02-deploy-safety.md](02-deploy-safety.md) | ✅ done — 13 findings (2 Critical, 4 High) + blast-radius table |
 | 3 | Data-contract audit (fields collected → ingested → exposed to AI) | [03-data-contract.md](03-data-contract.md) | ✅ done — 29-row matrix, 8 AI-exposure gaps + config-knob coverage |
-| 4 | Test / failure-path gap map | 04-test-gaps.md | ⏳ queued |
+| 4 | Test / failure-path gap map (test-bootstrap plan) | [04-test-gaps.md](04-test-gaps.md) | ✅ done — harness + 17 ranked tests + phase split |
+
+**Program complete (2026-07-02):** all four audits run on Fable, verified on Opus, committed.
+
+## Top priorities across the program (synthesis)
+
+If you act on nothing else, act on these — ranked by field impact:
+
+1. **[A1 #1, Critical] Bundle idempotency loses mid-hour scans.** `upload-now` ships a partial hour; the hourly rebuild reuses the filename; the dashboard's filename-only ingest guard (`ingest.ts:986`) refuses to re-parse → scans added mid-hour vanish. Fix = content-aware re-ingest on newer `builtAt`. Pair with A1 #2 (no backfill) — together they are the "sensor looks healthy, data missing" bleed. Quantify first on Monitor1 (diff `scan_runs` hours vs `bundle_uploads` hours).
+2. **[A2 #1/#2, Critical] A full `main.bicep` apply still breaks prod.** The env/secrets arrays only declare a subset, so an apply drops OIDC/email/SFTP-provisioning env; a re-apply that regenerates `AUTH_SECRET` makes the in-DB SFTP config undecryptable. Fix = reconcile the full live env/secrets into bicep (like the domain binding already got); read the two secrets from Key Vault on re-apply. Until then, follow the safe-deploy checklist in `02`.
+3. **[A4 Phase 1] Stand up the test harness (~1 day).** Reuses the codebase's own text-parse drift-guard idiom. Catches, structurally: the proxy.ts build-breaker, un-allowlisted sensor routes, collector↔dashboard contract drift, the bicep env-wipe class, and surfaces two live bugs as red tests. This is the highest-leverage follow-up the whole program points to.
+4. **[A3 gap 1, best AI win] Sensor fleet health is invisible to the AI.** Add a `sensor_health` chat tool + analysis-context block so "which sensors are unhealthy/failed update" can become an insight. Smallest change, on-strategy.
+
+**Cross-cutting themes:** (a) *silent-because-swallowed* — `_post` and several ingest paths log-and-continue, so failures never surface (A1 #3, #10); (b) *shipped-but-unconsumed* — perf data, traffic stats, `inventory.json`, reported topology config are collected but dropped before AI/DB (A3); (c) *no safety net* — no tests, no post-deploy healthcheck, a no-op DB rollback (A2 #3/#5, A4). Recurring root cause: green checks that verify a *different* condition than the one that matters.
+
+Two findings were independently re-discovered by more than one audit (the `saveSensorConfigAction` replace-not-merge bug: A1 #6 = A3 §D; the perf→AI gap: A1 #4 ⊂ A3) — corroboration, not duplication.
 
 ## How to read a report
 
