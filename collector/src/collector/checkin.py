@@ -84,6 +84,72 @@ def _post(url: str, token: str | None, body: dict) -> dict | None:
     return None
 
 
+# --- Result-delivery spool (Fable audit 01 #3: scheduled perf resilience) ----
+# Scheduled perf results (iperf/speedtest/latency/webperf) are measured on a
+# cadence, but the dashboard is regularly unreachable for short windows (every
+# deploy restarts the web app; transient 5xx). A dropped result POST used to be
+# lost silently for that whole interval. Instead, a failed result is spooled and
+# re-delivered on a later check-in. The measurement's original startedAt is kept
+# in the payload, so it lands in the correct time bucket — just later. We do NOT
+# gate the schedulers on delivery: that would re-run expensive probes (speedtest
+# burns bandwidth) every cycle during an outage. Spooling decouples "did we
+# measure" from "did the dashboard receive it."
+RESULT_SPOOL_DIR = Path("/var/lib/netmon/result-spool")
+RESULT_SPOOL_MAX = 500  # cap files so a long outage can't fill the disk
+RESULT_SPOOL_DRAIN_PER_RUN = 50  # bound redelivery work per check-in
+_result_spool_seq = 0
+
+
+def _spool_result(endpoint: str, payload: dict) -> None:
+    """Persist a result payload that failed to POST, for later redelivery.
+    Filenames sort oldest-first: a zero-padded ns timestamp orders across process
+    restarts, an in-run counter breaks ties (clocks can be coarse)."""
+    import time
+
+    global _result_spool_seq
+    try:
+        RESULT_SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+        existing = sorted(RESULT_SPOOL_DIR.glob("*.json"))
+        # Enforce the cap: drop the oldest to make room (bounded disk use).
+        for stale in existing[: max(0, len(existing) + 1 - RESULT_SPOOL_MAX)]:
+            stale.unlink(missing_ok=True)
+        _result_spool_seq += 1
+        name = f"{time.time_ns():020d}-{_result_spool_seq:09d}.json"
+        tmp = RESULT_SPOOL_DIR / f".{name}.tmp"
+        tmp.write_text(json.dumps({"endpoint": endpoint, "payload": payload}))
+        tmp.replace(RESULT_SPOOL_DIR / name)  # atomic — a partial write is never drained
+    except Exception as exc:  # noqa: BLE001 — spooling is best-effort
+        log.warning("could not spool result", endpoint=endpoint, error=str(exc))
+
+
+def _post_result(url: str, token: str | None, endpoint: str, payload: dict) -> bool:
+    """POST a scheduled-measurement result; spool it for retry if delivery fails.
+    Returns True on confirmed delivery (2xx), False if it was spooled."""
+    if _post(f"{url}{endpoint}", token, payload) is not None:
+        return True
+    _spool_result(endpoint, payload)
+    return False
+
+
+def _drain_result_spool(url: str, token: str | None) -> None:
+    """Redeliver spooled result payloads oldest-first. Stops at the first failure
+    (dashboard still down → retry next check-in) and bounds work per run."""
+    try:
+        pending = sorted(RESULT_SPOOL_DIR.glob("*.json"))
+    except Exception:  # noqa: BLE001
+        return
+    for spooled in pending[:RESULT_SPOOL_DRAIN_PER_RUN]:
+        try:
+            doc = json.loads(spooled.read_text())
+            endpoint, payload = doc["endpoint"], doc["payload"]
+        except Exception:  # noqa: BLE001 — corrupt/partial file: drop it
+            spooled.unlink(missing_ok=True)
+            continue
+        if _post(f"{url}{endpoint}", token, payload) is None:
+            return  # still unreachable; keep this and the rest for next time
+        spooled.unlink(missing_ok=True)
+
+
 def _read_applied_version() -> int | None:
     try:
         return int(APPLIED_VERSION_FILE.read_text().strip())
@@ -626,9 +692,10 @@ def _report_iperf(url: str, token: str | None, res: dict, trigger: str) -> None:
     """POST an iperf result to the dashboard (best-effort)."""
     from datetime import UTC, datetime
 
-    _post(
-        f"{url}/api/sensor/iperf-result",
+    _post_result(
+        url,
         token,
+        "/api/sensor/iperf-result",
         {
             "trigger": trigger,
             "serverHost": res.get("server"),
@@ -787,9 +854,10 @@ def _report_speedtest(url: str, token: str | None, res: dict, trigger: str) -> N
     """POST a public-speedtest result to the dashboard (best-effort)."""
     from datetime import UTC, datetime
 
-    _post(
-        f"{url}/api/sensor/speedtest-result",
+    _post_result(
+        url,
         token,
+        "/api/sensor/speedtest-result",
         {
             "trigger": trigger,
             "provider": res.get("provider"),
@@ -855,9 +923,10 @@ def _report_latency(url: str, token: str | None, results: list[dict], trigger: s
 
     ts = datetime.now(UTC).isoformat()
     for r in results:
-        _post(
-            f"{url}/api/sensor/latency-result",
+        _post_result(
+            url,
             token,
+            "/api/sensor/latency-result",
             {
                 "trigger": trigger,
                 "label": r.get("label"),
@@ -896,9 +965,10 @@ def _report_webperf(url: str, token: str | None, results: list[dict], trigger: s
 
     ts = datetime.now(UTC).isoformat()
     for r in results:
-        _post(
-            f"{url}/api/sensor/webperf-result",
+        _post_result(
+            url,
             token,
+            "/api/sensor/webperf-result",
             {
                 "trigger": trigger,
                 "url": r.get("url"),
@@ -1212,6 +1282,10 @@ def run_checkin() -> int:
             token,
             {"commandId": cid, "status": status, "result": result, "configVersion": applied},
         )
+
+    # Redeliver any perf results that failed to POST on an earlier cycle (e.g. a
+    # dashboard deploy restart) before running this cycle's scheduled probes.
+    _drain_result_spool(url, token)
 
     # Scheduled iperf + public speedtests + latency + web-performance probes piggyback
     # on check-in.
