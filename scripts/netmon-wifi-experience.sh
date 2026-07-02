@@ -396,7 +396,7 @@ _run_profile() {
     # 4. Battery (only if we got an IP). Probes traverse the joined net via the
     #    dedicated route table.
     local cap_state="n/a" cap_code="" cap_redir="" cap_redir_b64="" cap_accepted="null" cap_vendor=""
-    local ping_ok=false rtt="" loss="" dns_ok=false iso_tested="" iso_reachable=""
+    local ping_ok=false http_ok=false rtt="" loss="" dns_ok=false iso_tested="" iso_reachable=""
     local dl_mbps="" tgt_json="" wp_json="" st_json=""
     if [[ -n "$ip4" && -n "$gw" ]]; then
         local srcip="${ip4%/*}"
@@ -419,11 +419,15 @@ _run_profile() {
             cap_redir="$(printf '%s' "$cap" | cut -f3)"
         fi
         cap_redir_b64="$(printf '%s' "$cap_redir" | b64)"
-        # internet reachability via the Wi-Fi
+        # internet reachability via the Wi-Fi. TWO signals: ICMP (ping_ok) AND HTTP
+        # (http_ok). Guest networks commonly BLOCK ICMP but pass HTTP/DNS, so ping alone
+        # gives a false "unreachable" — http_ok (a 204 from the connectivity endpoint, the
+        # same one the captive probe used) is the reliable "internet actually works" signal.
         local png; png="$($SUDO ping -I "$srcip" -c 3 -W 2 1.1.1.1 2>/dev/null || true)"
         printf '%s' "$png" | grep -q ' 0% packet loss' && ping_ok=true
         rtt="$(printf '%s' "$png" | awk -F'/' '/rtt|round-trip/{print $5; exit}')"
         loss="$(printf '%s' "$png" | grep -oE '[0-9]+% packet loss' | grep -oE '[0-9]+' | head -1)"
+        [[ "$cap_state" == "open" ]] && http_ok=true
         # DNS resolves through the Wi-Fi
         $SUDO curl -s -m 6 --interface "$srcip" -o /dev/null https://dns.google/resolve?name=example.com 2>/dev/null && dns_ok=true
         # throughput: a short source-bound download over the Wi-Fi (Cloudflare speed
@@ -491,7 +495,7 @@ _run_profile() {
     printf '"ip":"%s","gateway":"%s","signal":%s,"signal_unit":"quality",' "${ip4:-}" "${gw:-}" "${rssi:-null}"
     printf '"captive_portal":{"state":"%s","http_code":"%s","redirect_b64":"%s","auto_accepted":%s,"vendor":"%s"},' \
         "$cap_state" "${cap_code:-}" "$cap_redir_b64" "$cap_accepted" "${cap_vendor:-}"
-    printf '"internet":{"ping_ok":%s,"rtt_ms":"%s","loss_pct":"%s"},' "$ping_ok" "${rtt:-}" "${loss:-}"
+    printf '"internet":{"ping_ok":%s,"http_ok":%s,"rtt_ms":"%s","loss_pct":"%s"},' "$ping_ok" "$http_ok" "${rtt:-}" "${loss:-}"
     printf '"link":{"bssid":"%s","band":"%s","rx_rate_mbps":%s},' "${bssid:-}" "${band:-}" "${rx_rate:-null}"
     printf '"throughput":{"download_mbps":%s},' "${dl_mbps:-null}"
     printf '"speedtest":%s,' "${st_json:-null}"
