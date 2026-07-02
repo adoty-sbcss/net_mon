@@ -23,7 +23,7 @@ Audits run **sequentially, highest-value first**, so a partial run still banks t
 | # | Audit | Report | Status |
 |---|-------|--------|--------|
 | 1 | Silent data-loss hunt (collector → dashboard delivery seam) | [01-silent-data-loss.md](01-silent-data-loss.md) | ✅ done — 10 findings (1 Critical, 3 High) |
-| 2 | Deploy / infra safety (bicep drift, blind-apply blast radius, pipeline fragility) | 02-deploy-safety.md | ⏳ queued |
+| 2 | Deploy / infra safety (bicep drift, blind-apply blast radius, pipeline fragility) | [02-deploy-safety.md](02-deploy-safety.md) | ✅ done — 13 findings (2 Critical, 4 High) + blast-radius table |
 | 3 | Data-contract audit (fields collected → ingested → exposed to AI) | 03-data-contract.md | ⏳ queued |
 | 4 | Test / failure-path gap map | 04-test-gaps.md | ⏳ queued |
 
