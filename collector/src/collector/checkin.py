@@ -232,6 +232,10 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_SFTP_PASSWORD"] = str(data["sftp_password"])
     if "sftp_remote_path" in data:
         mapping["NETMON_SFTP_REMOTE_PATH"] = str(data.get("sftp_remote_path") or "/")
+    # Bundle delivery transport (SFTP->HTTPS migration): "sftp" | "blob".
+    if "bundle_transport" in data:
+        bt = str(data.get("bundle_transport") or "sftp").lower()
+        mapping["NETMON_BUNDLE_TRANSPORT"] = bt if bt in ("sftp", "blob") else "sftp"
     # iperf3 schedule/params (#10) pushed from the dashboard.
     if "iperf_enabled" in data:
         mapping["NETMON_IPERF_ENABLED"] = "true" if data.get("iperf_enabled") else "false"
@@ -1222,6 +1226,7 @@ def run_checkin() -> int:
                 "sftp_host": settings.sftp_host,
                 "sftp_port": settings.sftp_port,
                 "sftp_user": settings.sftp_user,
+                "bundle_transport": settings.bundle_transport,
             },
         },
     )

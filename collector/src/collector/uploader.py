@@ -60,6 +60,19 @@ def _identity_slugs() -> tuple[str, str, str] | None:
     return None
 
 
+def _active_transport(s) -> str | None:
+    """Which upload verb this box uses this hour, or None (keep bundles local).
+
+    'blob' (HTTPS to the depot via a dashboard-minted SAS) takes precedence when
+    selected; else 'sftp' when SFTP is enabled; else None. blob_upload raises
+    cleanly if enrollment / dashboard URL is missing, so the bundle just stays
+    queued and retries — same failure handling as an SFTP error.
+    """
+    if s.bundle_transport == "blob":
+        return "blob"
+    return "sftp" if s.sftp_enabled else None
+
+
 def _filename_for(window_end: datetime) -> str:
     """Filename for the bundle covering the hour that just completed.
 
@@ -147,9 +160,13 @@ def build_and_upload_hour(window_end: datetime) -> dict[str, str | None]:
 
     # 2. Try to upload every pending bundle (today's plus anything orphaned
     # from earlier failed runs).
-    if not settings.sftp_enabled:
+    transport = _active_transport(settings)
+    if transport is None:
         result["status"] = "saved_only"
-        result["message"] = "SFTP disabled (NETMON_SFTP_ENABLED=false); bundles kept locally"
+        result["message"] = (
+            "no upload transport active (SFTP disabled, bundle_transport != blob); "
+            "bundles kept locally"
+        )
         return result
 
     pending = list_pending_bundles()
@@ -178,18 +195,23 @@ def build_and_upload_hour(window_end: datetime) -> dict[str, str | None]:
             last_error = "local file missing"
             continue
         try:
-            remote = upload_file(path)
+            if transport == "blob":
+                from . import blob_upload
+                remote = blob_upload.upload_file_blob(path)
+            else:
+                remote = upload_file(path)
             record_bundle_uploaded(fname, remote)
             audit("bundle_uploaded", filename=fname, remote_path=remote,
-                  size_bytes=path.stat().st_size)
+                  transport=transport, size_bytes=path.stat().st_size)
             succeeded += 1
             if path.name == Path(result.get("local_path") or "").name:
                 result["remote_path"] = remote
         except Exception as exc:
             err = str(exc)
-            log.exception("sftp upload failed", filename=fname, error=err)
+            log.exception("bundle upload failed", transport=transport,
+                          filename=fname, error=err)
             record_bundle_upload_failure(fname, err)
-            audit("bundle_upload_failed", filename=fname, error=err)
+            audit("bundle_upload_failed", filename=fname, transport=transport, error=err)
             failed += 1
             last_error = err
 
@@ -362,11 +384,12 @@ def request_stop() -> None:
 
 def _run_scheduler_loop() -> None:
     s = get_settings()
-    if not s.sftp_enabled:
-        log.info("uploader disabled (NETMON_SFTP_ENABLED=false), scheduler not running")
+    transport = _active_transport(s)
+    if transport is None:
+        log.info("uploader disabled (no active transport), scheduler not running")
         return
     log.info("uploader scheduler started",
-             host=s.sftp_host, port=s.sftp_port,
+             transport=transport, host=s.sftp_host, port=s.sftp_port,
              remote_dir=_remote_dir(), device=device_name(),
              identity_set=_identity_slugs() is not None)
 
@@ -390,8 +413,8 @@ def _run_scheduler_loop() -> None:
 def start_in_background() -> threading.Thread | None:
     """Spawn the scheduler as a daemon thread. Returns the thread (or None if disabled)."""
     s = get_settings()
-    if not s.sftp_enabled:
-        log.info("uploader disabled, not spawning scheduler thread")
+    if _active_transport(s) is None:
+        log.info("uploader disabled (no active transport), not spawning scheduler thread")
         return None
     t = threading.Thread(target=_run_scheduler_loop, name="netmon-uploader", daemon=True)
     t.start()
