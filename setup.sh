@@ -36,7 +36,10 @@ ensure_paths
 log "Checking essential packages..."
 # unattended-upgrades keeps the Ubuntu host current with security patches
 # (the containers get refreshed by netmon-update / netmon-deep-refresh timers).
-ensure_packages ca-certificates curl openssl git unattended-upgrades
+# `iw` is the Wi-Fi RF/AP survey tool (WIFI-2) on networkd boxes; ship it in the
+# baseline so the survey works the moment it's enabled. (netmon-wifi-survey.sh
+# also self-installs it as a fallback for boxes deployed before this landed.)
+ensure_packages ca-certificates curl openssl git unattended-upgrades iw
 
 if pkg_installed unattended-upgrades; then
     if ! systemctl is-enabled --quiet unattended-upgrades 2>/dev/null; then
