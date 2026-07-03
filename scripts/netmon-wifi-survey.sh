@@ -9,9 +9,11 @@
 # envelope in the shared state dir; the in-container `discovery/wifi.py` reads +
 # normalizes it.
 #
-# Passive + read-only: enumerates nearby SSIDs / BSSIDs / channels / signal /
-# encryption. Never associates, never changes config, captures no payloads and
-# writes no secrets — safe to run on a timer.
+# Passive scan: enumerates nearby SSIDs / BSSIDs / channels / signal / encryption.
+# Never associates, captures no payloads, writes no secrets. So the feature can be
+# turned on from the dashboard with no host access, it will (best-effort, guarded)
+# install `iw` and bring the analysis radio up so a scan can run — but it never
+# joins a network or writes persistent network config. Safe to run on a timer.
 #
 # Output: ${NETMON_STATE_DIR:-/var/lib/netmon}/wifi_survey.json (atomic write).
 # The raw tool output is base64'd into the envelope so this script stays dumb (no
@@ -42,8 +44,10 @@ TMP="$(mktemp)"
 ERRF="$(mktemp)"
 trap 'rm -f "$TMP" "$ERRF"' EXIT
 
+# Use `sudo -n` (never prompt): this runs from a systemd timer with no TTY, so a
+# password prompt would hang the oneshot forever instead of failing fast.
 SUDO=""
-[[ "$(id -u)" -ne 0 ]] && SUDO="sudo"
+[[ "$(id -u)" -ne 0 ]] && SUDO="sudo -n"
 
 host="$(hostname 2>/dev/null || echo unknown)"
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -71,6 +75,33 @@ for d in /sys/class/net/*/phy80211; do
     wifi_ifaces+=("$iface")
 done
 
+# --- Provision the radio for scanning (self-heal, best-effort) --------------
+# A box that never used its analysis radio ships two blockers the survey can fix
+# itself, so enabling Wi-Fi monitoring from the dashboard "just works" with no
+# SSH — a console-only operator has no host shell (the Trona 2026-07-03 case: box
+# recovered, monitoring enabled, but the survey could never run):
+#   1. `iw` may be absent on a networkd box (fresh images don't ship it; NM boxes
+#      use nmcli, already present). Install it once, non-interactively.
+#   2. The radio is often administratively DOWN — `iw scan` then fails with
+#      "Network is down". We bring each wifi iface up in the scan loop below.
+# Still passive: we never associate, change persistent config, or write secrets.
+# Guarded so the apt path runs at most once (until iw lands), and everything is
+# best-effort — a box without passwordless sudo just reports the tool error.
+if [[ ${#wifi_ifaces[@]} -gt 0 ]]; then
+    if command -v rfkill >/dev/null 2>&1; then
+        $SUDO rfkill unblock wifi 2>/dev/null || true
+    fi
+    if [[ "$backend" != "nm" ]] && ! command -v iw >/dev/null 2>&1; then
+        echo "iw not found on a networkd box; attempting one-time install"
+        $SUDO apt-get update -qq 2>/dev/null || true
+        if $SUDO apt-get install -y -qq iw 2>/dev/null; then
+            echo "installed iw"
+        else
+            echo "WARN: could not install iw (needs passwordless sudo + network); survey will report a tool error until it is present"
+        fi
+    fi
+fi
+
 NMCLI_FIELDS="IN-USE,SSID,BSSID,CHAN,FREQ,RATE,SIGNAL,SECURITY,WPA-FLAGS,RSN-FLAGS,MODE"
 
 # GNU base64 wraps at 76 cols by default; -w0 keeps it one line. Fallback strips.
@@ -87,6 +118,9 @@ sep=""
 if [[ ${#wifi_ifaces[@]} -gt 0 ]]; then
     for iface in "${wifi_ifaces[@]}"; do
         tool=""; raw=""; err="null"; fields="null"
+        # Bring the radio up so scans don't fail with "Network is down" (idempotent;
+        # we never associate, so this can't turn the analysis radio into an uplink).
+        $SUDO ip link set "$iface" up 2>/dev/null || true
         if [[ "$backend" == "nm" ]] && command -v nmcli >/dev/null 2>&1; then
             tool="nmcli"; fields="\"$NMCLI_FIELDS\""
             if out="$(nmcli -t -f "$NMCLI_FIELDS" dev wifi list ifname "$iface" --rescan auto 2>"$ERRF")"; then
