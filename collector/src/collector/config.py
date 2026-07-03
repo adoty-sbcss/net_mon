@@ -214,6 +214,10 @@ class Settings(BaseSettings):
     sftp_user: str = Field(default="", alias="NETMON_SFTP_USER")
     sftp_password: str = Field(default="", alias="NETMON_SFTP_PASSWORD")
     sftp_remote_path: str = Field(default="/", alias="NETMON_SFTP_REMOTE_PATH")
+    # Bundle delivery transport (SFTP->HTTPS migration): "sftp" (paramiko upload
+    # to the depot, today) | "blob" (HTTPS PUT with a dashboard-minted SAS URL).
+    # Pushed from the dashboard via desired-config; inert until flipped to "blob".
+    bundle_transport: str = Field(default="sftp", alias="NETMON_BUNDLE_TRANSPORT")
     device_name: str = Field(default="", alias="NETMON_DEVICE_NAME")
 
     # iperf3 throughput testing (#10). Pushed from the dashboard via desired_config.

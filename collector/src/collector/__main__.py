@@ -136,6 +136,27 @@ def cmd_upload_test() -> None:
     because uploads are disabled. We surface that here so a green test isn't
     mistaken for "uploads are working".
     """
+    settings = get_settings()
+    if settings.bundle_transport == "blob":
+        # Blob transport: prove the dashboard mints a SAS for us (exercises
+        # enrollment + dashboard URL + the /api/sensor/bundle-upload-url route +
+        # the proxy allowlist) WITHOUT writing a probe blob.
+        from . import blob_upload
+        slugs = uploader_mod._identity_slugs()
+        if slugs is None:
+            click.echo("FAIL blob transport needs box identity (run: sudo netmon-wizard)")
+            return
+        probe = f"{slugs[2]}_2000_01_01_00.zip"
+        try:
+            target = blob_upload.get_upload_target(probe)
+        except Exception as exc:
+            click.echo(f"FAIL blob mint failed: {exc}")
+            return
+        click.echo("OK   blob mint succeeded — dashboard issued a SAS URL")
+        click.echo(f"  transport:   blob (HTTPS PUT to the depot; expires {target.get('expiresAt')})")
+        click.echo("uploads:       ENABLED (bundle_transport=blob) — bundles ship via HTTPS")
+        return
+
     ok, msg = uploader_mod.test_connection()
     click.echo(("OK   " if ok else "FAIL ") + msg)
     if ok:
