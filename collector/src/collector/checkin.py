@@ -542,6 +542,11 @@ def _spawn_console_session(args: dict) -> tuple[str, dict]:
             HOST_CONSOLE_REQUEST_FILE.parent.mkdir(parents=True, exist_ok=True)
             with HOST_CONSOLE_REQUEST_FILE.open("a", encoding="utf-8") as fh:
                 fh.write(f"{sid}\t{nonce}\n")
+            # 0600: the one-time nonce must not linger world-readable in the shared
+            # bind mount (esp. on a box the host poll can't drain — no passwordless
+            # sudo). The socket it unlocks is already 0600 root; this is defence in
+            # depth so a non-root host user can't even read a pending nonce.
+            os.chmod(HOST_CONSOLE_REQUEST_FILE, 0o600)
         subprocess.Popen(
             [sys.executable, "-m", "collector", "console-session",
              "--broker", broker, "--sid", sid, "--mode", mode],
