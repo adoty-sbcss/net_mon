@@ -75,6 +75,32 @@ Enable it only on boxes where you reach the admin user by key (the office test
 boxes, or any sensor after you've installed your key). For a locked-down box whose
 only access is a password, install a key first or leave SSH hardening off.
 
+## 🖥️ Remote console — full shell = HOST root (CON-7)
+
+The dashboard's per-sensor **"Full shell"** drops the operator into an interactive
+`bash -i` **on the HOST as root** (not the container), so a console-only operator
+can do genuine host administration (`systemctl`, `apt`, `/etc/netmon`) without SSH.
+
+- **Why the host, not the container:** the collector container can't spawn a host
+  process (no `pid:host`, no host rootfs). So the full-shell arming launches a
+  host-side PTY server (`scripts/netmon-host-console.py`, via `sudo systemd-run`)
+  that runs `bash -i` on the host and exposes it over a **per-session Unix socket**
+  in `/var/lib/netmon`. The in-container `console-session` only **relays** the
+  broker's frames to that socket — it never holds a host shell itself.
+- **No new attack surface** over the prior in-container full-shell: that already
+  ran in a `privileged` + `network_mode: host` container with `/dev`, which is
+  host-root-equivalent (`mount` the disk + `chroot`). This just makes it direct.
+- **Gates (unchanged from the container full-shell):** superadmin-only, dashboard
+  **email one-time-code step-up**, broker relays shell frames only when `/validate`
+  reports `mode=full`, **full transcript recording**, **30/60-min time-box + idle
+  timeout + kill-switch**. Plus: a one-time **nonce** authenticates the container
+  bridge to the host server, `HISTFILE=/dev/null`, and a **hard TTL backstop**
+  (`systemd RuntimeMaxSec` + the server's own self-timeout). On teardown the whole
+  bash **session** is SIGKILLed so nothing lingers root.
+- **Still outbound-only:** the new hop is a local Unix socket, not a network
+  listener — the "no inbound" invariant holds. The fixed-argv **restricted** diag
+  console (allow-listed commands) is unchanged.
+
 ## Scope / status
 
 - **New installs only** for now (the installer checkbox). A fleet-wide apply path
