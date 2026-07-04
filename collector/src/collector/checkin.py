@@ -52,6 +52,12 @@ TOKEN_FILE = Path("/var/lib/netmon/enroll-token")
 # /var/lib/netmon is a shared host<->container bind mount, so this file is our
 # one-way IPC for actions the in-container agent can't perform itself.
 HOST_ACTION_FILE = Path("/var/lib/netmon/host-action-request")
+# CON-7 (host shell): when a full-shell (mode=full) session is claimed, we append
+# "<sid>\t<nonce>" here. netmon-console-poll.sh drains it right after this poll
+# returns and launches scripts/netmon-host-console.py — a HOST-side PTY server the
+# container's console-session bridges to over a Unix socket, so "Full shell" is the
+# real host root, not the container. Same shared-bind-mount IPC as HOST_ACTION_FILE.
+HOST_CONSOLE_REQUEST_FILE = Path("/var/lib/netmon/host-console-request")
 EXIT_CONFIG_CHANGED = 10
 EXIT_UPDATE_REQUESTED = 11
 EXIT_HOST_ACTION = 12
@@ -509,6 +515,7 @@ def _spawn_console_session(args: dict) -> tuple[str, dict]:
     token is passed via env, NOT argv, to keep it out of the process list.
     """
     import os
+    import secrets
     import subprocess
     import sys
 
@@ -524,6 +531,17 @@ def _spawn_console_session(args: dict) -> tuple[str, dict]:
     try:
         env = dict(os.environ)
         env["NETMON_CONSOLE_TOKEN"] = token
+        # Full shell = HOST root (CON-7). The container can't spawn a host process,
+        # so arm a host-side PTY server: append "<sid>\t<nonce>" for the host poll
+        # to drain + launch, and hand the SAME nonce to the session process (env,
+        # off argv) so its socket handshake authenticates to that server. The
+        # container never gets host root itself — it only bridges the socket.
+        if mode == "full":
+            nonce = secrets.token_hex(16)
+            env["NETMON_CONSOLE_HOST_NONCE"] = nonce
+            HOST_CONSOLE_REQUEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with HOST_CONSOLE_REQUEST_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(f"{sid}\t{nonce}\n")
         subprocess.Popen(
             [sys.executable, "-m", "collector", "console-session",
              "--broker", broker, "--sid", sid, "--mode", mode],

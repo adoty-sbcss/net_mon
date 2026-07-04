@@ -18,27 +18,28 @@ This module is the source of truth and re-validates every id the broker forwards
 
 FULL-SHELL mode (CON-7): when the dashboard mints a session in `mode="full"`
 (after an email one-time-code step-up gate) the `open-console` command carries
-`mode=full` and the check-in handler passes `--mode full` to this process. In
-that mode we DROP the fixed-argv allow-list and instead bridge an INTERACTIVE
-PTY (`bash -i`) to the operator's terminal — base64-framed stdin/stdout/resize.
-This removes the allow-list containment, so it is gated two independent ways
-(mirroring the allow-list's double-validation): the sensor only spawns the PTY
-when THIS process was launched with `--mode full`, and the broker only relays
-shell I/O frames when the dashboard's /validate reports `mode=full`. Every frame
+`mode=full`. Full shell = the real HOST root. The container can't spawn a host
+process, so the arming step (checkin._spawn_console_session) launches a host-side
+PTY server (scripts/netmon-host-console.py) that runs `bash -i` ON THE HOST and
+exposes it over a per-session Unix socket in the shared /var/lib/netmon bind
+mount. This process (`_HostShellBridge`) only RELAYS the same base64-framed
+stdin/stdout/resize frames between the broker and that socket — so the operator
+UI, the broker, and its transcript recorder are unchanged, and the container
+never holds a host shell itself, it just pipes bytes. It is gated the same ways
+the old in-container shell was (dashboard step-up + the broker only relaying shell
+frames when /validate reports mode=full), plus a one-time nonce (handed to us via
+env by the arming step) that authenticates us to the host server. Every frame
 still flows through the broker's transcript recorder, so the whole session is
-captured. The shell runs INSIDE the (privileged) collector container; genuine
-host-level ops still go through the host-action.sh allow-list.
+captured.
 
-The session is bounded three ways: the broker's idle + 15-min time-box, the
-dashboard kill-switch (broker drops us), and our own hard ceiling below.
+The session is bounded three ways: the broker's idle + time-box, the dashboard
+kill-switch (broker drops us), and our own hard ceiling below — and the host PTY
+server enforces its own matching backstop (systemd RuntimeMaxSec + self-TTL).
 """
 from __future__ import annotations
 
-import base64
 import json
 import os
-import select
-import signal
 import subprocess
 import threading
 import time
@@ -165,204 +166,130 @@ def _run_op_async(ws, cmd_id: str) -> None:
     threading.Thread(target=worker, name=f"console-op-{cmd_id}", daemon=True).start()
 
 
-# Bytes read from the PTY master per chunk; ~22 KB base64, well under the broker's
-# 256 KB max payload. Output framing: {type:"o", data:<base64>}.
-PTY_READ_BYTES = 16384
-# Coalesce burst output into fewer, larger frames: a chatty stream (e.g. `yes`,
-# `journalctl -f`) would otherwise emit thousands of tiny frames and quickly hit
-# the broker's per-session transcript cap, leaving a recording gap. We batch up to
-# COALESCE_MAX_BYTES of immediately-available output over a COALESCE_WINDOW window
-# before sending one frame. The cap keeps the base64-encoded frame well under the
-# broker's 256 KB WS max-payload (128 KB raw -> ~171 KB base64). The short window
-# adds no perceptible latency to interactive single-keystroke echo.
-COALESCE_MAX_BYTES = 128 * 1024
-COALESCE_WINDOW_SEC = 0.04
+# Where the host-side PTY server (scripts/netmon-host-console.py) listens. The
+# path is identical host+container thanks to the /var/lib/netmon:/var/lib/netmon
+# bind mount, so this AF_UNIX socket is reachable from here.
+HOST_CONSOLE_SOCK_DIR = "/var/lib/netmon"
+# How long to wait for the host poll (≤30s cadence) to arm + start the server
+# before we give up and fail closed. Generous enough to cover one full poll cycle
+# plus the server's socket setup.
+HOST_CONNECT_TIMEOUT_SEC = 45
+# Read chunk for the host socket; frames are newline-delimited JSON.
+SOCK_READ_BYTES = 65536
 
 
-def _kill_session(sid: int) -> None:
-    """SIGKILL every process in session `sid` (Linux /proc scan; best-effort).
+class _HostShellBridge:
+    """Bridge the operator's full-shell session to a HOST root PTY (CON-7).
 
-    Used at full-shell teardown to reach children bash put in their own process
-    groups via job control, which a killpg of bash's group alone would miss. A
-    process that did its own setsid (a real daemon) escapes — same as plain SSH.
-    No-op / silent on non-Linux or if /proc is unreadable."""
-    try:
-        entries = os.listdir("/proc")
-    except OSError:
-        return
-    for entry in entries:
-        if not entry.isdigit():
-            continue
-        try:
-            with open(f"/proc/{entry}/stat", encoding="ascii", errors="replace") as fh:
-                stat = fh.read()
-            # Layout: pid (comm) state ppid pgrp session ...  `comm` can contain
-            # spaces/parens, so parse the fields AFTER the final ')'.
-            fields = stat[stat.rindex(")") + 1 :].split()
-            psid = int(fields[3])  # state, ppid, pgrp, session
-        except (OSError, ValueError, IndexError):
-            continue
-        if psid == sid:
-            try:
-                os.kill(int(entry), signal.SIGKILL)
-            except OSError:
-                pass
-
-
-class _PtyShell:
-    """An interactive in-container PTY (`bash -i`) bridged to the operator (CON-7).
-
-    Only constructed for mode=="full" sessions, AFTER the dashboard's email
-    one-time-code step-up. stdin/stdout/resize are base64-framed JSON so raw
-    (non-UTF-8) terminal bytes survive the JSON relay; every frame still rides the
-    broker's transcript recorder. The PTY runs inside this (privileged) container,
-    so this is "full shell on the sensor"; true host ops stay on host-action.sh.
-
-    The Unix-only modules (pty/fcntl/termios/struct) are imported lazily here so
-    importing this module on a non-Unix dev box (py_compile/mypy) still works.
+    The container can't spawn a host process, so scripts/netmon-host-console.py
+    runs a `bash -i` PTY on the HOST and exposes it over a per-session Unix socket
+    in the shared /var/lib/netmon bind mount, speaking the SAME newline-delimited
+    JSON frames the broker uses ({i,resize,closed} in; {o,shell-exit} out). This
+    bridge just relays frames broker<->socket, so the operator UI, the broker, and
+    its transcript recorder are unchanged — and the container never holds a host
+    shell itself, it only pipes bytes. Authenticated to the server by a one-time
+    nonce (handed to us via env by the arming step) so a stray in-container
+    process can't grab the socket. Exposes the same write/resize/alive/close
+    interface the session loop used for the old in-container PTY.
     """
 
-    def __init__(self, ws) -> None:
-        import fcntl
-        import pty
-        import struct
-        import termios
+    def __init__(self, ws, sid: str, nonce: str) -> None:
+        import socket
 
         self._ws = ws
-        self._fcntl = fcntl
-        self._termios = termios
-        self._struct = struct
-        self.master_fd, slave_fd = pty.openpty()
+        self._buf = b""
+        self._exited = False
+        self._send_lock = threading.Lock()
+        path = f"{HOST_CONSOLE_SOCK_DIR}/host-console-{sid}.sock"
 
-        env = dict(os.environ)
-        env.setdefault("TERM", "xterm-256color")
-        # Mark the environment so an operator (and any audit) can tell this is a
-        # remote-console shell, and keep history out of the box's real shell file.
-        env["NETMON_REMOTE_CONSOLE"] = "1"
-        env["HISTFILE"] = "/dev/null"
-
-        def _preexec() -> None:
-            # New session + make the slave our controlling terminal so job control
-            # and Ctrl-C/SIGINT work like a real login shell.
-            os.setsid()
+        # Retry: the host poll arms + starts the server within its ~30s cadence,
+        # so the socket appears shortly after this session process starts.
+        deadline = time.monotonic() + HOST_CONNECT_TIMEOUT_SEC
+        last_err: Exception | None = None
+        self._sock: socket.socket | None = None
+        while time.monotonic() < deadline:
             try:
-                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-            except OSError:
-                pass
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(path)
+                self._sock = s
+                break
+            except OSError as exc:
+                last_err = exc
+                time.sleep(0.5)
+        if self._sock is None:
+            raise RuntimeError(f"host shell server not ready at {path}: {last_err}")
 
-        self.proc = subprocess.Popen(  # noqa: S603,S607 — fixed argv, shell only in PTY
-            ["/bin/bash", "-i"],
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            preexec_fn=_preexec,
-            env=env,
-            close_fds=True,
-        )
-        os.close(slave_fd)  # the child holds the slave; the parent only needs master
-        self._stop = threading.Event()
+        # Handshake FIRST: prove we're the intended session before the server
+        # attaches bash. A server that gets a bad/absent nonce closes on us.
+        self._send_sock({"type": "hello", "nonce": nonce})
         self._reader = threading.Thread(
-            target=self._pump_out, name="console-pty-out", daemon=True
+            target=self._pump_from_host, name="console-host-in", daemon=True
         )
         self._reader.start()
-        log.info("remote console: PTY shell started", pid=self.proc.pid)
+        log.info("remote console: host shell bridge connected", sid=sid)
 
-    def _pump_out(self) -> None:
-        """Read PTY output and stream it to the operator until EOF/shell-exit.
+    def _send_sock(self, obj: dict) -> None:
+        try:
+            with self._send_lock:
+                if self._sock is not None:
+                    self._sock.sendall((json.dumps(obj) + "\n").encode("utf-8"))
+        except OSError:
+            self._exited = True
 
-        Coalesces a burst of immediately-available output into one frame so a noisy
-        command can't flood the broker's transcript cap, and stops if the operator
-        connection drops (a failed send means the session is going away)."""
-        while not self._stop.is_set():
+    def _pump_from_host(self) -> None:
+        """Relay host->operator frames (o / shell-exit) verbatim to the broker."""
+        sock = self._sock
+        if sock is None:  # constructed only after a successful connect; guard anyway
+            return
+        while True:
             try:
-                data = os.read(self.master_fd, PTY_READ_BYTES)
+                chunk = sock.recv(SOCK_READ_BYTES)
             except OSError:
-                break  # master closed (we're shutting down) or PTY went away
-            if not data:
-                break  # EOF — the shell exited
-            # Batch any more output already waiting, up to the size/time window.
-            deadline = time.monotonic() + COALESCE_WINDOW_SEC
-            while len(data) < COALESCE_MAX_BYTES:
-                timeout = deadline - time.monotonic()
-                if timeout <= 0:
-                    break
+                break
+            if not chunk:
+                break  # server closed the socket
+            self._buf += chunk
+            while b"\n" in self._buf:
+                line, self._buf = self._buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
                 try:
-                    ready, _, _ = select.select([self.master_fd], [], [], timeout)
-                except OSError:
-                    break
-                if not ready:
-                    break
-                try:
-                    more = os.read(self.master_fd, PTY_READ_BYTES)
-                except OSError:
-                    break
-                if not more:
-                    break
-                data += more
-            if not _send(
-                self._ws,
-                {"type": "o", "data": base64.b64encode(data).decode("ascii")},
-            ):
-                break  # operator/broker gone — stop streaming
-        code = self.proc.poll()
-        _send(self._ws, {"type": "shell-exit", "code": -1 if code is None else code})
+                    frame = json.loads(line.decode("utf-8", "replace"))
+                except Exception:  # noqa: BLE001
+                    continue
+                if frame.get("type") == "shell-exit":
+                    self._exited = True
+                if not _send(self._ws, frame):  # operator/broker gone
+                    self._exited = True
+                    return
+        # Socket closed without an explicit shell-exit — synthesize one so the
+        # session loop ends and the operator's terminal shows the shell closed.
+        if not self._exited:
+            _send(self._ws, {"type": "shell-exit", "code": -1})
+        self._exited = True
 
     def write(self, data_b64: str) -> None:
-        try:
-            os.write(self.master_fd, base64.b64decode(data_b64))
-        except Exception:  # noqa: BLE001 — never let a bad input frame kill the loop
-            pass
+        self._send_sock({"type": "i", "data": data_b64})
 
     def resize(self, cols: int, rows: int) -> None:
-        try:
-            cols = max(1, min(1000, int(cols)))
-            rows = max(1, min(1000, int(rows)))
-            winsize = self._struct.pack("HHHH", rows, cols, 0, 0)
-            self._fcntl.ioctl(self.master_fd, self._termios.TIOCSWINSZ, winsize)
-        except Exception:  # noqa: BLE001
-            pass
+        self._send_sock({"type": "resize", "cols": cols, "rows": rows})
 
     def alive(self) -> bool:
-        return self.proc.poll() is None
+        return not self._exited and self._reader.is_alive()
 
     def close(self) -> None:
-        """Tear down the shell and EVERYTHING it spawned.
+        """Tell the host server to tear down bash, then drop the socket.
 
-        bash is the SESSION leader (setsid in _preexec). First SIGTERM→grace→SIGKILL
-        bash's own process group, then SWEEP the whole session: bash's job control
-        puts backgrounded/foreground children in their OWN process groups, so a
-        killpg of bash's group alone misses a child that ignores SIGHUP/SIGTERM
-        (`trap '' HUP TERM`, `nohup`, a `&` job). Every process bash spawned shares
-        sid==bash.pid (unless it setsid'd itself — a real daemon, same caveat as
-        plain SSH), so we SIGKILL every process in that session. This stops an
-        orphan from lingering root-in-(privileged-)container after the audited,
-        time-boxed session ends."""
-        self._stop.set()
-        pgid = self.proc.pid  # == process-group AND session id thanks to setsid
-
-        def _signal_group(sig: int) -> None:
-            try:
-                os.killpg(pgid, sig)
-            except (ProcessLookupError, OSError):
-                try:
-                    self.proc.send_signal(sig)
-                except Exception:  # noqa: BLE001
-                    pass
-
-        _signal_group(signal.SIGTERM)
+        The server owns the PTY + its process-group/session teardown (it SIGKILLs
+        the whole bash session, mirroring the old in-container path), so a clean
+        `closed` frame is enough; closing the socket is the belt-and-suspenders
+        signal (the server also exits on socket EOF)."""
+        self._send_sock({"type": "closed"})
         try:
-            self.proc.wait(timeout=2)
-        except Exception:  # noqa: BLE001 — still alive (or wait unavailable): force-kill
-            _signal_group(signal.SIGKILL)
-            try:
-                self.proc.wait(timeout=2)
-            except Exception:  # noqa: BLE001
-                pass
-        # Sweep any session members left in their own process groups (job control).
-        _kill_session(pgid)
-        try:
-            os.close(self.master_fd)  # unblocks the reader thread's os.read
-        except Exception:  # noqa: BLE001
+            with self._send_lock:
+                if self._sock is not None:
+                    self._sock.close()
+        except OSError:
             pass
 
 
@@ -371,8 +298,8 @@ def run_console_session(broker: str, token: str, sid: str, mode: str = "restrict
 
     mode="restricted" (default): allow-listed fixed-argv commands only (the safe
     default for every session minted before CON-7). mode="full": bridge an
-    interactive PTY (full-shell, CON-7) — only ever passed when the dashboard
-    minted a step-up-verified `mode=full` session.
+    interactive HOST-root PTY (full-shell, CON-7) — only ever passed when the
+    dashboard minted a step-up-verified `mode=full` session.
     """
     try:
         import websocket  # websocket-client (synchronous)
@@ -391,17 +318,19 @@ def run_console_session(broker: str, token: str, sid: str, mode: str = "restrict
         log.warning("remote console: connect failed", sid=sid, error=str(exc))
         return 3
 
-    # Full-shell mode (CON-7): spawn the interactive PTY now so the prompt is ready
-    # the moment the operator pairs. If the PTY can't start (no bash / non-Unix),
-    # report it and end — never silently fall back to the allow-list path.
+    # Full-shell mode (CON-7): attach to the host-side PTY server now so the prompt
+    # is ready the moment the operator pairs. Full shell targets the HOST root via
+    # a bridge (see _HostShellBridge). If it can't attach (server never armed,
+    # non-Unix), report it and end — never silently fall back to a container path.
     is_full = mode == "full"
-    shell: _PtyShell | None = None
+    shell: _HostShellBridge | None = None
     if is_full:
+        nonce = os.environ.get("NETMON_CONSOLE_HOST_NONCE", "")
         try:
-            shell = _PtyShell(ws)
+            shell = _HostShellBridge(ws, sid, nonce)
         except Exception as exc:  # noqa: BLE001
-            log.warning("remote console: could not start PTY shell", sid=sid, error=str(exc))
-            _send(ws, {"type": "err", "message": f"could not start shell: {exc}"})
+            log.warning("remote console: could not start host shell", sid=sid, error=str(exc))
+            _send(ws, {"type": "err", "message": f"could not start host shell: {exc}"})
             try:
                 ws.close()
             except Exception:  # noqa: BLE001
@@ -433,8 +362,8 @@ def run_console_session(broker: str, token: str, sid: str, mode: str = "restrict
                 continue
             ftype = frame.get("type")
             if is_full:
-                # Full-shell session: bridge PTY I/O; the fixed-argv allow-list does
-                # not apply here. Ignore `cmd` frames (the shell UI sends keystrokes).
+                # Full-shell session: bridge PTY I/O to the host server; the
+                # fixed-argv allow-list does not apply. Ignore `cmd` frames.
                 if shell is None:
                     continue
                 if ftype == "i":
