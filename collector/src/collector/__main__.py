@@ -294,6 +294,68 @@ def cmd_speedtest() -> None:
     sys.exit(1)
 
 
+@cli.command("dhcp-intel")
+@click.option("--server", default=None,
+              help="Ad-hoc: a single Windows DHCP server IP to query (bypasses the pushed target list).")
+@click.option("--user", default=None, help="WinRM username, e.g. 'DOMAIN\\svc_netmon_dhcp' (ad-hoc mode).")
+@click.option("--password", default=None,
+              help="WinRM password (ad-hoc mode). Falls back to $NETMON_DHCP_TEST_PASSWORD to keep it off argv.")
+@click.option("--port", type=int, default=None, help="WinRM port (default 5985 http / 5986 https).")
+@click.option("--https/--http", default=False,
+              help="Use HTTPS/5986 (default HTTP/5985 with NTLM message encryption).")
+@click.option("--transport", default="ntlm", show_default=True, help="pywinrm transport (ntlm|kerberos|...).")
+@click.option("--store/--no-store", default=False,
+              help="Also (re)write the bundle artifact dhcp_intel.json from this run.")
+def cmd_dhcp_intel(server: str | None, user: str | None, password: str | None,
+                   port: int | None, https: bool, transport: str, store: bool) -> None:
+    """Query authorized Windows DHCP server(s) over WinRM and print scopes + utilization (DHCP-2).
+
+    With no --server, reads the 0600 target list the dashboard pushed and runs the
+    same pass the poller runs (ignoring the interval gate). With --server/--user/
+    --password it does a one-off test of a single server — handy for validating
+    credentials + WinRM reachability before wiring it through the dashboard.
+    Least-privilege: a domain account in the server's read-only "DHCP Users" group.
+    """
+    import os as _os
+
+    from .discovery import dhcp_server as dh
+
+    settings = get_settings()
+    if server:
+        pw = password if password is not None else _os.environ.get("NETMON_DHCP_TEST_PASSWORD", "")
+        targets = [{
+            "server_ip": server, "server_type": "windows", "winrm_user": user or "",
+            "winrm_password": pw, "winrm_port": port, "use_https": https, "transport": transport,
+        }]
+    else:
+        targets = dh.load_targets()
+        if not targets:
+            click.echo("no DHCP targets configured (none pushed from the dashboard, and no --server given).")
+            sys.exit(2)
+
+    intel = dh.collect_all(targets, winrm_timeout=settings.dhcp_intel_winrm_timeout,
+                           time_budget=settings.dhcp_intel_time_budget)
+    if store:
+        dh._store(intel)
+
+    st = intel["stats"]
+    click.echo(f"queried {st['targets']} server(s): {st['ok']} ok, {st['errors']} error(s), {st['elapsed_sec']}s")
+    for s in intel["servers"]:
+        if s.get("status") != "ok":
+            click.echo(f"  ✗ {s.get('server_ip')}  [{s.get('status')}] {s.get('error') or ''}")
+            continue
+        scopes = s.get("scopes") or []
+        ss = s.get("server_stats") or {}
+        click.echo(f"  ✓ {s.get('server_ip')} ({s.get('hostname')})  scopes={len(scopes)}  "
+                   f"server_util={ss.get('percentage_in_use')}%  authorized={s.get('is_authorized')}")
+        for sc in scopes:
+            click.echo(f"      {str(sc.get('scope_id')):<16} {str(sc.get('state')):<8} "
+                       f"util={sc.get('percentage_in_use')}%  "
+                       f"inuse={sc.get('addresses_in_use')} free={sc.get('addresses_free')}  "
+                       f"{sc.get('name') or ''}")
+    sys.exit(0 if st["ok"] > 0 else 2)
+
+
 @cli.command("console-poll")
 def cmd_console_poll() -> None:
     """Fast interactive-command poll: pick up + start a live console quickly.

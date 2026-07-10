@@ -19,6 +19,7 @@ from .db import (
     list_inventory,
     list_snmp_credentials,
 )
+from .discovery import dhcp_server
 from .discovery import wifi as wifi_mod
 from .discovery import wifi_experience as wifi_exp_mod
 from .prompts import get_bundle_readme, get_bundle_readme_hourly
@@ -115,6 +116,13 @@ def build_hourly_bundle(
         wifi_exp = wifi_exp_mod.load()
         if wifi_exp.get("available"):
             z.writestr("wifi_experience.json", json.dumps(wifi_exp, indent=2, default=_default))
+        # Authoritative DHCP server intelligence (DHCP-2) — box-global like the
+        # Wi-Fi survey. Present ONLY when active collection is on AND at least one
+        # authorized server was queried, so a missing file means the feature is
+        # off. Contains server config the operator owns, no credentials.
+        dhcp = dhcp_server.load()
+        if dhcp and dhcp.get("servers"):
+            z.writestr("dhcp_intel.json", json.dumps(dhcp, indent=2, default=_default))
         for sid in scan_ids:
             payload = _scan_payload(sid)
             for name, content in payload.items():
