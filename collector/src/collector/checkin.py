@@ -328,6 +328,17 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_WIFI_JOIN_SCHEDULE_SEC"] = str(int(data["wifi_join_schedule_sec"]))
     if "wifi_join_quiet" in data:
         mapping["NETMON_WIFI_JOIN_QUIET"] = re.sub(r"[^0-9\-]", "", str(data.get("wifi_join_quiet") or ""))
+    # Authoritative DHCP server intelligence (DHCP-2). The enable flag + cadence
+    # ride env; the target list + per-server WinRM credentials ride a 0600 JSON
+    # file (NOT env — secrets + quotes/braces don't belong in the EnvironmentFile),
+    # exactly like the Wi-Fi join profiles. Full-replace; an empty list clears it
+    # (the feature stays gated by dhcp_intel_enabled).
+    if "dhcp_intel_enabled" in data:
+        mapping["NETMON_DHCP_INTEL_ENABLED"] = "true" if data.get("dhcp_intel_enabled") else "false"
+    if data.get("dhcp_intel_interval"):
+        mapping["NETMON_DHCP_INTEL_INTERVAL"] = str(int(data["dhcp_intel_interval"]))
+    if "dhcp_targets" in data:
+        _write_dhcp_targets(data.get("dhcp_targets") or [])
     if mapping:
         _update_env_file(ENV_FILE, mapping)
         log.info("applied desired config", keys=list(mapping))
@@ -713,6 +724,25 @@ def _write_wifi_profiles(profiles: list) -> None:
         os.replace(str(tmp), str(WIFI_PROFILES_FILE))
     except Exception as exc:  # noqa: BLE001
         log.warning("could not persist wifi profiles", error=str(exc))
+
+
+def _write_dhcp_targets(targets: list) -> None:
+    """Persist the pushed authorized-DHCP-server targets to the 0600 JSON file the
+    collector's dhcp_server module reads (DHCP-2). 0600 because each target carries
+    a WinRM credential; written to a temp created 0600 from the start then atomically
+    renamed, so the secret is never briefly world-readable nor a partial write ever
+    read. Full-replace, like the Wi-Fi profiles (an empty list clears it)."""
+    from .discovery.dhcp_server import TARGETS_FILE
+    try:
+        TARGETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(targets if isinstance(targets, list) else [])
+        tmp = TARGETS_FILE.with_suffix(".json.tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(payload)
+        os.replace(str(tmp), str(TARGETS_FILE))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not persist dhcp targets", error=str(exc))
 
 
 def _report_iperf(url: str, token: str | None, res: dict, trigger: str) -> None:

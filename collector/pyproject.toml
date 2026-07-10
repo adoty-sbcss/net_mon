@@ -19,6 +19,11 @@ dependencies = [
     # Synchronous WS client for the remote-console (browser-SSH) session: the
     # sensor dials OUT to the tunnel broker over WSS and services diagnostics.
     "websocket-client>=1.7",
+    # WinRM client for authoritative DHCP server intelligence (DHCP-2): drives the
+    # Windows DhcpServer PowerShell module remotely. Pure-Python (requests +
+    # requests_ntlm + xmltodict); no system libs — NTLM auth needs no krb5. Only
+    # imported when a DHCP target is actually collected (feature off by default).
+    "pywinrm>=0.4",
 ]
 # Note: SNMP is handled by shelling out to the net-snmp CLI (snmpget /
 # snmpbulkwalk, installed via the `snmp` apt package in the Dockerfile),

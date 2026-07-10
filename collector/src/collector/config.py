@@ -208,6 +208,25 @@ class Settings(BaseSettings):
     wifi_join_schedule_sec: int = Field(default=0, alias="NETMON_WIFI_JOIN_SCHEDULE_SEC")
     wifi_join_quiet: str = Field(default="", alias="NETMON_WIFI_JOIN_QUIET")
 
+    # --- Authoritative DHCP server intelligence (DHCP-2) ---
+    # Actively query authorized Windows DHCP servers over WinRM (PowerShell
+    # DhcpServer module) for scopes, per-scope utilization, options, reservations,
+    # and failover state — the authoritative view the passive OFFER/ACK sniffing
+    # (dhcp_observations) can't give. OFF by default. The target LIST + per-server
+    # credentials ride a 0600 JSON file (checkin.DHCP_TARGETS_FILE), NOT env, since
+    # it carries secrets and its quotes/braces don't survive EnvironmentFile parsing
+    # — exactly like the Wi-Fi join profiles. Least-privilege: a domain account in
+    # the server's read-only "DHCP Users" group is sufficient.
+    dhcp_intel_enabled: bool = Field(default=False, alias="NETMON_DHCP_INTEL_ENABLED")
+    # How often to query each server (seconds). Scope config changes slowly, so we
+    # don't re-query every poll. Default 1h; a manual `dhcp-intel` run overrides.
+    dhcp_intel_interval: int = Field(default=3600, alias="NETMON_DHCP_INTEL_INTERVAL")
+    # Wall-clock cap for the whole DHCP pass across all targets, so a slow/unreachable
+    # server can't stretch the poll loop.
+    dhcp_intel_time_budget: int = Field(default=120, alias="NETMON_DHCP_INTEL_TIME_BUDGET")
+    # Per-server WinRM operation timeout (seconds).
+    dhcp_intel_winrm_timeout: int = Field(default=30, alias="NETMON_DHCP_INTEL_WINRM_TIMEOUT")
+
     sftp_enabled: bool = Field(default=False, alias="NETMON_SFTP_ENABLED")
     sftp_host: str = Field(default="", alias="NETMON_SFTP_HOST")
     sftp_port: int = Field(default=22, alias="NETMON_SFTP_PORT")

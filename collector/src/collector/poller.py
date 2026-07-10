@@ -8,6 +8,7 @@ import structlog
 
 from .config import get_settings
 from .db import purge_old_scans, recent_network_scan
+from .discovery import dhcp_server
 from .discovery import interfaces as iface_mod
 from .scan import _vlan_of, run_scan
 
@@ -90,6 +91,15 @@ def tick() -> None:
     """
     settings = get_settings()
     _maybe_purge(settings)
+    # Authoritative DHCP server intel (DHCP-2): gated periodic WinRM pass to any
+    # authorized server the operator enabled collection on. Self-gates on the
+    # enable flag + interval + presence of a target list, and is wall-clock
+    # budgeted, so a slow/unreachable server can't stall the tick. try/except so
+    # a collection error never kills the poll loop (like the retention purge).
+    try:
+        dhcp_server.collect_and_store(settings)
+    except Exception as exc:  # pragma: no cover — keep loop alive
+        log.warning("dhcp intel collect failed", error=str(exc))
     states = iface_mod.snapshot(exclude_prefixes=settings.exclude_prefixes)
     primary = iface_mod.primary_interface()
 
