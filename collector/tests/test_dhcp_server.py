@@ -12,7 +12,27 @@ import sys
 import types
 from datetime import UTC, datetime
 
+import pytest
+
 from collector.discovery import dhcp_server as dh
+
+
+@pytest.fixture(autouse=True)
+def _no_network_probe(monkeypatch):
+    """Transport now defaults to 'auto', so _collect_one probes WWW-Authenticate
+    via requests.post. Make that probe fail fast in unit tests (→ falls back to
+    ntlm) so nothing hits the network; detection-specific tests override it. If
+    requests isn't installed locally, _detect_transport already returns None (its
+    own import fails inside the try), so there's nothing to stub."""
+    try:
+        import requests
+    except Exception:
+        return
+
+    def _fail(*_a, **_k):
+        raise OSError("no network in unit tests")
+
+    monkeypatch.setattr(requests, "post", _fail)
 
 # A realistic single-server ConvertTo-Json payload: one hot (90%) active scope
 # and one empty inactive scope, server + scope options, one failover relationship.
@@ -181,3 +201,79 @@ def test_age_sec():
     assert age is not None and age < 5
     assert dh._age_sec(None) is None
     assert dh._age_sec("garbage") is None
+
+
+# ---- DHCP-8: transport auto-detection + Kerberos ----
+
+
+class _Resp:
+    def __init__(self, www: str):
+        self.headers = {"www-authenticate": www}
+
+
+def test_detect_transport(monkeypatch):
+    requests = pytest.importorskip("requests")
+
+    # Server offering only Negotiate/Kerberos (NTLM disabled) → kerberos.
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp("Negotiate, Kerberos"))
+    assert dh._detect_transport("http://x:5985/wsman", 5) == "kerberos"
+    # Server offering NTLM → ntlm.
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp("Negotiate, NTLM"))
+    assert dh._detect_transport("http://x:5985/wsman", 5) == "ntlm"
+    # Unreachable/undetermined → None (caller falls back to ntlm).
+    monkeypatch.setattr(requests, "post", lambda *a, **k: (_ for _ in ()).throw(OSError()))
+    assert dh._detect_transport("http://x:5985/wsman", 5) is None
+
+
+def test_realm_from_server(monkeypatch):
+    import socket
+
+    monkeypatch.setattr(socket, "gethostbyaddr", lambda ip: ("dc01.sbcss.org", [], [ip]))
+    assert dh._realm_from_server("10.0.0.10") == "SBCSS.ORG"
+    monkeypatch.setattr(
+        socket, "gethostbyaddr", lambda ip: (_ for _ in ()).throw(OSError())
+    )
+    assert dh._realm_from_server("10.0.0.10") is None
+
+
+def test_auto_selects_kerberos_and_kinits(monkeypatch):
+    cap: dict = {}
+    _install_fake_winrm(
+        monkeypatch, result=_FakeResult(std_out=json.dumps(_SAMPLE).encode()), capture=cap
+    )
+    monkeypatch.setattr(dh, "_detect_transport", lambda endpoint, timeout: "kerberos")
+    kinited: dict = {}
+
+    def _fake_kinit(user, password, ip):
+        kinited["user"] = user
+        return "/tmp/netmon_ccache"
+
+    monkeypatch.setattr(dh, "_kinit", _fake_kinit)
+    monkeypatch.setattr(dh, "_cleanup_ccache", lambda c: None)
+    out = dh._collect_one(
+        {"server_ip": "10.0.0.10", "server_type": "windows",
+         "winrm_user": "DHCP_User@SBCSS.ORG", "winrm_password": "pw"},
+        winrm_timeout=30,
+    )
+    assert out["status"] == "ok"
+    assert out["transport"] == "kerberos"
+    assert cap["kwargs"]["transport"] == "kerberos"
+    assert kinited["user"] == "DHCP_User@SBCSS.ORG"
+
+
+def test_kerberos_kinit_failure_is_clean(monkeypatch):
+    _install_fake_winrm(monkeypatch, result=_FakeResult(std_out=json.dumps(_SAMPLE).encode()))
+    monkeypatch.setattr(dh, "_detect_transport", lambda endpoint, timeout: "kerberos")
+
+    def _bad_kinit(user, password, ip):
+        raise RuntimeError("Password incorrect")
+
+    monkeypatch.setattr(dh, "_kinit", _bad_kinit)
+    out = dh._collect_one(
+        {"server_ip": "10.0.0.10", "server_type": "windows",
+         "winrm_user": "DHCP_User@SBCSS.ORG", "winrm_password": "pw"},
+        winrm_timeout=30,
+    )
+    assert out["status"] == "error"
+    assert out["transport"] == "kerberos"
+    assert "kerberos sign-in failed" in out["error"].lower()

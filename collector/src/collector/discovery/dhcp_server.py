@@ -177,9 +177,25 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
     port = int(target.get("winrm_port") or (5986 if target.get("use_https") else 5985))
     scheme = "https" if target.get("use_https") else "http"
     endpoint = f"{scheme}://{ip}:{port}/wsman"
-    transport = str(target.get("transport") or "ntlm").lower()
+    transport = str(target.get("transport") or "auto").lower()
     user = str(target.get("winrm_user") or "")
     password = str(target.get("winrm_password") or "")
+
+    # Auto-detect (default): probe what the server actually accepts and pick NTLM
+    # where it's offered, Kerberos where NTLM is disabled — the operator never has
+    # to choose (DHCP-8). An explicit 'ntlm'/'kerberos' overrides the probe.
+    if transport in ("", "auto"):
+        transport = _detect_transport(endpoint, winrm_timeout) or "ntlm"
+
+    # Kerberos needs a ticket: kinit the same credential into a private ccache that
+    # pywinrm's gssapi transport then uses. NTLM needs none of this.
+    ccache: str | None = None
+    if transport == "kerberos":
+        try:
+            ccache = _kinit(user, password, ip)
+        except Exception as exc:  # noqa: BLE001 — surface a clean, scrubbed reason
+            return {**base, "status": "error", "transport": "kerberos",
+                    "error": _short(_scrub(f"Kerberos sign-in failed: {exc}", password))}
 
     try:
         session = winrm.Session(
@@ -192,29 +208,37 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
         )
         result = session.run_ps(_PS_PROBE)
     except Exception as exc:  # connection / auth / transport error
-        return {**base, "status": "error", "error": _short(_scrub(str(exc), password))}
+        return {**base, "status": "error", "transport": transport,
+                "error": _short(_scrub(str(exc), password))}
+    finally:
+        if ccache:
+            _cleanup_ccache(ccache)
 
     if getattr(result, "status_code", 1) != 0:
         err = _short(_scrub((result.std_err or b"").decode("utf-8", "replace"), password))
-        return {**base, "status": "error", "error": err or "winrm returned non-zero"}
+        return {**base, "status": "error", "transport": transport,
+                "error": err or "winrm returned non-zero"}
 
     raw = result.std_out or b""
     if len(raw) > _MAX_OUTPUT_BYTES:
-        return {**base, "status": "error", "error": "server response too large"}
+        return {**base, "status": "error", "transport": transport,
+                "error": "server response too large"}
     try:
         parsed = json.loads(raw.decode("utf-8", "replace") or "{}")
     except Exception as exc:
-        return {**base, "status": "error", "error": f"unparseable server response: {exc}"}
+        return {**base, "status": "error", "transport": transport,
+                "error": f"unparseable server response: {exc}"}
 
     if not parsed.get("ok"):
-        return {**base, "status": "error",
+        return {**base, "status": "error", "transport": transport,
                 "error": _short(str(parsed.get("error") or "DhcpServer probe failed"))}
 
     # Merge the server's own report onto the target identity. `ok`/`error` in the
-    # PS payload are control fields — drop them; keep everything else.
+    # PS payload are control fields — drop them; keep everything else. `transport`
+    # records which auth actually worked, for the dashboard status line.
     parsed.pop("ok", None)
     parsed.pop("error", None)
-    return {**base, "status": "ok", **parsed}
+    return {**base, "status": "ok", "transport": transport, **parsed}
 
 
 # ---------------------------------------------------------------------------
@@ -357,3 +381,121 @@ def _scrub(text: str, secret: str) -> str:
 def _short(text: str, limit: int = 300) -> str:
     text = " ".join((text or "").split())
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+# ---------------------------------------------------------------------------
+# Transport auto-detection + Kerberos (DHCP-8)
+# ---------------------------------------------------------------------------
+# Hardened AD environments DISABLE NTLM on WinRM (the 401 offers only Negotiate/
+# Kerberos). So transport defaults to "auto": probe the endpoint's
+# WWW-Authenticate and pick NTLM where it's offered, else Kerberos — the operator
+# never has to know the difference. For Kerberos we kinit the same username +
+# password into a private ccache and let pywinrm's gssapi transport use it; the
+# realm + KDC come from DNS (nothing hardcoded). Kerberos needs the sensor clock
+# within ~5 min of AD.
+
+KRB5_CONF_PATH = "/var/lib/netmon/krb5.conf"
+
+
+def _detect_transport(endpoint: str, timeout: int) -> str | None:
+    """Choose a transport from the WinRM 401 challenge: 'ntlm' if the server offers
+    bare NTLM, 'kerberos' if it offers Negotiate/Kerberos, None if undetermined
+    (caller falls back to ntlm). Best-effort — never raises."""
+    try:
+        import requests
+        import urllib3
+
+        urllib3.disable_warnings()  # self-signed WinRM https is expected
+        resp = requests.post(
+            endpoint,
+            data=b"0",  # a body avoids the 411 some listeners return on empty POST
+            headers={"Content-Type": "application/soap+xml;charset=UTF-8"},
+            timeout=timeout,
+            verify=False,
+        )
+        auth = resp.headers.get("www-authenticate", "").lower()
+    except Exception:  # noqa: BLE001 — probe is advisory only
+        return None
+    if "ntlm" in auth:
+        return "ntlm"
+    if "kerberos" in auth or "negotiate" in auth:
+        return "kerberos"
+    return None
+
+
+def _realm_from_server(ip: str) -> str | None:
+    """Kerberos realm from the server's DNS domain via reverse lookup, e.g.
+    10.0.0.10 -> dc01.sbcss.org -> SBCSS.ORG."""
+    import socket
+
+    try:
+        host = socket.gethostbyaddr(ip)[0]
+    except Exception:  # noqa: BLE001
+        return None
+    parts = host.split(".", 1)
+    return parts[1].upper() if len(parts) == 2 and parts[1] else None
+
+
+def _write_krb5_conf(realm: str) -> None:
+    """Minimal krb5.conf: the realm + DNS-based KDC discovery (no hardcoded KDCs)."""
+    conf = (
+        "[libdefaults]\n"
+        f"    default_realm = {realm}\n"
+        "    dns_lookup_kdc = true\n"
+        "    dns_lookup_realm = true\n"
+        "    rdns = false\n"
+    )
+    path = Path(KRB5_CONF_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(conf)
+
+
+def _kinit(user: str, password: str, server_ip: str) -> str:
+    """Acquire a Kerberos ticket for `user` into a private ccache and return its
+    path (exported via KRB5CCNAME for pywinrm's gssapi transport). The realm comes
+    from the UPN (user@domain) or, for a down-level DOMAIN\\user, the server's DNS
+    domain. Raises with a clean message on failure."""
+    import os
+    import subprocess
+    import tempfile
+
+    if "@" in user:
+        principal = user
+        realm = user.rsplit("@", 1)[1].upper()
+    elif "\\" in user:
+        dom, uname = user.split("\\", 1)
+        realm = _realm_from_server(server_ip) or dom.upper()
+        principal = f"{uname}@{realm}"
+    else:
+        realm = _realm_from_server(server_ip) or ""
+        principal = f"{user}@{realm}" if realm else user
+    if not realm:
+        raise RuntimeError("could not determine the Kerberos realm — use the user@DOMAIN form")
+
+    _write_krb5_conf(realm)
+    fd, ccache = tempfile.mkstemp(prefix="netmon_dhcp_krb5cc_")
+    os.close(fd)
+    env = {**os.environ, "KRB5_CONFIG": KRB5_CONF_PATH, "KRB5CCNAME": ccache}
+    proc = subprocess.run(
+        ["kinit", principal],
+        input=(password + "\n").encode(),
+        env=env,
+        capture_output=True,
+        timeout=20,
+    )
+    if proc.returncode != 0:
+        _cleanup_ccache(ccache)
+        msg = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError(msg or f"kinit failed (rc={proc.returncode})")
+    # pywinrm's gssapi transport reads the ambient ccache + config.
+    os.environ["KRB5_CONFIG"] = KRB5_CONF_PATH
+    os.environ["KRB5CCNAME"] = ccache
+    return ccache
+
+
+def _cleanup_ccache(ccache: str) -> None:
+    import contextlib
+    import os
+
+    with contextlib.suppress(Exception):
+        os.remove(ccache)
