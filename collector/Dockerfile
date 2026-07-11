@@ -30,6 +30,10 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
         curl \
         tini \
         procps \
+        krb5-user \
+        libkrb5-dev \
+        gcc \
+        python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # (Public speed tests use the dependency-free Cloudflare probe — see
