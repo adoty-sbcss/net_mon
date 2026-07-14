@@ -32,6 +32,9 @@ jobs:
 
       - name: Install collector + dev tools
         run: |
+          # pywinrm[kerberos] -> pykerberos compiles against the GSSAPI headers,
+          # so the runner needs libkrb5-dev (the Docker image already installs it).
+          sudo apt-get update -qq && sudo apt-get install -y -qq libkrb5-dev
           python -m pip install --upgrade pip
           # Installs runtime deps so mypy can resolve real imports (pydantic,
           # etc.) plus the [dev] extra (mypy, ruff).
