@@ -25,6 +25,12 @@ dependencies = [
     # libkrb5 in the image; the NTLM path still needs no krb5. Imported only when a
     # DHCP target is actually collected (feature off by default).
     "pywinrm[kerberos]>=0.4",
+    # MS-DHCPM RPC client for the WinRM/WMI fallback (DHCP-9): reads DHCP scopes /
+    # options straight from the DHCP service over its own RPC interface, which
+    # authorizes on the DHCP Users group ALONE (no WinRM, no WMI, no admin) — the
+    # answer for hardened boxes. Kerberos reuses the krb5 already in the image.
+    # Imported lazily (dhcp_rpc.py) only when the rpc transport is actually used.
+    "impacket>=0.11",
 ]
 # Note: SNMP is handled by shelling out to the net-snmp CLI (snmpget /
 # snmpbulkwalk, installed via the `snmp` apt package in the Dockerfile),

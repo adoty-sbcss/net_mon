@@ -169,6 +169,17 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
         return {**base, "status": "unsupported",
                 "error": f"server_type '{server_type}' not supported yet (v1 = windows)"}
 
+    transport = str(target.get("transport") or "auto").lower()
+    user = str(target.get("winrm_user") or "")
+    password = str(target.get("winrm_password") or "")
+
+    # Explicit RPC transport (DHCP-9): talk straight to the DHCP service over
+    # MS-DHCPM — authorizes on the DHCP Users group ALONE, no WinRM, no WMI. The
+    # escape hatch for hardened boxes that block non-admin WMI/DCOM.
+    if transport == "rpc":
+        return _collect_via_rpc(base, ip=ip, user=user, password=password,
+                                winrm_timeout=winrm_timeout)
+
     try:
         import winrm  # lazy: only needed when a target is actually collected
     except Exception as exc:  # pragma: no cover — dep-missing guard
@@ -177,14 +188,13 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
     port = int(target.get("winrm_port") or (5986 if target.get("use_https") else 5985))
     scheme = "https" if target.get("use_https") else "http"
     endpoint = f"{scheme}://{ip}:{port}/wsman"
-    transport = str(target.get("transport") or "auto").lower()
-    user = str(target.get("winrm_user") or "")
-    password = str(target.get("winrm_password") or "")
 
     # Auto-detect (default): probe what the server actually accepts and pick NTLM
     # where it's offered, Kerberos where NTLM is disabled — the operator never has
-    # to choose (DHCP-8). An explicit 'ntlm'/'kerberos' overrides the probe.
-    if transport in ("", "auto"):
+    # to choose (DHCP-8). An explicit 'ntlm'/'kerberos' overrides the probe. On auto
+    # we may also fall back to RPC below when WinRM's WMI gate denies a non-admin.
+    auto_transport = transport in ("", "auto")
+    if auto_transport:
         transport = _detect_transport(endpoint, winrm_timeout) or "ntlm"
 
     # Kerberos needs a ticket: kinit the same credential into a private ccache that
@@ -230,8 +240,17 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
                 "error": f"unparseable server response: {exc}"}
 
     if not parsed.get("ok"):
-        return {**base, "status": "error", "transport": transport,
-                "error": _short(str(parsed.get("error") or "DhcpServer probe failed"))}
+        err = _short(str(parsed.get("error") or "DhcpServer probe failed"))
+        # Hardened boxes let the WinRM shell in but block non-admin WMI/DCOM
+        # ("Cannot connect to CIM server. Access denied"). The DHCP service's own
+        # RPC has no WMI gate — auto-fall back to it, but only when the operator
+        # left transport on auto (a pinned transport gets the raw WinRM error).
+        if auto_transport and _is_wmi_denied(err):
+            rpc_result = _collect_via_rpc(base, ip=ip, user=user,
+                                          password=password, winrm_timeout=winrm_timeout)
+            if rpc_result.get("status") == "ok":
+                return rpc_result
+        return {**base, "status": "error", "transport": transport, "error": err}
 
     # Merge the server's own report onto the target identity. `ok`/`error` in the
     # PS payload are control fields — drop them; keep everything else. `transport`
@@ -239,6 +258,45 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
     parsed.pop("ok", None)
     parsed.pop("error", None)
     return {**base, "status": "ok", "transport": transport, **parsed}
+
+
+def _is_wmi_denied(err: str) -> bool:
+    """True for the hardened-box signature where the WinRM shell ran but the
+    DhcpServer cmdlets couldn't reach WMI/DCOM as a non-admin."""
+    return "cannot connect to cim server" in (err or "").lower()
+
+
+def _collect_via_rpc(
+    base: dict[str, Any], *, ip: str, user: str, password: str, winrm_timeout: int
+) -> dict[str, Any]:
+    """DHCP intel over MS-DHCPM RPC (DHCP-9) — authorizes on the DHCP Users group
+    alone, no WinRM/WMI. The escape hatch for hardened boxes that block non-admin
+    WMI. Reuses the Kerberos kinit (most hardened AD shops disable NTLM); falls
+    back to letting impacket try NTLM if a ticket can't be minted. Never raises."""
+    try:
+        from . import dhcp_rpc
+    except Exception as exc:  # pragma: no cover — dep-missing guard
+        return {**base, "status": "error", "transport": "rpc",
+                "error": _short(f"rpc collector unavailable: {exc}")}
+
+    ccache: str | None = None
+    use_kerberos = True
+    try:
+        ccache = _kinit(user, password, ip)  # sets KRB5CCNAME for impacket
+    except Exception:  # noqa: BLE001 — no ticket; let impacket attempt NTLM
+        use_kerberos = False
+    try:
+        parsed = dhcp_rpc.collect(
+            ip, user, password, kdc=None, use_kerberos=use_kerberos, timeout=winrm_timeout
+        )
+    except Exception as exc:  # noqa: BLE001 — connection / auth / bind error
+        return {**base, "status": "error", "transport": "rpc",
+                "error": _short(_scrub(str(exc), password))}
+    finally:
+        if ccache:
+            _cleanup_ccache(ccache)
+    parsed.pop("transport_detail", None)
+    return {**base, "status": "ok", "transport": "rpc", **parsed}
 
 
 # ---------------------------------------------------------------------------
