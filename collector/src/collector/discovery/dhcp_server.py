@@ -47,6 +47,8 @@ Output (written to INTEL_FILE, shipped box-global in the hourly bundle as
          "scopes": [{scope_id, name, state, start_range, end_range,
                      subnet_mask, lease_duration_sec, addresses_in_use,
                      addresses_free, percentage_in_use, reserved,
+                     reservations: [{ip, mac, name, active, client_mac,
+                                     lease_expiry, bad_address}, ...],
                      options: [{id, name, value: [...]}, ...]}, ...]},
         {"server_ip", "label", "status": "error", "error": "..."},
         ...
@@ -93,6 +95,35 @@ $ErrorActionPreference = 'Stop'
 function Opts($values) {
   @($values | ForEach-Object { @{ id = [int]$_.OptionId; name = "$($_.Name)"; value = @($_.Value | ForEach-Object { "$_" }) } })
 }
+# Normalize a DHCP client id / hardware address to colon-lowercase, trailing 6 bytes
+# (a client-id may carry a prefix; the MAC is the last 6 bytes) — matches the RPC path.
+function Mac($id) {
+  $h = ("$id" -replace '[^0-9A-Fa-f]', '').ToLower()
+  if ($h.Length -ge 12) { $h = $h.Substring($h.Length - 12) }
+  if ($h.Length -lt 2) { return '' }
+  (0..([int]($h.Length / 2) - 1) | ForEach-Object { $h.Substring($_ * 2, 2) }) -join ':'
+}
+# Reservations for a scope, each joined to its live lease (name / holding-MAC / expiry)
+# so the dashboard can flag conflicts (client_mac != mac) and never-used (active=false).
+function Resv($scopeId) {
+  $leases = @{}
+  try {
+    foreach ($l in @(Get-DhcpServerv4Lease -ScopeId $scopeId -ErrorAction SilentlyContinue)) { $leases["$($l.IPAddress)"] = $l }
+  } catch {}
+  @(Get-DhcpServerv4Reservation -ScopeId $scopeId -ErrorAction SilentlyContinue | ForEach-Object {
+    $ips = "$($_.IPAddress)"; $l = $leases[$ips]
+    $bad = ($l -and "$($l.HostName)" -eq 'BAD_ADDRESS')
+    @{
+      ip           = $ips
+      mac          = Mac($_.ClientId)
+      name         = if ($l -and $l.HostName) { "$($l.HostName)" } else { "$($_.Name)" }
+      active       = [bool]$l
+      client_mac   = if ($l -and -not $bad) { Mac($l.ClientId) } else { '' }
+      lease_expiry = if ($l -and $l.LeaseExpiryTime) { ([datetime]$l.LeaseExpiryTime).ToUniversalTime().ToString('o') } else { $null }
+      bad_address  = [bool]$bad
+    }
+  })
+}
 try {
   Import-Module DhcpServer -ErrorAction Stop
   $srvStats = Get-DhcpServerv4Statistics
@@ -108,6 +139,8 @@ try {
     try { $st = Get-DhcpServerv4ScopeStatistics -ScopeId $s.ScopeId } catch {}
     $opts = @()
     try { $opts = Opts(Get-DhcpServerv4OptionValue -ScopeId $s.ScopeId -ErrorAction SilentlyContinue) } catch {}
+    $resv = @()
+    try { $resv = @(Resv($s.ScopeId)) } catch {}
     $scopeList += @{
       scope_id           = "$($s.ScopeId)"
       name               = "$($s.Name)"
@@ -121,6 +154,7 @@ try {
       addresses_free     = if ($st) { [int]$st.AddressesFree } else { $null }
       percentage_in_use  = if ($st) { [double]$st.PercentageInUse } else { $null }
       reserved           = if ($st) { [int]$st.Reserved } else { $null }
+      reservations       = @($resv)
       options            = $opts
     }
   }
@@ -144,7 +178,7 @@ try {
     server_options = $serverOpts
     scopes         = $scopeList
   }
-  $out | ConvertTo-Json -Depth 6 -Compress
+  $out | ConvertTo-Json -Depth 8 -Compress
 } catch {
   @{ ok = $false; error = "$($_.Exception.Message)" } | ConvertTo-Json -Compress
 }

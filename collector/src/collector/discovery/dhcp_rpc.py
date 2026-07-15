@@ -17,13 +17,18 @@ DHCP-Users-only. Notes baked into the calls below:
   * **Utilization** = in-use from ``EnumSubnetClientsV5`` (``ClientsTotal``) over
     total from ``EnumSubnetElementsV5`` IP-ranges. An empty subnet raises
     ``ERROR_NO_MORE_ITEMS`` — treated as 0.
-  * impacket 0.13.1 ships the ``EnumSubnetElementsV5`` structs BROKEN (referent
-    comma, a duplicated BOOTP-range field, union arms must be pointers, union keys
-    must be plain ints, ``Elements`` must be a pointer). Corrected classes are
-    rebuilt here in ``_element_types`` and used explicitly (never ``dce.request``,
-    which would resolve impacket's buggy response class).
-  * Reservations decode via the same corrected structs (element type 2) but are
-    deferred (``reserved=None``) until the reservation UI feature lands.
+  * impacket 0.13.1 ships the ``EnumSubnetElementsV5`` structs BROKEN. Corrected
+    classes are rebuilt in ``_element_types`` and used explicitly (never
+    ``dce.request``, which would resolve impacket's buggy response class). The
+    decisive fix: the ``DHCP_SUBNET_ELEMENT_TYPE`` discriminant is a **2-byte** NDR
+    enum (plus a separate ``ElementType`` field), NOT a 4-byte ULONG — the old
+    4-byte tag worked for ranges only by accident (type 0 zeros both halves) and
+    read reservations (type 2) as tag 0x00020002.
+  * Reservations (element type 2) are collected per scope and joined to the scope's
+    live leases for name / holding-MAC / conflict. A reserved client-UID that ENDS
+    WITH the reserved IP (little-endian) is a server-synthesized bad-address/IP-only
+    id, not a hardware MAC — ``_hw_mac`` suppresses those so they don't read as a
+    bogus conflict.
 
 Auth reuses the Kerberos ccache ``dhcp_server._kinit`` writes (impacket reads
 ``KRB5CCNAME`` when ``set_kerberos(True)`` is used). NTLM only when the caller
@@ -34,6 +39,7 @@ from __future__ import annotations
 
 import socket
 import struct
+from datetime import UTC, datetime
 from typing import Any
 
 # MS-DHCPM DHCP_SUBNET_STATE -> the PowerShell probe's "Active"/"Inactive" vocab.
@@ -63,6 +69,40 @@ def _wstr(v: Any) -> str:
         return ""
     s = str(v)
     return "" if s == "NULL" else s.rstrip("\x00")
+
+
+def _fmt_mac(raw: bytes) -> str:
+    """Colon-separated lowercase MAC from a hardware-address / client-UID byte string.
+    Windows reservation UIDs are often 11 bytes (client-id prefix + MAC); take the
+    trailing 6. A shorter blob is used as-is."""
+    b = raw[-6:] if len(raw) >= 6 else raw
+    return ":".join(f"{x:02x}" for x in b)
+
+
+def _hw_mac(raw: bytes, ip_int: int) -> str:
+    """Hardware MAC (colon-lowercase) from a client-UID / lease hardware address, or ""
+    when there is no real MAC. Windows synthesizes IP-based client ids for bad-address
+    and IP-only reservations — those UIDs END WITH the reserved IP (little-endian), so
+    the trailing 6 bytes are prefix+IP, not a MAC. Detecting that (rather than assuming
+    a UID length) keeps a real MAC while suppressing the synthetic garbage that would
+    otherwise read as a bogus conflict."""
+    if len(raw) < 6:
+        return ""
+    if raw.endswith(struct.pack("<I", ip_int & 0xFFFFFFFF)):
+        return ""
+    return _fmt_mac(raw)
+
+
+def _filetime_iso(lo: int, hi: int) -> str | None:
+    """Windows FILETIME (dwLowDateTime/dwHighDateTime, 100ns since 1601) -> ISO-8601
+    UTC. 0 / max (infinite lease — how reservations present) -> None."""
+    ft = (hi << 32) | lo
+    if ft <= 0 or ft >= 0x7FFFFFFFFFFFFFFF:
+        return None
+    try:
+        return datetime.fromtimestamp(ft / 1e7 - 11644473600, tz=UTC).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _opt_value_strings(option_data: Any) -> list[str]:
@@ -139,8 +179,10 @@ def _extract_elements(resp: Any) -> list[dict[str, Any]]:
                 rv = u["ReservedIp"]
                 uid = rv["ReservedForClient"]
                 nb = _num(uid["DataLength"])
-                mac = b"".join(bytes(uid["Data_"][j]) for j in range(nb))
-                out.append({"kind": "reservation", "ip": _num(rv["ReservedIpAddress"]), "mac": mac.hex()})
+                raw = b"".join(bytes(uid["Data_"][j]) for j in range(nb))
+                # emit the full client-UID; _hw_mac() derives the hardware MAC (or ""
+                # for server-synthesized IP-based ids) once the reserved IP is known.
+                out.append({"kind": "reservation", "ip": _num(rv["ReservedIpAddress"]), "uid": raw.hex()})
             elif tag == 3:  # DhcpExcludedIpRanges
                 r = u["ExcludeIpRange"]
                 out.append({"kind": "exclude", "start": _num(r["StartAddress"]), "end": _num(r["EndAddress"])})
@@ -194,9 +236,10 @@ def _element_types() -> dict[str, Any]:
         item = 'c'
     class PBYTE_ARRAY(NDRPOINTER):
         referent = (('Data', BYTE_ARRAY),)
-    class DHCP_BINARY_DATA(NDRSTRUCT):
+    class DHCP_BINARY_DATA(NDRSTRUCT):  # DHCP_CLIENT_UID is a typedef of this
         structure = (('DataLength', DWORD), ('Data_', PBYTE_ARRAY))
-    DHCP_CLIENT_UID = DHCP_BINARY_DATA
+    class LPDHCP_CLIENT_UID(NDRPOINTER):  # FIXED: ReservedForClient is a POINTER on the wire
+        referent = (('Data', DHCP_BINARY_DATA),)
 
     class DHCP_BOOTP_IP_RANGE(NDRSTRUCT):  # FIXED: 4 fields, no duplicate
         structure = (('StartAddress', DHCP_IP_ADDRESS), ('EndAddress', DHCP_IP_ADDRESS),
@@ -210,7 +253,7 @@ def _element_types() -> dict[str, Any]:
         referent = (('Data', DHCP_IP_RANGE),)
 
     class DHCP_IP_RESERVATION_V4(NDRSTRUCT):
-        structure = (('ReservedIpAddress', DHCP_IP_ADDRESS), ('ReservedForClient', DHCP_CLIENT_UID),
+        structure = (('ReservedIpAddress', DHCP_IP_ADDRESS), ('ReservedForClient', LPDHCP_CLIENT_UID),
                      ('bAllowedClientTypes', BYTE))
     class LPDHCP_IP_RESERVATION_V4(NDRPOINTER):
         referent = (('Data', DHCP_IP_RESERVATION_V4),)
@@ -220,8 +263,12 @@ def _element_types() -> dict[str, Any]:
     class LPDHCP_IP_CLUSTER(NDRPOINTER):
         referent = (('Data', DHCP_IP_CLUSTER),)
 
-    class DHCP_SUBNET_ELEMENT_UNION_V5(NDRUNION):  # 4-byte tag == element type; INT keys; POINTER arms
-        commonHdr = (('tag', ULONG),)
+    class DHCP_SUBNET_ELEMENT_UNION_V5(NDRUNION):
+        # FIXED: the discriminant is a 2-BYTE NDR enum, not a 4-byte ULONG. The old
+        # ULONG tag happened to work for ranges ONLY because type 0 zeros both halves;
+        # reservations (type 2) read 0x00020002 = "Unknown tag 131074". INT keys; arms
+        # are POINTERs.
+        commonHdr = (('tag', DHCP_SUBNET_ELEMENT_TYPE),)
         union = {
             0: ('IpRange', LPDHCP_BOOTP_IP_RANGE),
             5: ('IpRange', LPDHCP_BOOTP_IP_RANGE),
@@ -234,7 +281,9 @@ def _element_types() -> dict[str, Any]:
         }
 
     class DHCP_SUBNET_ELEMENT_DATA_V5(NDRSTRUCT):
-        structure = (('Element', DHCP_SUBNET_ELEMENT_UNION_V5),)
+        # FIXED: ElementType is a separate 2-byte enum field that precedes the union
+        # (which re-transmits its own 2-byte discriminant) — matches the wire layout.
+        structure = (('ElementType', DHCP_SUBNET_ELEMENT_TYPE), ('Element', DHCP_SUBNET_ELEMENT_UNION_V5))
     class DHCP_SUBNET_ELEMENT_DATA_V5_ARRAY(NDRUniConformantArray):
         item = DHCP_SUBNET_ELEMENT_DATA_V5
     class PDHCP_SUBNET_ELEMENT_DATA_V5_ARRAY(NDRPOINTER):
@@ -286,17 +335,67 @@ def _scope_range(dce2: Any, sid: int) -> tuple[str, str, int]:
     return _ip(lo), _ip(hi), total
 
 
-def _scope_inuse(dce2: Any, dhcpm: Any, sid: int) -> int | None:
-    """Leases in use for a scope, from EnumSubnetClientsV5 (dhcpsrv2). We ask for
-    every client (PreferredMaximum=0xFFFFFFFF) and read ClientsTotal off the
-    successful response — a zero-read request instead returns an INT_MAX sentinel
-    for ClientsTotal, so the full pull is the only reliable count. The lease
-    payload is small in practice (a handful of leases per K-12 scope). An empty
-    subnet raises ERROR_NO_MORE_ITEMS -> 0; any other failure -> None."""
+def _scope_clients(dce2: Any, dhcpm: Any, sid: int) -> tuple[int | None, dict[int, dict[str, Any]]]:
+    """One EnumSubnetClientsV5 full-pull (dhcpsrv2) → (in_use_count, {ip_int: lease}).
+    We ask for every client (PreferredMaximum=0xFFFFFFFF) and read ClientsTotal off
+    the successful response — a zero-read request returns an INT_MAX sentinel, so the
+    full pull is the only reliable count; its payload is small per K-12 scope. The
+    same pull yields the per-lease records we join reservations against (name /
+    holding-MAC / expiry). Empty subnet (ERROR_NO_MORE_ITEMS) -> (0, {}); any other
+    failure -> (None, {})."""
     try:
-        return _num(dhcpm.hDhcpEnumSubnetClientsV5(dce2, sid, 0xFFFFFFFF)["ClientsTotal"])
+        resp = dhcpm.hDhcpEnumSubnetClientsV5(dce2, sid, 0xFFFFFFFF)
     except Exception as exc:  # noqa: BLE001
-        return 0 if "NO_MORE_ITEMS" in str(exc) else None
+        return (0 if "NO_MORE_ITEMS" in str(exc) else None), {}
+    leases: dict[int, dict[str, Any]] = {}
+    try:
+        count = _num(resp["ClientsTotal"])
+    except Exception:  # noqa: BLE001
+        count = None
+    try:
+        ci = resp["ClientsInfo"]
+        n = _num(ci["NumElements"]) if ci else 0
+        for i in range(n):
+            d = ci["Clients"][i]["Data"]
+            ip_int = _num(d["ClientIpAddress"])
+            hw = d["ClientHardwareAddress"]
+            nb = _num(hw["DataLength"])
+            mac = b"".join(bytes(hw["Data_"][j]) for j in range(nb))
+            dt = d["ClientLeaseExpires"]
+            leases[ip_int] = {
+                "mac": _hw_mac(mac, ip_int),
+                "name": _wstr(d["ClientName"]),
+                "expiry": _filetime_iso(_num(dt["dwLowDateTime"]), _num(dt["dwHighDateTime"])),
+            }
+    except Exception:  # noqa: BLE001
+        pass
+    return count, leases
+
+
+def _scope_reservations(dce2: Any, sid: int, leases: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reservations for a scope (ElementsV5 type=2, dhcpsrv2), each enriched by joining
+    the reserved IP against the scope's live leases: `active` = a lease exists for the
+    reserved IP; `client_mac` = who currently holds it (a real MAC ≠ the reserved MAC ⇒
+    conflict); `name`/`lease_expiry` from that lease; `bad_address` = the server flagged
+    the address as in-use by an unknown host. The dashboard turns these into health
+    states (active / never-used / conflict / bad) and cross-refs the MAC against passive
+    sightings for "last actually seen"."""
+    out: list[dict[str, Any]] = []
+    for e in _enum_elements(dce2, sid, 2):
+        if e.get("kind") != "reservation":
+            continue
+        ip_int = e["ip"]
+        lease = leases.get(ip_int)
+        out.append({
+            "ip": _ip(ip_int),
+            "mac": _hw_mac(bytes.fromhex(e["uid"]), ip_int),
+            "name": lease["name"] if lease else "",
+            "active": lease is not None,
+            "client_mac": lease["mac"] if lease else "",
+            "lease_expiry": lease["expiry"] if lease else None,
+            "bad_address": bool(lease and lease["name"] == "BAD_ADDRESS"),
+        })
+    return out
 
 
 def _one_scope(dce1: Any, dce2: Any, dhcpm: Any, sid: int) -> dict[str, Any] | None:
@@ -315,9 +414,11 @@ def _one_scope(dce1: Any, dce2: Any, dhcpm: Any, sid: int) -> dict[str, Any] | N
     in_use: int | None = None
     start_range = end_range = ""
     total = 0
+    reservations: list[dict[str, Any]] = []
     if dce2 is not None:
-        in_use = _scope_inuse(dce2, dhcpm, sid)
+        in_use, leases = _scope_clients(dce2, dhcpm, sid)
         start_range, end_range, total = _scope_range(dce2, sid)
+        reservations = _scope_reservations(dce2, sid, leases)
 
     # Match the WinRM/PowerShell path's domain: the server computes these within the
     # scope range, so free is never negative and pct never exceeds 100. A scope with
@@ -336,7 +437,8 @@ def _one_scope(dce1: Any, dce2: Any, dhcpm: Any, sid: int) -> dict[str, Any] | N
         "addresses_in_use": in_use,
         "addresses_free": free,
         "percentage_in_use": pct,
-        "reserved": None,  # reservation list deferred to the reservation UI feature
+        "reserved": len(reservations) if dce2 is not None else None,
+        "reservations": reservations,
         "options": options,
     }
 

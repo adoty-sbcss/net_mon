@@ -71,7 +71,7 @@ def test_extract_elements_ranges_and_excludes():
     ]
 
 
-def test_extract_elements_reservation_decodes_mac():
+def test_extract_elements_reservation_emits_full_uid():
     resp = {"EnumElementInfo": {"NumElements": 1, "Elements": [
         {"Element": {"tag": 2, "ReservedIp": {
             "ReservedIpAddress": 167772171,  # 10.0.0.11
@@ -80,7 +80,77 @@ def test_extract_elements_reservation_decodes_mac():
         }}},
     ]}}
     assert r._extract_elements(resp) == [
-        {"kind": "reservation", "ip": 167772171, "mac": "aabbccddeeff"},
+        {"kind": "reservation", "ip": 167772171, "uid": "aabbccddeeff"},
+    ]
+
+
+def test_extract_elements_reservation_11byte_uid_full():
+    # Windows reservation UIDs are often 11 bytes (client-id prefix + 6-byte MAC).
+    uid = [b"\x00", b"\x01", b"\x01", b"\x0a", b"\x01",
+           b"\x28", b"\x29", b"\x86", b"\x09", b"\xc1", b"\x78"]
+    resp = {"EnumElementInfo": {"NumElements": 1, "Elements": [
+        {"Element": {"tag": 2, "ReservedIp": {
+            "ReservedIpAddress": 167838053,  # 10.1.1.101
+            "ReservedForClient": {"DataLength": 11, "Data_": uid},
+        }}},
+    ]}}
+    assert r._extract_elements(resp) == [
+        {"kind": "reservation", "ip": 167838053, "uid": "0001010a0128298609c178"},
+    ]
+
+
+def test_fmt_mac_takes_trailing_six_and_colon_lowercases():
+    assert r._fmt_mac(bytes.fromhex("28298609c178")) == "28:29:86:09:c1:78"
+    # 11-byte UID -> trailing 6
+    assert r._fmt_mac(bytes.fromhex("000101 0a01 28298609c178".replace(" ", ""))) == "28:29:86:09:c1:78"
+    # short blob used as-is
+    assert r._fmt_mac(b"\x01\x02\x03") == "01:02:03"
+
+
+def test_hw_mac_keeps_real_suppresses_ip_synthetic():
+    ip = 167841499  # 10.1.14.219  (little-endian bytes db 0e 01 0a)
+    real = bytes.fromhex("000e010a0128298609c178")   # 11-byte hardware UID (ends in MAC)
+    synth = bytes.fromhex("000e010a01db0e010a")       # 9-byte, ends in the reserved IP
+    assert r._hw_mac(real, ip) == "28:29:86:09:c1:78"
+    assert r._hw_mac(synth, ip) == ""                 # server-synthesized -> no MAC
+    assert r._hw_mac(b"\x01\x02", ip) == ""           # too short -> no MAC
+
+
+def test_filetime_iso_converts_and_treats_infinite_as_none():
+    # 2020-08-26T16:32:03Z as a FILETIME (100ns ticks since 1601)
+    ft = int((1598459523 + 11644473600) * 1e7)
+    iso = r._filetime_iso(ft & 0xFFFFFFFF, ft >> 32)
+    assert iso is not None and iso.startswith("2020-08-26T16:32:03")
+    assert r._filetime_iso(0, 0) is None                       # infinite / unset lease
+    assert r._filetime_iso(0xFFFFFFFF, 0x7FFFFFFF) is None      # max
+
+
+def test_scope_reservations_joins_leases(monkeypatch):
+    # reserved .101 has a live lease (active, same MAC); .200 has none (never used)
+    monkeypatch.setattr(r, "_enum_elements", lambda *_a: [
+        {"kind": "reservation", "ip": 167838053, "uid": "0001010a0128298609c178"},  # 10.1.1.101
+        {"kind": "reservation", "ip": 167838152, "uid": "aabbccddeeff"},            # 10.1.1.200
+    ])
+    leases = {167838053: {"mac": "28:29:86:09:c1:78", "name": "pdu02", "expiry": None}}
+    out = r._scope_reservations(object(), 0, leases)
+    assert out == [
+        {"ip": "10.1.1.101", "mac": "28:29:86:09:c1:78", "name": "pdu02", "active": True,
+         "client_mac": "28:29:86:09:c1:78", "lease_expiry": None, "bad_address": False},
+        {"ip": "10.1.1.200", "mac": "aa:bb:cc:dd:ee:ff", "name": "", "active": False,
+         "client_mac": "", "lease_expiry": None, "bad_address": False},
+    ]
+
+
+def test_scope_reservations_flags_bad_address_and_suppresses_synthetic(monkeypatch):
+    # a bad-address reservation: synthetic UID (ends in the reserved IP) + BAD_ADDRESS lease
+    monkeypatch.setattr(r, "_enum_elements", lambda *_a: [
+        {"kind": "reservation", "ip": 167841499, "uid": "000e010a01db0e010a"},  # 10.1.14.219
+    ])
+    leases = {167841499: {"mac": "", "name": "BAD_ADDRESS", "expiry": None}}
+    out = r._scope_reservations(object(), 0, leases)
+    assert out == [
+        {"ip": "10.1.14.219", "mac": "", "name": "BAD_ADDRESS", "active": True,
+         "client_mac": "", "lease_expiry": None, "bad_address": True},
     ]
 
 
