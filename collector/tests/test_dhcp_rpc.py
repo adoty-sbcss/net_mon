@@ -54,3 +54,64 @@ def test_options_from_enum_flattens_values():
 def test_options_from_enum_tolerates_empty():
     assert r._options_from_enum({"OptionValues": None}) == []
     assert r._options_from_enum({}) == []
+
+
+def test_extract_elements_ranges_and_excludes():
+    # EnumSubnetElementsV5 shape: tag == element type; 0/5/6/7 are IP ranges, 3 = exclude.
+    resp = {"EnumElementInfo": {"NumElements": 3, "Elements": [
+        {"Element": {"tag": 0, "IpRange": {"StartAddress": 167772161, "EndAddress": 167772413}}},   # .1-.253
+        {"Element": {"tag": 6, "IpRange": {"StartAddress": 167772416, "EndAddress": 167772430}}},   # bootp subtype
+        {"Element": {"tag": 3, "ExcludeIpRange": {"StartAddress": 167772417, "EndAddress": 167772417}}},
+    ]}}
+    els = r._extract_elements(resp)
+    assert els == [
+        {"kind": "range", "start": 167772161, "end": 167772413},
+        {"kind": "range", "start": 167772416, "end": 167772430},
+        {"kind": "exclude", "start": 167772417, "end": 167772417},
+    ]
+
+
+def test_extract_elements_reservation_decodes_mac():
+    resp = {"EnumElementInfo": {"NumElements": 1, "Elements": [
+        {"Element": {"tag": 2, "ReservedIp": {
+            "ReservedIpAddress": 167772171,  # 10.0.0.11
+            "ReservedForClient": {"DataLength": 6,
+                                  "Data_": [b"\xaa", b"\xbb", b"\xcc", b"\xdd", b"\xee", b"\xff"]},
+        }}},
+    ]}}
+    assert r._extract_elements(resp) == [
+        {"kind": "reservation", "ip": 167772171, "mac": "aabbccddeeff"},
+    ]
+
+
+def test_extract_elements_tolerates_empty_and_null():
+    assert r._extract_elements({"EnumElementInfo": None}) == []
+    assert r._extract_elements({}) == []
+    assert r._extract_elements({"EnumElementInfo": {"NumElements": 0, "Elements": None}}) == []
+
+
+def test_scope_range_sums_ranges():
+    # two ranges → overall start/end span + total = sum of per-range sizes
+    def fake_enum(_dce2, _sid, _et):
+        return [
+            {"kind": "range", "start": 167772161, "end": 167772165},   # 10.0.0.1-.5  (5)
+            {"kind": "range", "start": 167772171, "end": 167772172},   # 10.0.0.11-.12 (2)
+        ]
+    orig = r._enum_elements
+    r._enum_elements = fake_enum
+    try:
+        start, end, total = r._scope_range(object(), 167772160)
+    finally:
+        r._enum_elements = orig
+    assert start == "10.0.0.1"
+    assert end == "10.0.0.12"
+    assert total == 7
+
+
+def test_scope_range_no_ranges_is_zero():
+    orig = r._enum_elements
+    r._enum_elements = lambda *_a: []
+    try:
+        assert r._scope_range(object(), 1) == ("", "", 0)
+    finally:
+        r._enum_elements = orig
