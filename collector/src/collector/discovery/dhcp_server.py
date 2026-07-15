@@ -238,6 +238,9 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
         try:
             ccache = _kinit(user, password, ip)
         except Exception as exc:  # noqa: BLE001 — surface a clean, scrubbed reason
+            fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout) if auto_transport else None
+            if fb:
+                return fb
             return {**base, "status": "error", "transport": "kerberos",
                     "error": _short(_scrub(f"Kerberos sign-in failed: {exc}", password))}
 
@@ -252,6 +255,17 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
         )
         result = session.run_ps(_PS_PROBE)
     except Exception as exc:  # connection / auth / transport error
+        # On auto, a WinRM failure is not fatal — fall back to RPC. This catches the
+        # Kerberos-by-IP case (pywinrm's gssapi needs an FQDN SPN, so an IP target
+        # fails at authGSSClientStep; impacket's RPC does Kerberos-by-IP fine) as well
+        # as connection resets / WinRM-off. Free the WinRM ticket first so the RPC
+        # path's own kinit starts clean.
+        if ccache:
+            _cleanup_ccache(ccache)
+            ccache = None
+        fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout) if auto_transport else None
+        if fb:
+            return fb
         return {**base, "status": "error", "transport": transport,
                 "error": _short(_scrub(str(exc), password))}
     finally:
@@ -280,10 +294,9 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
         # RPC has no WMI gate — auto-fall back to it, but only when the operator
         # left transport on auto (a pinned transport gets the raw WinRM error).
         if auto_transport and _is_wmi_denied(err):
-            rpc_result = _collect_via_rpc(base, ip=ip, user=user,
-                                          password=password, winrm_timeout=winrm_timeout)
-            if rpc_result.get("status") == "ok":
-                return rpc_result
+            fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout)
+            if fb:
+                return fb
         return {**base, "status": "error", "transport": transport, "error": err}
 
     # Merge the server's own report onto the target identity. `ok`/`error` in the
@@ -298,6 +311,17 @@ def _is_wmi_denied(err: str) -> bool:
     """True for the hardened-box signature where the WinRM shell ran but the
     DhcpServer cmdlets couldn't reach WMI/DCOM as a non-admin."""
     return "cannot connect to cim server" in (err or "").lower()
+
+
+def _rpc_fallback(
+    base: dict[str, Any], *, ip: str, user: str, password: str, winrm_timeout: int
+) -> dict[str, Any] | None:
+    """Auto-mode fallback: try the RPC transport and return its result only if the
+    collection actually succeeded, else None (the caller keeps the WinRM error). Lets
+    'auto' recover from ANY WinRM failure — Kerberos-by-IP SPN, connection reset,
+    WinRM off, or the non-admin WMI gate — so it's a safe default on every server."""
+    rpc_result = _collect_via_rpc(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout)
+    return rpc_result if rpc_result.get("status") == "ok" else None
 
 
 def _collect_via_rpc(
