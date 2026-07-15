@@ -497,20 +497,44 @@ def collect(
                     pass
 
 
-def _collect_over_dce(dce1: Any, dce2: Any, dhcpm: Any, fqdn: str) -> dict[str, Any]:
-    server_options: list[dict[str, Any]] = []
+def _server_options(dce1: Any, dhcpm: Any) -> list[dict[str, Any]]:
+    """Server-level (global) option values — the inherited baseline the dashboard tags
+    scope options against (matches the WinRM path's server-level
+    Get-DhcpServerv4OptionValue). These are DhcpGlobalOptions (scope type 1), but
+    impacket's hDhcpEnumOptionValues helper is BROKEN for it: it sets the struct
+    ScopeType to 1 yet skips the union discriminant (leaving tag 0), so the server
+    rejects the ScopeType/tag mismatch as rpc_x_bad_stub_data. We instead build a valid
+    DhcpDefaultOptions request (which the helper marshals correctly) and byte-patch the
+    ScopeType + union tag 0 -> 1 to make it a well-formed Global request. Needs the
+    account to have option-read access (DHCP Administrators on hardened servers, where
+    plain DHCP Users is access-denied for option enums); returns [] otherwise."""
     try:
-        # Server-level option VALUES (the inherited baseline every scope draws from),
-        # matching the WinRM path's server-level Get-DhcpServerv4OptionValue. That is
-        # DhcpGlobalOptions (1), NOT DhcpDefaultOptions (0 — the option-DEFINITION
-        # defaults, which are empty here). Using Default returned zero server options,
-        # so the dashboard tagged every scope option "scope-specific" with no
-        # inherited/override (and inflated the no-router/no-DNS flags). getattr with an
-        # int fallback in case an older impacket enum omits the member.
-        scope_global = getattr(dhcpm.DHCP_OPTION_SCOPE_TYPE, "DhcpGlobalOptions", 1)
-        server_options = _options_from_enum(dhcpm.hDhcpEnumOptionValues(dce1, scope_global))
+        base = dhcpm.DhcpEnumOptionValues()
+        base["ServerIpAddress"] = dhcpm.NULL
+        base["ScopeInfo"]["ScopeType"] = 0  # Default: the one scope type the helper marshals correctly
+        base["ResumeHandle"] = dhcpm.NULL
+        base["PreferredMaximum"] = 0xFFFFFFFF
+        raw = bytearray(base.getData())
+        # wire layout: [ServerIp ptr:4][ScopeType:2][union tag:2][ResumeHandle:4][max:4].
+        # Bail rather than send a malformed request if the marshaling isn't what we expect.
+        if len(raw) < 8 or raw[4:8] != b"\x00\x00\x00\x00":
+            return []
+        raw[4] = 1  # ScopeType: DhcpDefaultOptions(0) -> DhcpGlobalOptions(1)
+        raw[6] = 1  # union discriminant: match ScopeType (the helper's bug is leaving this 0)
+        patched = bytes(raw)
+
+        class _RawGlobalReq(dhcpm.DhcpEnumOptionValues):
+            def getData(self, soFar: int = 0) -> bytes:  # noqa: ARG002
+                return patched
+
+        dce1.call(base.opnum, _RawGlobalReq())
+        return _options_from_enum(dhcpm.DhcpEnumOptionValuesResponse(dce1.recv()))
     except Exception:  # noqa: BLE001
-        pass
+        return []
+
+
+def _collect_over_dce(dce1: Any, dce2: Any, dhcpm: Any, fqdn: str) -> dict[str, Any]:
+    server_options = _server_options(dce1, dhcpm)
 
     subnet_ints: list[int] = []
     try:
