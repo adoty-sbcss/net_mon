@@ -500,9 +500,15 @@ def collect(
 def _collect_over_dce(dce1: Any, dce2: Any, dhcpm: Any, fqdn: str) -> dict[str, Any]:
     server_options: list[dict[str, Any]] = []
     try:
-        server_options = _options_from_enum(
-            dhcpm.hDhcpEnumOptionValues(dce1, dhcpm.DHCP_OPTION_SCOPE_TYPE.DhcpDefaultOptions)
-        )
+        # Server-level option VALUES (the inherited baseline every scope draws from),
+        # matching the WinRM path's server-level Get-DhcpServerv4OptionValue. That is
+        # DhcpGlobalOptions (1), NOT DhcpDefaultOptions (0 — the option-DEFINITION
+        # defaults, which are empty here). Using Default returned zero server options,
+        # so the dashboard tagged every scope option "scope-specific" with no
+        # inherited/override (and inflated the no-router/no-DNS flags). getattr with an
+        # int fallback in case an older impacket enum omits the member.
+        scope_global = getattr(dhcpm.DHCP_OPTION_SCOPE_TYPE, "DhcpGlobalOptions", 1)
+        server_options = _options_from_enum(dhcpm.hDhcpEnumOptionValues(dce1, scope_global))
     except Exception:  # noqa: BLE001
         pass
 
