@@ -227,6 +227,17 @@ class Settings(BaseSettings):
     # Per-server WinRM operation timeout (seconds).
     dhcp_intel_winrm_timeout: int = Field(default=30, alias="NETMON_DHCP_INTEL_WINRM_TIMEOUT")
 
+    # --- Network DEVICE config backup (NCM-1): fetch running/startup configs over
+    #     READ-ONLY SSH from the district's managed devices. OFF by default; the
+    #     target list + per-device SSH creds ride a 0600 JSON file (like DHCP). ---
+    device_config_enabled: bool = Field(default=False, alias="NETMON_DEVICE_CONFIG_ENABLED")
+    # How often to back up each device (seconds). Configs change slowly; default 24h.
+    device_config_interval: int = Field(default=86400, alias="NETMON_DEVICE_CONFIG_INTERVAL")
+    # Wall-clock cap for the whole config-backup pass across all devices.
+    device_config_time_budget: int = Field(default=300, alias="NETMON_DEVICE_CONFIG_TIME_BUDGET")
+    # Per-device SSH connect/read timeout (seconds).
+    device_config_ssh_timeout: int = Field(default=30, alias="NETMON_DEVICE_CONFIG_SSH_TIMEOUT")
+
     sftp_enabled: bool = Field(default=False, alias="NETMON_SFTP_ENABLED")
     sftp_host: str = Field(default="", alias="NETMON_SFTP_HOST")
     sftp_port: int = Field(default=22, alias="NETMON_SFTP_PORT")

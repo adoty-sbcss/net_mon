@@ -339,6 +339,16 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_DHCP_INTEL_INTERVAL"] = str(int(data["dhcp_intel_interval"]))
     if "dhcp_targets" in data:
         _write_dhcp_targets(data.get("dhcp_targets") or [])
+    # Network DEVICE config backup (NCM-1). Same shape as DHCP: the enable flag +
+    # cadence ride env; the target list + per-device SSH creds ride a 0600 JSON file
+    # (NOT env — secrets + quotes don't belong in the EnvironmentFile). Full-replace;
+    # an empty list clears it (the feature stays gated by device_config_enabled).
+    if "device_config_enabled" in data:
+        mapping["NETMON_DEVICE_CONFIG_ENABLED"] = "true" if data.get("device_config_enabled") else "false"
+    if data.get("device_config_interval"):
+        mapping["NETMON_DEVICE_CONFIG_INTERVAL"] = str(int(data["device_config_interval"]))
+    if "device_config_targets" in data:
+        _write_device_config_targets(data.get("device_config_targets") or [])
     if mapping:
         _update_env_file(ENV_FILE, mapping)
         log.info("applied desired config", keys=list(mapping))
@@ -743,6 +753,25 @@ def _write_dhcp_targets(targets: list) -> None:
         os.replace(str(tmp), str(TARGETS_FILE))
     except Exception as exc:  # noqa: BLE001
         log.warning("could not persist dhcp targets", error=str(exc))
+
+
+def _write_device_config_targets(targets: list) -> None:
+    """Persist the pushed device-config-backup targets to the 0600 JSON file the
+    collector's device_config module reads (NCM-1). 0600 because each target carries
+    an SSH credential; temp created 0600 from the start then atomically renamed, so
+    the secret is never briefly world-readable nor a partial write ever read.
+    Full-replace, like the DHCP targets (an empty list clears it)."""
+    from .discovery.device_config import TARGETS_FILE
+    try:
+        TARGETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(targets if isinstance(targets, list) else [])
+        tmp = TARGETS_FILE.with_suffix(".json.tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(payload)
+        os.replace(str(tmp), str(TARGETS_FILE))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not persist device config targets", error=str(exc))
 
 
 def _report_iperf(url: str, token: str | None, res: dict, trigger: str) -> None:

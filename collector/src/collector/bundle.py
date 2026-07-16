@@ -19,7 +19,7 @@ from .db import (
     list_inventory,
     list_snmp_credentials,
 )
-from .discovery import dhcp_server
+from .discovery import device_config, dhcp_server
 from .discovery import wifi as wifi_mod
 from .discovery import wifi_experience as wifi_exp_mod
 from .prompts import get_bundle_readme, get_bundle_readme_hourly
@@ -123,6 +123,12 @@ def build_hourly_bundle(
         dhcp = dhcp_server.load()
         if dhcp and dhcp.get("servers"):
             z.writestr("dhcp_intel.json", json.dumps(dhcp, indent=2, default=_default))
+        # Network DEVICE config backup (NCM-1) — box-global, REDACTED configs only
+        # (no plaintext secrets). Present ONLY when the feature is on and at least one
+        # device was backed up, so a missing file means the feature is off.
+        dev_cfg = device_config.load()
+        if dev_cfg and dev_cfg.get("devices"):
+            z.writestr("device_configs.json", json.dumps(dev_cfg, indent=2, default=_default))
         for sid in scan_ids:
             payload = _scan_payload(sid)
             for name, content in payload.items():

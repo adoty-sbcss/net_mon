@@ -31,6 +31,12 @@ dependencies = [
     # answer for hardened boxes. Kerberos reuses the krb5 already in the image.
     # Imported lazily (dhcp_rpc.py) only when the rpc transport is actually used.
     "impacket>=0.11",
+    # Multi-vendor network-device CLI over SSH for device config backup (NCM-1):
+    # fetch running/startup configs from switches/routers (Cisco/Aruba/Juniper/
+    # Ubiquiti/Netgear/Extreme). Rides paramiko (already a dep). Imported lazily
+    # (discovery/device_config.py) only when a device is actually backed up (feature
+    # off by default). READ-ONLY: only 'show' commands, never enable/config mode.
+    "netmiko>=4.3,<5",
 ]
 # Note: SNMP is handled by shelling out to the net-snmp CLI (snmpget /
 # snmpbulkwalk, installed via the `snmp` apt package in the Dockerfile),
