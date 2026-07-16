@@ -8,7 +8,7 @@ import structlog
 
 from .config import get_settings
 from .db import purge_old_scans, recent_network_scan
-from .discovery import dhcp_server
+from .discovery import device_config, dhcp_server
 from .discovery import interfaces as iface_mod
 from .scan import _vlan_of, run_scan
 
@@ -100,6 +100,12 @@ def tick() -> None:
         dhcp_server.collect_and_store(settings)
     except Exception as exc:  # pragma: no cover — keep loop alive
         log.warning("dhcp intel collect failed", error=str(exc))
+    # NCM-1 device config backup — same gated-periodic pattern; isolated so a
+    # backup error never kills the poll loop.
+    try:
+        device_config.collect_and_store(settings)
+    except Exception as exc:  # pragma: no cover — keep loop alive
+        log.warning("device config backup failed", error=str(exc))
     states = iface_mod.snapshot(exclude_prefixes=settings.exclude_prefixes)
     primary = iface_mod.primary_interface()
 

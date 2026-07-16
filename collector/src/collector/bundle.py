@@ -19,7 +19,7 @@ from .db import (
     list_inventory,
     list_snmp_credentials,
 )
-from .discovery import dhcp_server
+from .discovery import device_config, dhcp_server
 from .discovery import wifi as wifi_mod
 from .discovery import wifi_experience as wifi_exp_mod
 from .prompts import get_bundle_readme, get_bundle_readme_hourly
@@ -123,6 +123,17 @@ def build_hourly_bundle(
         dhcp = dhcp_server.load()
         if dhcp and dhcp.get("servers"):
             z.writestr("dhcp_intel.json", json.dumps(dhcp, indent=2, default=_default))
+        # Network DEVICE config backup (NCM-1) — box-global, REDACTED configs only
+        # (no plaintext secrets). Present ONLY when the feature is on and at least one
+        # device was backed up, so a missing file means the feature is off.
+        # Optional + best-effort: a corrupt artifact or a serialization error must
+        # NEVER fail the whole hourly bundle (that would lose the scan data — A1 audit).
+        try:
+            dev_cfg = device_config.load()
+            if dev_cfg and dev_cfg.get("devices"):
+                z.writestr("device_configs.json", json.dumps(dev_cfg, indent=2, default=_default))
+        except Exception as exc:  # noqa: BLE001 — never fail the bundle for this artifact
+            log.warning("could not add device_configs to bundle", error=str(exc))
         for sid in scan_ids:
             payload = _scan_payload(sid)
             for name, content in payload.items():
