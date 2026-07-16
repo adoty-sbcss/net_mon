@@ -46,6 +46,7 @@ import hmac
 import json
 import os
 import re
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -432,12 +433,28 @@ def collect_and_store(settings: Any) -> None:
         age = _age_sec(existing.get("collected_at"))
         if age is not None and age < settings.device_config_interval:
             return  # backed up recently enough
-    result = fetch_all(
-        targets,
-        ssh_timeout=settings.device_config_ssh_timeout,
-        time_budget=settings.device_config_time_budget,
-    )
-    _store(result)
+    # Run the pass under a HARD wall in a daemon thread so a pathological device that
+    # slips past netmiko's per-device timeouts can NEVER wedge the poll loop — which
+    # also runs the scans + uploads and is the channel the disable kill-switch rides
+    # on. The cooperative time_budget is the primary control; this is the backstop.
+    box: dict[str, Any] = {}
+
+    def _run() -> None:
+        box["result"] = fetch_all(
+            targets,
+            ssh_timeout=settings.device_config_ssh_timeout,
+            time_budget=settings.device_config_time_budget,
+        )
+
+    worker = threading.Thread(target=_run, name="device-config-backup", daemon=True)
+    worker.start()
+    worker.join(settings.device_config_time_budget + 60)
+    if worker.is_alive():
+        log.warning("device config pass exceeded hard deadline; skipping this cycle",
+                    budget=settings.device_config_time_budget)
+        return
+    if "result" in box:
+        _store(box["result"])
 
 
 # ---------------------------------------------------------------------------
