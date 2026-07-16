@@ -304,6 +304,9 @@ def _fetch_one(target: dict[str, Any], *, key: bytes, ssh_timeout: int) -> dict[
     cmds = _PLATFORM_CMDS.get(platform)
     if not cmds:
         return {**base, "status": "error", "error": f"unsupported platform '{platform}'"}
+    run_cmd = cmds["running"]
+    if run_cmd is None:  # defensive — every supported platform defines a running cmd
+        return {**base, "status": "error", "error": f"no running-config command for '{platform}'"}
 
     user = str(target.get("ssh_user") or "")
     password = str(target.get("ssh_password") or "")
@@ -329,10 +332,10 @@ def _fetch_one(target: dict[str, Any], *, key: bytes, ssh_timeout: int) -> dict[
             banner_timeout=ssh_timeout,
             fast_cli=False,
         )
-        running = conn.send_command(cmds["running"], read_timeout=ssh_timeout * 2)
+        running = str(conn.send_command(run_cmd, read_timeout=ssh_timeout * 2))
         if cmds["startup"]:
             try:
-                startup = conn.send_command(cmds["startup"], read_timeout=ssh_timeout * 2)
+                startup = str(conn.send_command(cmds["startup"], read_timeout=ssh_timeout * 2))
             except Exception:  # noqa: BLE001 — startup is optional (may be unset)
                 startup = None
     except Exception as exc:  # noqa: BLE001 — connect / auth / timeout / read
