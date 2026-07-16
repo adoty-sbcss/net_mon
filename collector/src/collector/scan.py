@@ -104,8 +104,15 @@ def _dns_due(interval_sec: int) -> bool:
 
 
 def run_scan(*, interface: str, trigger_reason: str, force: bool,
-             is_primary: bool = False) -> int | None:
-    """Run a single scan against `interface`. Returns the scan id on success."""
+             is_primary: bool = False, light: bool = False) -> int | None:
+    """Run a single scan against `interface`. Returns the scan id on success.
+
+    When `light` is True this is a capture-only pass: it runs the passive
+    tshark capture + a quick ARP sweep (so the scan still carries a device
+    list) and SKIPS the heavier discovery — LLDP, nmap, SNMP (+ topology
+    crawl), DNS health, reachability, and mDNS/SSDP. The poller uses it to
+    sample DHCP/STP between full scans without paying the full-scan cost.
+    """
     settings = get_settings()
 
     state = iface_mod.get_one(interface)
@@ -175,30 +182,31 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
         # 3. Counter snapshot post-capture for delta
         post_counters = iface_mod.read_counters(state.name)
 
-        # 4. LLDP / CDP neighbors
-        lldp_neighbors = lldp_mod.fetch_neighbors()
+        # 4. LLDP / CDP neighbors (skipped on a light capture-only pass)
+        lldp_neighbors = [] if light else lldp_mod.fetch_neighbors()
         ctx.raw_outputs["lldp"] = lldp_neighbors
 
         # 5. ARP sweep
         arp_results = arp_mod.run(state.name)
         ctx.raw_outputs["arp_scan"] = arp_results
 
-        # 6. nmap host discovery (ping sweep only)
+        # 6. nmap host discovery (ping sweep only) — skipped on a light pass
         cidr = state.primary_cidr
-        if cidr:
+        if not light and cidr:
             nmap_results = nmap_mod.host_discovery(cidr)
             ctx.raw_outputs["nmap"] = nmap_results
         else:
             nmap_results = []
 
         # Infrastructure candidate set (gateway + LLDP mgmt IPs + network-vendor
-        # OUIs). Computed unconditionally — reused by SNMP polling, topology
-        # seeds, AND the reachability probe (which runs even when SNMP is off).
-        snmp_candidates_list = _snmp_candidates(
+        # OUIs). Reused by SNMP polling, topology seeds, AND the reachability
+        # probe. Empty on a light pass, which short-circuits all three.
+        snmp_candidates_list = [] if light else _snmp_candidates(
             state.gateway_ip, lldp_neighbors, arp_results, nmap_results,
             include_all_hosts=settings.snmp_poll_all_hosts)
-        log.info("network device candidate set", count=len(snmp_candidates_list),
-                 ips=snmp_candidates_list)
+        if not light:
+            log.info("network device candidate set", count=len(snmp_candidates_list),
+                     ips=snmp_candidates_list)
 
         # 7. Optional SNMP polling. The heavy bulk OIDs (FDB / ifTable / ARP cache)
         # are gated to a slow cadence (snmp_bulk_interval, default daily) — they
@@ -221,7 +229,7 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
         # per snmp_topology_interval per network. A manual `./netmon scan`
         # (force=True) always crawls — an on-demand "rediscover now" override.
         topology: dict[str, Any] | None = None
-        topology_due = force or _topology_due(net_id, settings.snmp_topology_interval)
+        topology_due = (not light) and (force or _topology_due(net_id, settings.snmp_topology_interval))
         if (settings.snmp_enabled and settings.snmp_topology_enabled
                 and snmp_candidates_list and topology_due):
             try:
@@ -252,7 +260,7 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
         # pure duplication. Measures path to public DNS *and* whatever the
         # DHCP/static config gave us — spots ISP DNS issues + resolver hijacking.
         dns_results: list[dns_mod.DnsProbeResult] = []
-        if settings.dns_enabled and (force or _dns_due(settings.rescan_interval)):
+        if not light and settings.dns_enabled and (force or _dns_due(settings.rescan_interval)):
             try:
                 dns_results = dns_mod.probe_all()
             except Exception as exc:  # pragma: no cover — defensive
@@ -280,7 +288,7 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
         # miss (AirPrint printers, Apple TV, Chromecast, Sonos, Roku, cameras).
         # Time-bounded and best-effort.
         services: list[dict[str, Any]] = []
-        if settings.mdns_enabled:
+        if not light and settings.mdns_enabled:
             try:
                 bind_ip = state.primary_cidr.split("/")[0] if state.primary_cidr else None
                 services = mdns_mod.discover(
