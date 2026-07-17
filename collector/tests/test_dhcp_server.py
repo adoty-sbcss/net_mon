@@ -136,6 +136,52 @@ def test_https_endpoint(monkeypatch):
     assert cap["endpoint"] == "https://10.0.0.10:5986/wsman"
 
 
+def test_fqdn_used_as_winrm_host(monkeypatch):
+    # When a target carries an FQDN, WinRM must connect BY NAME (so Kerberos gets a
+    # resolvable SPN) while the target IDENTITY still reports the IP.
+    cap: dict = {}
+    _install_fake_winrm(monkeypatch, result=_FakeResult(std_out=json.dumps(_SAMPLE).encode()), capture=cap)
+    out = dh._collect_one(
+        {"server_ip": "10.0.0.10", "fqdn": "dc01.sbcss.org", "server_type": "windows",
+         "winrm_user": "svc@SBCSS.ORG", "winrm_password": "pw"},
+        winrm_timeout=30,
+    )
+    assert out["status"] == "ok"
+    assert cap["endpoint"] == "http://dc01.sbcss.org:5985/wsman"
+    # Identity is unchanged — server_ip anchors the record, not the FQDN.
+    assert out["server_ip"] == "10.0.0.10"
+
+
+def test_empty_fqdn_falls_back_to_ip(monkeypatch):
+    # An explicitly empty FQDN behaves exactly like the key being absent (back-compat).
+    cap: dict = {}
+    _install_fake_winrm(monkeypatch, result=_FakeResult(std_out=json.dumps(_SAMPLE).encode()), capture=cap)
+    dh._collect_one(
+        {"server_ip": "10.0.0.10", "fqdn": "", "server_type": "windows"},
+        winrm_timeout=30,
+    )
+    assert cap["endpoint"] == "http://10.0.0.10:5985/wsman"
+
+
+def test_fqdn_endpoint_on_kerberos_path(monkeypatch):
+    # The motivating case: on the Kerberos transport the SPN is derived from the
+    # endpoint host, so it MUST be the FQDN, not the by-IP endpoint that fails
+    # "Server not found in Kerberos database".
+    cap: dict = {}
+    _install_fake_winrm(monkeypatch, result=_FakeResult(std_out=json.dumps(_SAMPLE).encode()), capture=cap)
+    monkeypatch.setattr(dh, "_detect_transport", lambda endpoint, timeout: "kerberos")
+    monkeypatch.setattr(dh, "_kinit", lambda user, password, ip: "/tmp/netmon_ccache")
+    monkeypatch.setattr(dh, "_cleanup_ccache", lambda c: None)
+    out = dh._collect_one(
+        {"server_ip": "10.0.0.10", "fqdn": "dc01.sbcss.org", "server_type": "windows",
+         "winrm_user": "svc@SBCSS.ORG", "winrm_password": "pw"},
+        winrm_timeout=30,
+    )
+    assert out["status"] == "ok"
+    assert out["transport"] == "kerberos"
+    assert cap["endpoint"] == "http://dc01.sbcss.org:5985/wsman"
+
+
 def test_ps_reported_error(monkeypatch):
     _install_fake_winrm(
         monkeypatch,
