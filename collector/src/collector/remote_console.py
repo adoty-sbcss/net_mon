@@ -11,7 +11,9 @@ re-validates run —
   - `_LIVE_OPS` (in-container operational: run-scan / upload-now / config-backup /
     collect-logs): reuse the SAME handlers the queued path uses (`_run_command`),
     run in a worker THREAD so a slow op (e.g. a full scan) doesn't block the recv
-    loop's keepalive and trip the broker's idle timer.
+    loop's keepalive and trip the broker's idle timer. Bounded by an in-flight
+    guard (per cmd_id) + a total concurrency cap, so a flood of frames can't stack
+    N force scans on the box — see MAX_CONCURRENT_OPS.
 HOST-level actions (restart/rebuild/reboot/rollback) + code `update` are NOT here:
 they need the host wrapper's exit-code path and stay on the queued near-live path.
 This module is the source of truth and re-validates every id the broker forwards.
@@ -67,6 +69,26 @@ RECV_TIMEOUT_SEC = 30
 DIAG_TIMEOUT_SEC = 20
 OUTPUT_CAP = 16000
 CHUNK = 8000
+
+# Concurrency bound for `_LIVE_OPS` (CON / F-COL-15). Each op is REAL work on the
+# box — run-scan alone drives nmap + arp-scan + a multi-minute tshark capture — and
+# every `cmd` frame used to spawn its own unbounded daemon thread. A flood of
+# run-scan frames (a wedged UI retrying, a compromised broker, an impatient
+# operator double-clicking) therefore launched N concurrent force scans and could
+# exhaust CPU / memory / fds on a small sensor.
+#
+# Two independent guards, both refusing loudly rather than queueing (the operator
+# is watching a terminal; a silent queue would look like a hang):
+#   - per-cmd_id: the same op can never run twice at once. This is the one that
+#     matters for the run-scan flood.
+#   - total: a ceiling across DIFFERENT ops, since the per-id guard alone would
+#     still allow every _LIVE_OPS member at once. 2 leaves room for the sensible
+#     pairing (e.g. collect-logs while a scan runs) without stacking heavy work.
+# Scope: module state in the per-session console process, so this bounds ONE
+# session. Concurrent sessions are separately gated (dashboard step-up + broker).
+MAX_CONCURRENT_OPS = 2
+_ops_lock = threading.Lock()
+_ops_inflight: set[str] = set()
 
 
 def _send(ws, obj: dict) -> bool:
@@ -141,36 +163,67 @@ def _run_op_async(ws, cmd_id: str) -> None:
     """Run an in-container operational command (run-scan / upload-now / etc.) in a
     worker thread, streaming begin/out/exit. Threaded so the recv loop keeps
     pinging the broker while a slow op runs (websocket-client send is thread-safe
-    with enable_multithread=True)."""
+    with enable_multithread=True).
+
+    Bounded by the in-flight guards (see MAX_CONCURRENT_OPS): an op already running
+    or an over-budget box is REFUSED with an `err` frame, never queued or stacked.
+    """
+    # Claim a slot before spawning anything. Both checks under one lock so two
+    # frames arriving together can't both see a free slot and race past the cap.
+    with _ops_lock:
+        if cmd_id in _ops_inflight:
+            _send(ws, {"type": "err", "id": cmd_id,
+                       "message": f"already running: {cmd_id}"})
+            return
+        if len(_ops_inflight) >= MAX_CONCURRENT_OPS:
+            _send(ws, {"type": "err", "id": cmd_id,
+                       "message": (f"busy: {len(_ops_inflight)} operations already "
+                                   f"running (max {MAX_CONCURRENT_OPS}) — try again "
+                                   "when one finishes")})
+            return
+        _ops_inflight.add(cmd_id)
 
     def worker() -> None:
-        _send(ws, {"type": "begin", "id": cmd_id})
-        t0 = time.monotonic()
         try:
-            status, result = _run_command(cmd_id)
-            # Scrub secrets before streaming to the operator + the broker's
-            # PERSISTENT transcript — an op's error/success value can echo
-            # credential-shaped text back at us. Redact the full text first, THEN
-            # cap: the same guard the diag path applies. NOTE this masks what
-            # _redact_secrets knows (KEY=secret / Bearer <token>); a blob SAS
-            # `?sig=` param or an sftp://user:pass@host URL is NOT matched by its
-            # key list — closing those means widening the shared regex in checkin.
-            text = _redact_secrets(_op_result_text(cmd_id, status, result))[-OUTPUT_CAP:]
-            for i in range(0, len(text), CHUNK):
-                _send(ws, {"type": "out", "id": cmd_id, "data": text[i : i + CHUNK]})
-            _send(
-                ws,
-                {
-                    "type": "exit",
-                    "id": cmd_id,
-                    "code": 0 if status in ("done", "scheduled") else 1,
-                    "ms": int((time.monotonic() - t0) * 1000),
-                },
-            )
-        except Exception as exc:  # noqa: BLE001
-            _send(ws, {"type": "err", "id": cmd_id, "message": str(exc)})
+            _send(ws, {"type": "begin", "id": cmd_id})
+            t0 = time.monotonic()
+            try:
+                status, result = _run_command(cmd_id)
+                # Scrub secrets before streaming to the operator + the broker's
+                # PERSISTENT transcript — an op's error/success value can echo
+                # credential-shaped text back at us. Redact the full text first, THEN
+                # cap: the same guard the diag path applies. NOTE this masks what
+                # _redact_secrets knows (KEY=secret / Bearer <token>); a blob SAS
+                # `?sig=` param or an sftp://user:pass@host URL is NOT matched by its
+                # key list — closing those means widening the shared regex in checkin.
+                text = _redact_secrets(_op_result_text(cmd_id, status, result))[-OUTPUT_CAP:]
+                for i in range(0, len(text), CHUNK):
+                    _send(ws, {"type": "out", "id": cmd_id, "data": text[i : i + CHUNK]})
+                _send(
+                    ws,
+                    {
+                        "type": "exit",
+                        "id": cmd_id,
+                        "code": 0 if status in ("done", "scheduled") else 1,
+                        "ms": int((time.monotonic() - t0) * 1000),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                _send(ws, {"type": "err", "id": cmd_id, "message": str(exc)})
+        finally:
+            # Release in a finally that wraps EVERYTHING above: a slot leaked here
+            # would wedge this cmd_id for the rest of the session.
+            with _ops_lock:
+                _ops_inflight.discard(cmd_id)
 
-    threading.Thread(target=worker, name=f"console-op-{cmd_id}", daemon=True).start()
+    try:
+        threading.Thread(target=worker, name=f"console-op-{cmd_id}", daemon=True).start()
+    except Exception as exc:  # noqa: BLE001
+        # The box is out of threads — the very exhaustion these guards exist to
+        # prevent. Hand the slot back or this cmd_id stays refused all session.
+        with _ops_lock:
+            _ops_inflight.discard(cmd_id)
+        _send(ws, {"type": "err", "id": cmd_id, "message": f"could not start: {exc}"})
 
 
 # Where the host-side PTY server (scripts/netmon-host-console.py) listens. The

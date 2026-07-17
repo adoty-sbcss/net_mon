@@ -3,11 +3,15 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import socket
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import structlog
 
@@ -64,6 +68,36 @@ def build_bundle(scan_id: int, output_path: str | None = None) -> Path:
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def _atomic_zip(final: Path) -> Iterator[zipfile.ZipFile]:
+    """Yield a ZipFile that builds at a unique temp path beside `final`, then
+    `os.replace` it into position — so `final` only ever appears COMPLETE.
+
+    Needed because two processes can build the same bundle at once: the dashboard's
+    `upload-now` runs the builder in a SEPARATE process (checkin.py) and derives the
+    same hour/filename as the uploader's own pass. Writing both to a shared final
+    path could interleave into a truncated ZIP; a crash mid-write left a corrupt one.
+    With this, the loser of the race just replaces the winner's file with its own
+    equivalent build, and a crash leaves only a temp behind.
+
+    The temp name is dot-prefixed + `.tmp` and pid + random tagged: unique against a
+    concurrent process AND a leftover from a crashed one, and ignored by anything
+    consuming bundles (which go by exact DB-recorded filename anyway). Deliberately
+    NOT tempfile.mkstemp — that forces 0600, whereas letting ZipFile create the file
+    keeps the umask-derived mode bundles have always had (os.replace preserves the
+    temp's mode).
+    """
+    tmp = final.with_name(f".{final.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
+    try:
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            yield z
+        os.replace(tmp, final)
+    finally:
+        # No-op after a successful replace (tmp is gone); on any failure it clears
+        # the partial build so a repeatedly-failing box can't fill its disk.
+        tmp.unlink(missing_ok=True)
+
+
 def build_hourly_bundle(
     scan_ids: list[int],
     output_path: Path,
@@ -72,7 +106,18 @@ def build_hourly_bundle(
     window_start: datetime,
     window_end: datetime,
 ) -> Path:
-    """Build a single ZIP rolling up every scan that completed in the hour."""
+    """Build a single ZIP rolling up every scan that completed in the hour.
+
+    Written ATOMICALLY: the ZIP is built at a unique temp path in the same
+    directory and `os.replace`d into position, so `output_path` only ever exists
+    complete. Two builders CAN race for one hour — the dashboard's `upload-now`
+    runs `_build_hour` in a SEPARATE process (checkin.py) and derives the same
+    hour/filename as the uploader — and interleaved writes to a shared handle
+    would have shipped a truncated ZIP. A crash mid-write now leaves only a temp
+    file behind (dot-prefixed + `.tmp`, so nothing that consumes bundles by name
+    can pick it up), never a corrupt bundle. The loser of the race simply replaces
+    the winner's file with its own equivalent build.
+    """
     if not scan_ids:
         raise ValueError("build_hourly_bundle called with no scan_ids")
 
@@ -91,7 +136,7 @@ def build_hourly_bundle(
         inv_counts=inv_counts,
     )
 
-    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+    with _atomic_zip(output_path) as z:
         z.writestr("README.md", get_bundle_readme_hourly())
         z.writestr("HOURLY_SUMMARY.md", summary)
         z.writestr("inventory.csv", _inventory_csv(inventory))
