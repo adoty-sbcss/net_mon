@@ -41,7 +41,10 @@ def probe_url(url: str, timeout: int = 15, srcip: str | None = None) -> dict:
     ]
     if srcip:
         cmd += ["--interface", srcip]
-    cmd.append(url)
+    # `--` terminates option parsing: a dashboard-pushed webperf URL that begins with
+    # '-' (and slipped past the https:// prefixing because it already contains "://")
+    # must not be read as a curl option, e.g. -K to load a local file as config (F-COL-16).
+    cmd += ["--", url]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
     except FileNotFoundError:
