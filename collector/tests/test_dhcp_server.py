@@ -323,3 +323,128 @@ def test_kerberos_kinit_failure_is_clean(monkeypatch):
     assert out["status"] == "error"
     assert out["transport"] == "kerberos"
     assert "kerberos sign-in failed" in out["error"].lower()
+
+
+# ---- F-COL-9: fail fast on an auth failure (avoid AD lockout) ----
+
+
+def test_is_auth_failure_positive():
+    # Credential-rejection signatures across kinit / WinRM (401) / impacket.
+    for msg in [
+        "InvalidCredentialsError: the specified credentials were rejected by the server",
+        "requests.exceptions.HTTPError: 401 Client Error for url",
+        "kinit: Preauthentication failed while getting initial credentials",
+        "Kerberos sign-in failed: Password incorrect",
+        "SMB SessionError: STATUS_LOGON_FAILURE(0xC000006D)",
+        "STATUS_ACCOUNT_LOCKED_OUT",
+        "STATUS_PASSWORD_EXPIRED",
+    ]:
+        assert dh._is_auth_failure(msg), msg
+
+
+def test_is_auth_failure_negative():
+    # Transport / connectivity / authorization errors must NOT fail fast — these are
+    # exactly the cases the RPC fallback is designed to recover, so they keep falling
+    # back. Access-denied is a VALID credential lacking rights (no lockout risk).
+    for msg in [
+        "OSError: no route to host",
+        "ConnectionResetError: connection reset by peer",
+        "Cannot connect to CIM server. Access denied",     # WMI/DCOM gate → RPC
+        "Server not found in Kerberos database",           # SPN-by-IP → RPC
+        "kinit: Clock skew too great while getting initial credentials",
+        "rpc_s_access_denied",
+        "",
+    ]:
+        assert not dh._is_auth_failure(msg), msg
+
+
+def _fallback_spy():
+    """A stand-in for _rpc_fallback that records whether it was called (each real
+    call is another AD logon we're trying to avoid)."""
+    state = {"calls": 0}
+
+    def _fb(*_a, **_k):
+        state["calls"] += 1
+        return {"status": "ok", "transport": "rpc", "scopes": []}
+
+    return state, _fb
+
+
+def test_winrm_auth_failure_skips_rpc_fallback(monkeypatch):
+    # A 401-style WinRM error must NOT trigger the RPC fallback (which would kinit +
+    # NTLM = two more failed logons). Fail fast instead.
+    class InvalidCredentialsError(Exception):
+        pass
+
+    _install_fake_winrm(
+        monkeypatch,
+        raises=InvalidCredentialsError("the specified credentials were rejected by the server"),
+    )
+    state, fb = _fallback_spy()
+    monkeypatch.setattr(dh, "_rpc_fallback", fb)
+    out = dh._collect_one(
+        {"server_ip": "10.0.0.10", "server_type": "windows",
+         "winrm_user": "DOM\\svc", "winrm_password": "bad"},
+        winrm_timeout=30,
+    )
+    assert out["status"] == "error"
+    assert state["calls"] == 0  # no fallback → no extra AD logon
+
+
+def test_winrm_transport_failure_still_falls_back(monkeypatch):
+    # A genuine transport error (connection reset) SHOULD still fall back to RPC.
+    _install_fake_winrm(monkeypatch, raises=OSError("connection reset by peer"))
+    state, fb = _fallback_spy()
+    monkeypatch.setattr(dh, "_rpc_fallback", fb)
+    out = dh._collect_one(
+        {"server_ip": "10.0.0.10", "server_type": "windows",
+         "winrm_user": "DOM\\svc", "winrm_password": "pw"},
+        winrm_timeout=30,
+    )
+    assert state["calls"] == 1
+    assert out["status"] == "ok"
+    assert out["transport"] == "rpc"
+
+
+def test_kinit_auth_failure_skips_rpc_fallback(monkeypatch):
+    _install_fake_winrm(monkeypatch, result=_FakeResult(std_out=json.dumps(_SAMPLE).encode()))
+    monkeypatch.setattr(dh, "_detect_transport", lambda endpoint, timeout: "kerberos")
+    monkeypatch.setattr(
+        dh, "_kinit", lambda u, p, ip: (_ for _ in ()).throw(RuntimeError("Preauthentication failed"))
+    )
+    state, fb = _fallback_spy()
+    monkeypatch.setattr(dh, "_rpc_fallback", fb)
+    out = dh._collect_one(
+        {"server_ip": "10.0.0.10", "server_type": "windows",
+         "winrm_user": "DHCP_User@SBCSS.ORG", "winrm_password": "bad"},
+        winrm_timeout=30,
+    )
+    assert out["status"] == "error"
+    assert out["transport"] == "kerberos"
+    assert state["calls"] == 0
+
+
+def test_rpc_kinit_auth_failure_skips_ntlm(monkeypatch):
+    # Pinned RPC transport: a bad-password kinit must NOT then try NTLM (another logon).
+    monkeypatch.setattr(
+        dh, "_kinit", lambda u, p, ip: (_ for _ in ()).throw(RuntimeError("Password incorrect"))
+    )
+    monkeypatch.setattr(dh, "_cleanup_ccache", lambda c: None)
+    fake = types.ModuleType("collector.discovery.dhcp_rpc")
+    called = {"n": 0}
+
+    def _collect(*_a, **_k):
+        called["n"] += 1
+        return {"scopes": []}
+
+    fake.collect = _collect  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "collector.discovery.dhcp_rpc", fake)
+    out = dh._collect_one(
+        {"server_ip": "10.0.0.10", "server_type": "windows", "transport": "rpc",
+         "winrm_user": "u@DOM", "winrm_password": "bad"},
+        winrm_timeout=30,
+    )
+    assert out["status"] == "error"
+    assert out["transport"] == "rpc"
+    assert "authentication failed" in out["error"].lower()
+    assert called["n"] == 0  # NTLM attempt skipped

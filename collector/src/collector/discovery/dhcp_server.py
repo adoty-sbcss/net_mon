@@ -246,11 +246,17 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
         try:
             ccache = _kinit(user, password, ip)
         except Exception as exc:  # noqa: BLE001 — surface a clean, scrubbed reason
-            fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout) if auto_transport else None
-            if fb:
-                return fb
+            reason = _scrub(f"Kerberos sign-in failed: {exc}", password)
+            # A bad/locked/expired password fails EVERY transport identically, so
+            # don't burn another AD logon on the RPC fallback (which kinits again).
+            # Only a NON-credential kinit failure (no realm, clock skew, KDC down)
+            # is worth falling back for.
+            if auto_transport and not _is_auth_failure(reason):
+                fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout)
+                if fb:
+                    return fb
             return {**base, "status": "error", "transport": "kerberos",
-                    "error": _short(_scrub(f"Kerberos sign-in failed: {exc}", password))}
+                    "error": _short(reason)}
 
     try:
         session = winrm.Session(
@@ -263,17 +269,23 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
         )
         result = session.run_ps(_PS_PROBE)
     except Exception as exc:  # connection / auth / transport error
-        # On auto, a WinRM failure is not fatal — fall back to RPC. This catches the
-        # Kerberos-by-IP case (pywinrm's gssapi needs an FQDN SPN, so an IP target
+        # On auto, a TRANSPORT failure is not fatal — fall back to RPC. This catches
+        # the Kerberos-by-IP case (pywinrm's gssapi needs an FQDN SPN, so an IP target
         # fails at authGSSClientStep; impacket's RPC does Kerberos-by-IP fine) as well
         # as connection resets / WinRM-off. Free the WinRM ticket first so the RPC
         # path's own kinit starts clean.
         if ccache:
             _cleanup_ccache(ccache)
             ccache = None
-        fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout) if auto_transport else None
-        if fb:
-            return fb
+        # But a 401 / rejected credential is NOT a transport problem — every transport
+        # rejects the same credential, so falling back just burns another AD logon
+        # (~3/cycle trips lockout). Fail fast on an auth failure; keep the fallback
+        # only for genuine transport errors.
+        auth_failed = _is_auth_failure(f"{type(exc).__name__}: {exc}")
+        if auto_transport and not auth_failed:
+            fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout)
+            if fb:
+                return fb
         return {**base, "status": "error", "transport": transport,
                 "error": _short(_scrub(str(exc), password))}
     finally:
@@ -321,6 +333,52 @@ def _is_wmi_denied(err: str) -> bool:
     return "cannot connect to cim server" in (err or "").lower()
 
 
+# Credential-rejection signatures (F-COL-9). An AUTHENTICATION failure means every
+# transport rejects the SAME credential, so in auto mode we must STOP rather than
+# fall back — each fallback is another failed AD logon, and ~3 per cycle trips
+# account lockout. We match the bad/locked/expired-password classes specifically;
+# a plain authorization "access denied" (a VALID credential lacking rights) does
+# NOT increment AD's lockout counter and is deliberately excluded so it still falls
+# back. The excluded connectivity/transport signatures below (WinRM off, connection
+# reset, the WMI/DCOM gate, and the Kerberos-by-IP "server not found" SPN case) are
+# exactly the ones the module is designed to recover from via the RPC fallback, so
+# they must NOT be classified as auth failures.
+_AUTH_FAILURE_SIGNS: tuple[str, ...] = (
+    # WinRM / HTTP: pywinrm raises InvalidCredentialsError on a 401.
+    "invalidcredentials",
+    "the specified credentials were rejected",
+    "401",
+    # Kerberos (kinit stderr): a wrong password is a pre-auth failure. NB: we do
+    # NOT match "not found in kerberos database" — that is the SPN-by-IP case that
+    # must still fall back to RPC.
+    "preauth",
+    "password incorrect",
+    "password has expired",
+    # NTLM / impacket (NTSTATUS on a bad or unusable credential).
+    "status_logon_failure",         # 0xC000006D bad username/password
+    "0xc000006d",
+    "status_account_locked_out",    # 0xC0000234 — already locked; don't pile on
+    "0xc0000234",
+    "status_password_expired",      # 0xC0000071
+    "0xc0000071",
+    "status_password_must_change",  # 0xC0000224
+    "0xc0000224",
+    "status_account_disabled",      # 0xC0000072
+    "0xc0000072",
+)
+
+
+def _is_auth_failure(text: str) -> bool:
+    """True when an error is a CREDENTIAL rejection (bad/locked/expired/disabled
+    password) — the signal that retrying the same credential over another transport
+    is futile and would only burn more AD bad-password attempts. Connectivity and
+    transport errors (WinRM off, connection reset, the WMI/DCOM gate, Kerberos-by-IP
+    SPN) and plain authorization access-denied are NOT auth failures and still fall
+    back. See _AUTH_FAILURE_SIGNS for the exclusions."""
+    low = (text or "").lower()
+    return any(sign in low for sign in _AUTH_FAILURE_SIGNS)
+
+
 def _rpc_fallback(
     base: dict[str, Any], *, ip: str, user: str, password: str, winrm_timeout: int
 ) -> dict[str, Any] | None:
@@ -349,15 +407,24 @@ def _collect_via_rpc(
     use_kerberos = True
     try:
         ccache = _kinit(user, password, ip)  # sets KRB5CCNAME for impacket
-    except Exception:  # noqa: BLE001 — no ticket; let impacket attempt NTLM
+    except Exception as exc:  # noqa: BLE001 — no ticket
+        # A bad/locked/expired password won't fare better over NTLM — that's just
+        # one more failed AD logon for the same dead credential. Fail fast. A
+        # non-credential kinit failure (no realm/KDC/clock) still falls through to
+        # let impacket attempt NTLM, which may be all the box offers.
+        if _is_auth_failure(_scrub(str(exc), password)):
+            return {**base, "status": "error", "transport": "rpc",
+                    "error": _short(_scrub(f"authentication failed: {exc}", password))}
         use_kerberos = False
     try:
         parsed = dhcp_rpc.collect(
             ip, user, password, kdc=None, use_kerberos=use_kerberos, timeout=winrm_timeout
         )
     except Exception as exc:  # noqa: BLE001 — connection / auth / bind error
+        reason = _scrub(str(exc), password)
+        prefix = "authentication failed: " if _is_auth_failure(reason) else ""
         return {**base, "status": "error", "transport": "rpc",
-                "error": _short(_scrub(str(exc), password))}
+                "error": _short(f"{prefix}{reason}")}
     finally:
         if ccache:
             _cleanup_ccache(ccache)
