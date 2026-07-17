@@ -193,6 +193,10 @@ try {
 def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any]:
     """Query one DHCP server. Never raises — returns a status dict either way."""
     ip = str(target.get("server_ip") or "").strip()
+    # Optional per-target FQDN (pushed from the dashboard). Kerberos can't derive an
+    # SPN from a bare IP, so when present we address WinRM by name (see winrm_host
+    # below). The IP still anchors identity + the RPC transport.
+    fqdn = str(target.get("fqdn") or "").strip()
     label = target.get("label")
     server_type = str(target.get("server_type") or "windows").lower()
     base = {"server_ip": ip, "label": label, "server_type": server_type}
@@ -221,7 +225,11 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
 
     port = int(target.get("winrm_port") or (5986 if target.get("use_https") else 5985))
     scheme = "https" if target.get("use_https") else "http"
-    endpoint = f"{scheme}://{ip}:{port}/wsman"
+    # WinRM connection host: prefer the FQDN so pywinrm's gssapi transport can build a
+    # resolvable Kerberos SPN (HTTP/<fqdn>); fall back to the IP when none is set. The
+    # RPC fallback + the target identity keep using `ip`.
+    winrm_host = fqdn or ip
+    endpoint = f"{scheme}://{winrm_host}:{port}/wsman"
 
     # Auto-detect (default): probe what the server actually accepts and pick NTLM
     # where it's offered, Kerberos where NTLM is disabled — the operator never has
