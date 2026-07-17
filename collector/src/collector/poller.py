@@ -60,6 +60,20 @@ def run_poller() -> None:
              poll_interval=settings.poll_interval,
              rescan_interval=settings.rescan_interval)
 
+    # A light capture pass goes through run_scan(force=False), so it is subject to
+    # the cooldown_seconds anti-flap floor: set capture_interval BELOW cooldown and
+    # EVERY light pass is silently rejected ("cooldown active, skipping") — the
+    # feature reads as enabled but never runs. The defaults (900 > 300) are safe, so
+    # this only fires on a real misconfig; name both values so it's actionable.
+    if 0 < settings.capture_interval < settings.cooldown_seconds:
+        log.warning(
+            "capture_interval is below cooldown_seconds — light capture passes will "
+            "be skipped by the cooldown; raise NETMON_CAPTURE_INTERVAL above "
+            "NETMON_COOLDOWN_SECONDS (or lower the cooldown) for it to take effect",
+            capture_interval=settings.capture_interval,
+            cooldown_seconds=settings.cooldown_seconds,
+        )
+
     while not _stop:
         try:
             tick()

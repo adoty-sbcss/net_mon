@@ -103,26 +103,39 @@ def build_hourly_bundle(
         z.writestr("snmp_credentials.json", json.dumps(
             {"devices": list_snmp_credentials()},
             indent=2, default=_default))
+        # Every OPTIONAL artifact below is best-effort and individually guarded: the
+        # loaders only catch (OSError, JSONDecodeError), so a valid-JSON-but-non-object
+        # envelope raises AttributeError on .get() and would abort the WHOLE hourly
+        # bundle — losing every scan in that hour over a side artifact (A1 audit).
         # Wi-Fi RF/AP survey (WIFI-2) — box-global like inventory. Read + normalize
         # the host-written envelope (scripts/netmon-wifi-survey.sh) via discovery/
         # wifi.py. Present ONLY when NETMON_WIFI_SURVEY_ENABLED and an envelope
         # exists, so a missing file means the survey is off / no Wi-Fi NIC.
-        wifi = wifi_mod.survey()
-        if wifi.get("available"):
-            z.writestr("wifi_survey.json", json.dumps(wifi, indent=2, default=_default))
+        try:
+            wifi = wifi_mod.survey()
+            if wifi.get("available"):
+                z.writestr("wifi_survey.json", json.dumps(wifi, indent=2, default=_default))
+        except Exception as exc:  # noqa: BLE001 — never fail the bundle for this artifact
+            log.warning("could not add wifi_survey to bundle", error=str(exc))
         # WIFI-3: the host-side client-experience battery (join -> measure -> leave),
         # box-global like the survey. Present only when wifi-join is enabled + the
         # battery has run.
-        wifi_exp = wifi_exp_mod.load()
-        if wifi_exp.get("available"):
-            z.writestr("wifi_experience.json", json.dumps(wifi_exp, indent=2, default=_default))
+        try:
+            wifi_exp = wifi_exp_mod.load()
+            if wifi_exp.get("available"):
+                z.writestr("wifi_experience.json", json.dumps(wifi_exp, indent=2, default=_default))
+        except Exception as exc:  # noqa: BLE001 — never fail the bundle for this artifact
+            log.warning("could not add wifi_experience to bundle", error=str(exc))
         # Authoritative DHCP server intelligence (DHCP-2) — box-global like the
         # Wi-Fi survey. Present ONLY when active collection is on AND at least one
         # authorized server was queried, so a missing file means the feature is
         # off. Contains server config the operator owns, no credentials.
-        dhcp = dhcp_server.load()
-        if dhcp and dhcp.get("servers"):
-            z.writestr("dhcp_intel.json", json.dumps(dhcp, indent=2, default=_default))
+        try:
+            dhcp = dhcp_server.load()
+            if dhcp and dhcp.get("servers"):
+                z.writestr("dhcp_intel.json", json.dumps(dhcp, indent=2, default=_default))
+        except Exception as exc:  # noqa: BLE001 — never fail the bundle for this artifact
+            log.warning("could not add dhcp_intel to bundle", error=str(exc))
         # Network DEVICE config backup (NCM-1) — box-global, REDACTED configs only
         # (no plaintext secrets). Present ONLY when the feature is on and at least one
         # device was backed up, so a missing file means the feature is off.

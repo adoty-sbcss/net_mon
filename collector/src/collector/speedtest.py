@@ -51,6 +51,10 @@ def run_cloudflare(duration: int = 5, streams: int = 16, timeout: int = 60) -> d
     base = "https://speed.cloudflare.com"
     ctx = ssl.create_default_context()
     dur = max(2, min(int(duration or 5), 20))
+    # Clamp streams like dur — it's pushed from the dashboard and feeds
+    # ThreadPoolExecutor(max_workers=...) directly, so an unbounded value would
+    # spawn that many threads (and sockets) on a small field box.
+    streams = max(1, min(int(streams or 16), 64))
 
     def _get(url: str, timeout_s: int):
         # A real User-Agent is required — Cloudflare blocks Python-urllib's default.
