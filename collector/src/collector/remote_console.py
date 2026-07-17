@@ -191,11 +191,11 @@ def _run_op_async(ws, cmd_id: str) -> None:
                 status, result = _run_command(cmd_id)
                 # Scrub secrets before streaming to the operator + the broker's
                 # PERSISTENT transcript — an op's error/success value can echo
-                # credential-shaped text back at us. Redact the full text first, THEN
-                # cap: the same guard the diag path applies. NOTE this masks what
-                # _redact_secrets knows (KEY=secret / Bearer <token>); a blob SAS
-                # `?sig=` param or an sftp://user:pass@host URL is NOT matched by its
-                # key list — closing those means widening the shared regex in checkin.
+                # credential-shaped text back at us (e.g. a `config-backup`/`upload-now`
+                # error echoing a blob SAS URL or an sftp connection string). Redact the
+                # full text first, THEN cap: the same guard the diag path applies.
+                # _redact_secrets masks KEY=secret / Bearer <token>, a blob SAS `?sig=`
+                # value, and a `scheme://user:pass@host` URL password.
                 text = _redact_secrets(_op_result_text(cmd_id, status, result))[-OUTPUT_CAP:]
                 for i in range(0, len(text), CHUNK):
                     _send(ws, {"type": "out", "id": cmd_id, "data": text[i : i + CHUNK]})
