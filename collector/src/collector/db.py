@@ -372,7 +372,19 @@ def record_snmp_failure(device_ip: str) -> None:
 
 def record_bundle_built(filename: str, local_path: str, size_bytes: int) -> None:
     """Record that a bundle file was just built. Upserts on filename so a
-    rebuilt-same-hour ZIP doesn't create duplicate rows."""
+    rebuilt-same-hour ZIP doesn't create duplicate rows.
+
+    A rebuild fully RESURRECTS the row: the prior upload is stale, and the retry
+    budget / give-up tombstone belong to the bundle we just replaced, not to the
+    new one. Resetting them is what makes an operator's explicit `upload-now`
+    work again after the automation gave up on an hour (gave_up_at is terminal
+    for automation only), and what stops a stale retry_count from putting a
+    freshly-built bundle straight into 12h backoff.
+
+    Safe against a rebuild loop because the scheduler's catch-up only rebuilds an
+    hour whose bundle is MISSING or PARTIAL (built_at < window_end) — a predicate
+    that is false the moment this row is written for a closed hour.
+    """
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -386,7 +398,11 @@ def record_bundle_built(filename: str, local_path: str, size_bytes: int) -> None
                         size_bytes = EXCLUDED.size_bytes,
                         -- If we're rebuilding, the prior upload is stale.
                         uploaded_at = NULL,
-                        remote_path = NULL
+                        remote_path = NULL,
+                        -- ...and so is the prior bundle's failure history.
+                        gave_up_at  = NULL,
+                        retry_count = 0,
+                        last_error  = NULL
                 """,
                 (filename, local_path, size_bytes),
             )
@@ -424,7 +440,11 @@ def record_bundle_upload_failure(filename: str, error: str) -> None:
 
 
 def list_pending_bundles() -> list[dict[str, Any]]:
-    """Bundles built but not yet successfully uploaded. FIFO order."""
+    """Bundles built, not yet uploaded, and not given up on. FIFO order.
+
+    Given-up bundles (see mark_bundles_gave_up) are excluded so a permanently
+    un-shippable file can't be re-tried forever — that's what bounded the flush.
+    """
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -433,10 +453,104 @@ def list_pending_bundles() -> list[dict[str, Any]]:
                        retry_count, last_error
                   FROM bundle_uploads
                  WHERE uploaded_at IS NULL
+                   AND gave_up_at IS NULL
                  ORDER BY built_at ASC
                 """,
             )
             return list(cur.fetchall())
+
+
+def list_completed_scan_times_since(hours: int) -> list[Any]:
+    """completed_at of every scan that finished within the last N hours.
+
+    Feeds the uploader's catch-up: which hour windows actually have data that
+    needs bundling. Returns raw timestamps and groups into hours in PYTHON, on
+    purpose — date_trunc() would truncate in the psycopg session's timezone (the
+    postgres container's UTC), while bundle filenames are stamped in the
+    COLLECTOR's local timezone. Grouping server-side would silently mis-bucket
+    every box that isn't on UTC.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT completed_at
+                  FROM scan_runs
+                 WHERE completed_at IS NOT NULL
+                   AND completed_at >= NOW() - (%s || ' hours')::interval
+                 ORDER BY completed_at ASC
+                """,
+                (str(hours),),
+            )
+            return [r["completed_at"] for r in cur.fetchall()]
+
+
+def get_bundle_rows(filenames: list[str]) -> dict[str, dict[str, Any]]:
+    """Build/upload state for a batch of bundle filenames, keyed by filename.
+
+    One round-trip for the whole catch-up horizon. Absent filenames simply don't
+    appear in the result — that's the "never built this hour" case.
+    """
+    if not filenames:
+        return {}
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT filename, built_at, uploaded_at, gave_up_at
+                  FROM bundle_uploads
+                 WHERE filename = ANY(%s)
+                """,
+                (list(filenames),),
+            )
+            return {r["filename"]: r for r in cur.fetchall()}
+
+
+def mark_bundles_gave_up(max_age_days: int, max_retries: int) -> list[dict[str, Any]]:
+    """Tombstone every pending bundle that is too old or has burned its retries.
+
+    Returns the rows we just gave up on (so the caller can unlink their local
+    ZIPs and audit them). The age cap normally binds first: 60 retries at the
+    uploader's backoff is ~26 days, while 7 days of hourly bundles is the disk
+    bound we actually care about (~168 files).
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE bundle_uploads
+                   SET gave_up_at = NOW()
+                 WHERE uploaded_at IS NULL
+                   AND gave_up_at IS NULL
+                   AND (built_at < NOW() - (%s || ' days')::interval
+                        OR retry_count >= %s)
+                RETURNING filename, local_path, built_at, retry_count, last_error
+                """,
+                (str(max_age_days), max_retries),
+            )
+            return list(cur.fetchall())
+
+
+def mark_bundle_gave_up(filename: str, reason: str) -> None:
+    """Tombstone ONE pending bundle (e.g. its local file vanished).
+
+    No-op if the bundle already uploaded or was already given up on, so this is
+    safe to call from a racing manual upload-now.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE bundle_uploads
+                   SET gave_up_at      = NOW(),
+                       last_attempt_at = NOW(),
+                       last_error      = %s
+                 WHERE filename = %s
+                   AND uploaded_at IS NULL
+                   AND gave_up_at IS NULL
+                """,
+                (reason[:500] if reason else reason, filename),
+            )
 
 
 def list_uploaded_bundles_older_than(days: int) -> list[dict[str, Any]]:

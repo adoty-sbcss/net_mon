@@ -174,6 +174,12 @@ CREATE TABLE IF NOT EXISTS bundle_uploads (
     last_attempt_at TIMESTAMPTZ,
     last_error      TEXT,
     retry_count     INTEGER NOT NULL DEFAULT 0,
+    -- Terminal state for a bundle the uploader will never ship: too old or too
+    -- many failed retries (see migration 0013). Given-up bundles leave the
+    -- pending queue and their local ZIP is unlinked, so a long depot outage
+    -- can't grow the queue (or the disk) without bound. Automation-terminal
+    -- only — an operator's explicit upload-now resets it back to NULL.
+    gave_up_at      TIMESTAMPTZ,
     size_bytes      BIGINT
 );
 CREATE INDEX IF NOT EXISTS idx_bundle_uploads_pending
