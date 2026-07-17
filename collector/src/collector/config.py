@@ -15,12 +15,21 @@ class Settings(BaseSettings):
     postgres_password: str = Field(default="netmon", alias="POSTGRES_PASSWORD")
     postgres_db: str = Field(default="netmon", alias="POSTGRES_DB")
 
-    capture_seconds: int = Field(default=60, alias="NETMON_CAPTURE_SECONDS")
+    # Passive-capture window length per scan (full OR light): tshark listens
+    # this long for DHCP/STP/ARP/broadcast on the scanned interface.
+    capture_seconds: int = Field(default=120, alias="NETMON_CAPTURE_SECONDS")
     poll_interval: int = Field(default=30, alias="NETMON_POLL_INTERVAL")
     # The poller re-scans any active interface whose network hasn't been
     # scanned within this window. Covers both link-up (no prior scan) and
     # periodic re-scan of a stable network. Replaces the old field/monitor mode.
     rescan_interval: int = Field(default=3600, alias="NETMON_RESCAN_INTERVAL")
+    # Between full re-scans, run a LIGHT capture-only pass (passive tshark + a
+    # quick ARP sweep — no LLDP / nmap / SNMP / reachability / DNS / mDNS)
+    # whenever the network hasn't had ANY scan within this window. Lets sporadic
+    # DHCP/STP get sampled far more often than the hourly full scan without
+    # paying for full discovery each time. Must be < rescan_interval to have any
+    # effect; a full scan also resets this clock. 0 disables the light pass.
+    capture_interval: int = Field(default=900, alias="NETMON_CAPTURE_INTERVAL")
     # Anti-flap floor only: never scan the same network twice within this many
     # seconds, even if something asks. Much smaller than rescan_interval.
     cooldown_seconds: int = Field(default=300, alias="NETMON_COOLDOWN_SECONDS")

@@ -81,6 +81,10 @@ def tick() -> None:
         tick (within poll_interval seconds of link-up).
       - A stable network gets re-scanned once the rescan interval elapses,
         producing fresh hourly data for the uploader to bundle.
+      - Between those full re-scans, a lighter capture-only pass (passive
+        tshark + ARP, no SNMP/reachability/DNS/mDNS) runs every
+        capture_interval, so sporadic DHCP/STP is sampled far more often than
+        the hourly full scan without paying for the full discovery each time.
       - State lives in the DB (scan_runs), so a collector restart doesn't
         reset the schedule or cause a thundering re-scan.
 
@@ -120,23 +124,33 @@ def tick() -> None:
             continue
 
         net_id = _network_id(st.gateway_mac, st.primary_cidr)
-
-        # Due for a scan if this network has NOT been scanned within the
-        # rescan interval. recent_network_scan returns the most recent scan
-        # row for net_id inside the window, or None.
-        if net_id is not None:
-            recent = recent_network_scan(net_id, settings.rescan_interval)
-            if recent is not None:
-                continue  # scanned recently enough; not due yet
-
         is_primary = (st.name == primary)
-        log.info("triggering scan",
-                 interface=st.name, cidr=st.primary_cidr,
-                 gateway=st.gateway_ip, is_primary=is_primary,
-                 reason="due_for_scan")
-        run_scan(
-            interface=st.name,
-            trigger_reason="periodic" if net_id else "link_up",
-            force=False,
-            is_primary=is_primary,
-        )
+
+        # No stable network id yet (e.g. just linked up, no gateway) -> full scan.
+        if net_id is None:
+            log.info("triggering scan", interface=st.name, cidr=st.primary_cidr,
+                     gateway=st.gateway_ip, is_primary=is_primary, reason="link_up")
+            run_scan(interface=st.name, trigger_reason="link_up",
+                     force=False, is_primary=is_primary)
+            continue
+
+        # Due for a FULL scan if this network has NOT been scanned within the
+        # rescan interval. recent_network_scan returns the most recent scan row
+        # for net_id inside the window, or None.
+        if recent_network_scan(net_id, settings.rescan_interval) is None:
+            log.info("triggering scan", interface=st.name, cidr=st.primary_cidr,
+                     gateway=st.gateway_ip, is_primary=is_primary, reason="due_for_scan")
+            run_scan(interface=st.name, trigger_reason="periodic",
+                     force=False, is_primary=is_primary)
+            continue
+
+        # Not due for a full scan. Run a LIGHT capture-only pass if the network
+        # hasn't had ANY scan within capture_interval -> samples DHCP/STP far more
+        # often than the hourly full scan without paying for full discovery. A
+        # full scan also captures, so it resets this clock too.
+        if settings.capture_interval > 0 and (
+                recent_network_scan(net_id, settings.capture_interval) is None):
+            log.info("triggering light capture", interface=st.name,
+                     cidr=st.primary_cidr, is_primary=is_primary, reason="capture_due")
+            run_scan(interface=st.name, trigger_reason="capture",
+                     force=False, is_primary=is_primary, light=True)
