@@ -39,6 +39,16 @@ class Settings(BaseSettings):
     # without this the local db grows unbounded. The durable inventory survives
     # (its scan FK is SET NULL, not CASCADE). 0 disables.
     local_retention_days: int = Field(default=14, alias="NETMON_LOCAL_RETENTION_DAYS")
+    # A much SHORTER window for the heavy topology SNMP rows (db.HEAVY_SNMP_OID_NAMES:
+    # dot1dStpPortTable, entPhysical*, ifName/ifTable, dot1dBasePortIfIndex,
+    # dot1qTpFdbPort). Measured on a live box, snmp_polls was 13 GB / 45.7M rows =
+    # 95% of its whole db, and those slow-changing topology OIDs are ~97% of that —
+    # stored IN FULL on every bulk walk. Retention was never broken (the oldest row
+    # sat exactly at the local_retention_days window); the problem is VOLUME. They
+    # ship in the hourly bundle and the dashboard is their durable home, so the box
+    # only needs them briefly. Genuine host inventory keeps local_retention_days.
+    # Keep this ABOVE snmp_bulk_interval (see db.HEAVY_SNMP_OID_NAMES). 0 disables.
+    snmp_bulk_retention_days: int = Field(default=3, alias="NETMON_SNMP_BULK_RETENTION_DAYS")
     exclude_ifaces: str = Field(
         default="lo,docker0,br-,veth,virbr,tun,tap",
         alias="NETMON_EXCLUDE_IFACES",

@@ -7,7 +7,7 @@ import time
 import structlog
 
 from .config import get_settings
-from .db import purge_old_scans, recent_network_scan
+from .db import purge_heavy_snmp_polls, purge_old_scans, recent_network_scan
 from .discovery import device_config, dhcp_server
 from .discovery import interfaces as iface_mod
 from .scan import _vlan_of, run_scan
@@ -34,9 +34,12 @@ def _network_id(gateway_mac: str | None, cidr: str | None) -> str | None:
 def _maybe_purge(settings) -> None:  # noqa: ANN001
     """Local-DB retention: at most once/day, drop scan_runs (and cascaded per-scan
     tables) older than the configured window so the collector's own Postgres can't
-    grow unbounded. A restart just runs it once on the next tick — harmless."""
+    grow unbounded, then purge the HEAVY topology SNMP rows on their own, shorter
+    window — they alone were ~92% of a live box's entire db (see
+    db.HEAVY_SNMP_OID_NAMES). A restart just runs it once on the next tick —
+    harmless. Each knob disables independently at <=0."""
     global _last_purge
-    if settings.local_retention_days <= 0:
+    if settings.local_retention_days <= 0 and settings.snmp_bulk_retention_days <= 0:
         return
     now = time.monotonic()
     if _last_purge is not None and (now - _last_purge) < 24 * 3600:
@@ -49,6 +52,15 @@ def _maybe_purge(settings) -> None:  # noqa: ANN001
                      deleted=n, retention_days=settings.local_retention_days)
     except Exception as exc:  # pragma: no cover — keep loop alive
         log.warning("local retention purge failed", error=str(exc))
+    # Separate try: a failure purging the heavy rows must not mask the scan purge
+    # above, and vice versa.
+    try:
+        n = purge_heavy_snmp_polls(settings.snmp_bulk_retention_days)
+        if n:
+            log.info("local retention: purged heavy SNMP topology rows",
+                     deleted=n, retention_days=settings.snmp_bulk_retention_days)
+    except Exception as exc:  # pragma: no cover — keep loop alive
+        log.warning("heavy SNMP retention purge failed", error=str(exc))
 
 
 def run_poller() -> None:

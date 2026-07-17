@@ -214,6 +214,60 @@ def purge_old_scans(retention_days: int) -> int:
             return cur.rowcount
 
 
+# The HEAVY topology OIDs. Slow-changing (physical cabling + switch config), yet
+# stored IN FULL on every bulk walk — measured at ~97% of snmp_polls on a live box,
+# where snmp_polls was 13 GB / 45.7M rows = 95% of that box's ENTIRE local db. Row
+# counts at the time:
+#   dot1dStpPortTable 19.7M (43%); entPhysical{Class,Name,SerialNum,Descr,ModelName}
+#   ~3.2M each; ifName 2.7M; ifTable 2.7M; dot1dBasePortIfIndex 1.9M;
+#   dot1qTpFdbPort 1.2M.
+# These get their own SHORTER window (snmp_bulk_retention_days) while genuine host
+# inventory — sys*, hrDevice*, prtGeneral*, and the smaller dot1dTpFdbTable /
+# ipNetToMediaTable, a minority of rows — keeps the full local_retention_days.
+# Nothing is lost: every row ships in the hourly bundle first and the dashboard is
+# its durable home; the box only needs recent scans for bundling + crawl gates.
+#
+# NOTE ifTable doubles as the marker last_snmp_bulk() dates the last bulk walk by.
+# Purging it early is safe while snmp_bulk_retention_days > snmp_bulk_interval
+# (defaults: 3 days vs 24h). If an operator raised the interval PAST the retention
+# window, the marker would age out first and the walk would re-run on roughly the
+# retention cadence instead of the configured one — bounded and self-correcting
+# (a walk rewrites the marker), never a runaway, but it would undercut the saving.
+HEAVY_SNMP_OID_NAMES: tuple[str, ...] = (
+    "dot1dStpPortTable",
+    "entPhysicalDescr",
+    "entPhysicalClass",
+    "entPhysicalName",
+    "entPhysicalSerialNum",
+    "entPhysicalModelName",
+    "ifName",
+    "ifTable",
+    "dot1dBasePortIfIndex",
+    "dot1qTpFdbPort",
+)
+
+
+def purge_heavy_snmp_polls(retention_days: int) -> int:
+    """Delete snmp_polls rows for the HEAVY topology OIDs (HEAVY_SNMP_OID_NAMES)
+    whose scan started more than retention_days ago, leaving host inventory on the
+    longer local_retention_days window. Returns rows deleted; <=0 disables."""
+    if retention_days <= 0:
+        return 0
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM snmp_polls sp
+                 USING scan_runs sr
+                 WHERE sp.scan_run_id = sr.id
+                   AND sp.oid_name = ANY(%s)
+                   AND sr.started_at < NOW() - (%s || ' days')::interval
+                """,
+                (list(HEAVY_SNMP_OID_NAMES), str(retention_days)),
+            )
+            return cur.rowcount
+
+
 def list_scan_runs_in_window(start, end) -> list[dict[str, Any]]:
     """Scans whose completed_at falls in [start, end). Times must be tz-aware."""
     with connect() as conn:
