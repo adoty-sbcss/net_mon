@@ -134,10 +134,13 @@ def tick() -> None:
                      force=False, is_primary=is_primary)
             continue
 
-        # Due for a FULL scan if this network has NOT been scanned within the
-        # rescan interval. recent_network_scan returns the most recent scan row
-        # for net_id inside the window, or None.
-        if recent_network_scan(net_id, settings.rescan_interval) is None:
+        # Due for a FULL scan if this network has NOT had a full scan within the
+        # rescan interval. exclude_capture=True is essential: the light capture
+        # pass below writes a scan_runs row every capture_interval, and without
+        # this filter those rows would keep satisfying the (longer) rescan window
+        # and starve the full scan forever once light passes are enabled.
+        if recent_network_scan(
+                net_id, settings.rescan_interval, exclude_capture=True) is None:
             log.info("triggering scan", interface=st.name, cidr=st.primary_cidr,
                      gateway=st.gateway_ip, is_primary=is_primary, reason="due_for_scan")
             run_scan(interface=st.name, trigger_reason="periodic",

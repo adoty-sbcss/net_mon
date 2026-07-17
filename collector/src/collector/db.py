@@ -109,7 +109,18 @@ def complete_scan_run(
             )
 
 
-def recent_network_scan(network_id: str, within_seconds: int) -> dict[str, Any] | None:
+def recent_network_scan(
+    network_id: str, within_seconds: int, exclude_capture: bool = False
+) -> dict[str, Any] | None:
+    """Most recent scan_runs row for this network inside the window, or None.
+
+    exclude_capture=True skips the light capture-only passes (trigger_reason
+    'capture') so the caller sees only FULL scans. The full-scan freshness gate
+    needs this: a light pass writes a scan_runs row every capture_interval, and
+    if those counted toward the (longer) rescan window the full periodic scan
+    would be starved forever once light passes are enabled. The light-pass gate
+    leaves it False so a full scan still resets the capture clock.
+    """
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -118,10 +129,11 @@ def recent_network_scan(network_id: str, within_seconds: int) -> dict[str, Any] 
                   FROM scan_runs
                  WHERE network_id = %s
                    AND started_at > NOW() - (%s || ' seconds')::interval
+                   AND (NOT %s OR trigger_reason IS DISTINCT FROM 'capture')
                  ORDER BY started_at DESC
                  LIMIT 1
                 """,
-                (network_id, str(within_seconds)),
+                (network_id, str(within_seconds), exclude_capture),
             )
             return cur.fetchone()
 

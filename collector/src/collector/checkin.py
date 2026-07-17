@@ -186,7 +186,21 @@ def _update_env_file(path: Path, mapping: dict[str, str]) -> None:
     for k, v in mapping.items():
         if k not in seen:
             out.append(f"{k}={v}")
-    path.write_text("\n".join(out) + "\n")
+    # Atomic + durable write: /etc/netmon/netmon.env holds the box identity + SFTP/
+    # SNMP credentials + every NETMON_* setting. A torn write on power loss (these are
+    # field boxes) would leave a mangled env that bricks the box's config and can zero
+    # NETMON_DASHBOARD_URL, cutting off the remote config-push recovery path (→ truck
+    # roll). Mirror the module's other secret writers: a temp created 0600 from the
+    # start (so the mode never flips) and fsynced before the rename, so a crash can
+    # never leave an empty or partially written env behind.
+    data = "\n".join(out) + "\n"
+    tmp = path.parent / (path.name + ".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(str(tmp), str(path))
 
 
 def _apply_config(data: dict) -> None:
