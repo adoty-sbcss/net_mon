@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import structlog
@@ -30,6 +31,13 @@ _LOSS = re.compile(r"(\d+(?:\.\d+)?)%\s*packet loss")
 _RTT_AVG = re.compile(r"=\s*[\d.]+/([\d.]+)/")
 _FLOAT_MS = re.compile(r"([\d.]+)\s*ms")
 _HOP = re.compile(r"^(\d+)\s+(.*)$")  # traceroute hop line: "<n>  <rest>"
+
+# Bounded fan-out. Each probe is a ping (and maybe a traceroute) subprocess
+# blocked on the network, so threads are the right tool; the cap is about not
+# spawning `limit` (256) process pairs at once on a small sensor box. Serially
+# this took TENS OF MINUTES once NETMON_SNMP_POLL_ALL_HOSTS widened the candidate
+# set to every discovered host.
+_MAX_WORKERS = 16
 
 
 def probe(
@@ -47,27 +55,37 @@ def probe(
     Each input target is a dict with at least ``ip`` and may carry
     ``hostname``/``vendor``/``source``/``snmp_responded``/``snmp_version``
     which are passed through onto the output record.
+
+    Targets are probed on a small thread pool; the output still follows input
+    order. Traceroute runs only for targets that ANSWERED ping — an offline
+    candidate otherwise ran the path out to the full hop limit (~10-20s each)
+    just to produce a list of timed-out hops.
     """
     have_tr = traceroute and shutil.which("traceroute") is not None
     if traceroute and not have_tr:
         log.info("traceroute not installed; reachability will ping only")
 
-    out: list[dict[str, Any]] = []
-    for i, t in enumerate(targets):
-        ip = t.get("ip")
-        if not ip:
-            continue
-        if i >= limit:
-            log.info("reachability capped", limit=limit)
-            break
+    if len(targets) > limit:
+        log.info("reachability capped", limit=limit)
+    # Pull the IP out right next to the filter that guarantees it, so it is a
+    # plain str by the time the probes run (the serial loop narrowed it per
+    # iteration with `if not ip: continue`). Callers pass string IPs — see
+    # scan._probe_reachability, whose candidate set is list[str].
+    todo: list[tuple[str, dict[str, Any]]] = [
+        (t["ip"], t) for t in targets[:limit] if t.get("ip")
+    ]
+    if not todo:
+        return []
 
+    def _one(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
+        ip, t = item
         alive, rtt_ms, loss_pct = _ping(ip, count=ping_count, timeout=ping_timeout)
         path: list[dict[str, Any]] = []
         hops: int | None = None
-        if have_tr:
+        if have_tr and alive:
             path, hops = _traceroute(ip, max_hops=max_hops, wait=tr_wait)
 
-        out.append({
+        return {
             "ip": ip,
             "hostname": t.get("hostname"),
             "vendor": t.get("vendor"),
@@ -79,8 +97,10 @@ def probe(
             "snmp_version": t.get("snmp_version"),
             "traceroute_hops": hops,
             "traceroute_path": path,
-        })
-    return out
+        }
+
+    with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(todo))) as pool:
+        return list(pool.map(_one, todo))
 
 
 # ---------------------------------------------------------------------------

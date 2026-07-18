@@ -186,7 +186,21 @@ def _update_env_file(path: Path, mapping: dict[str, str]) -> None:
     for k, v in mapping.items():
         if k not in seen:
             out.append(f"{k}={v}")
-    path.write_text("\n".join(out) + "\n")
+    # Atomic + durable write: /etc/netmon/netmon.env holds the box identity + SFTP/
+    # SNMP credentials + every NETMON_* setting. A torn write on power loss (these are
+    # field boxes) would leave a mangled env that bricks the box's config and can zero
+    # NETMON_DASHBOARD_URL, cutting off the remote config-push recovery path (→ truck
+    # roll). Mirror the module's other secret writers: a temp created 0600 from the
+    # start (so the mode never flips) and fsynced before the rename, so a crash can
+    # never leave an empty or partially written env behind.
+    data = "\n".join(out) + "\n"
+    tmp = path.parent / (path.name + ".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(str(tmp), str(path))
 
 
 def _apply_config(data: dict) -> None:
@@ -386,14 +400,32 @@ _SECRET_KV_RE = re.compile(
                                 # public,private) is fully masked, not just the head.
 )
 _BEARER_RE = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._\-]+")
+# Azure blob SAS: in a `?sv=..&se=..&sp=..&sig=<hmac>` query it's the `sig` value that
+# is the actual credential (the HMAC that makes the token valid) — mask ONLY it, keep
+# the param name + the rest of the SAS (sv/se/sp/sr are non-secret metadata:
+# version/expiry/permissions/resource) so a `config-backup`/`upload-now` blob error is
+# still diagnosable. The value runs to the next query/punct delimiter; a base64-or-
+# percent-encoded signature never contains any of the excluded stop chars.
+_SAS_SIG_RE = re.compile(r"(?i)([?&]sig=)[^\s\"';}),&#]+")
+# URL userinfo `scheme://user:PASSWORD@host` (e.g. an `sftp://` depot connection string
+# echoed in an upload error). Mask ONLY the password, keeping scheme/user/host so the
+# line stays diagnosable. Anchored on BOTH `://` AND a `user:pass@`, so a bare
+# `user@host` or an email (no scheme, no `:pass`), and a plain URL or `host:port` with
+# no `@` (the password class stops at `/`, so it can't reach across a path), are all
+# left untouched — only a real embedded password is masked.
+_URL_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^\s/:@]+:)[^\s/@]+@")
 
 
 def _redact_secrets(text: str) -> str:
-    """Replace credential VALUES (KEY=secret, KEY: "secret", Bearer <token>) with
-    ***, leaving the key + surrounding log text intact. Only masks assignment-style
-    secrets, so prose like "passwordauthentication no" is untouched."""
+    """Replace credential VALUES (KEY=secret, KEY: "secret", Bearer <token>, an Azure
+    blob SAS `sig=<hmac>`, and the password in a `scheme://user:PASS@host` URL) with
+    ***, leaving the key/param name, scheme/user/host, and surrounding log text intact.
+    Only masks assignment- or URL-shaped secrets, so prose like "passwordauthentication
+    no" — and a bare `user@host` or plain URL with no embedded password — is untouched."""
     text = _SECRET_KV_RE.sub(lambda m: f"{m.group(1)}=***", text)
     text = _BEARER_RE.sub(r"\1 ***", text)
+    text = _SAS_SIG_RE.sub(r"\1***", text)
+    text = _URL_USERINFO_RE.sub(r"\1***@", text)
     return text
 
 

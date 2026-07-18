@@ -40,14 +40,41 @@ CAPTURE_FILTER = (
     "or (eth.dst == ff:ff:ff:ff:ff:ff) or (eth.dst[0] & 0x01 == 0x01)"
 )
 
+# Hard cap on the frames one capture reads. `-a duration:N` bounds TIME but not
+# VOLUME: on a multicast-heavy VLAN a 120s window is ~1e5 ek-JSON frames, and we
+# buffer all of that stdout in RAM (subprocess.run) plus a dict per frame — and
+# the light capture pass re-runs this on a short cadence per network. `-c` makes
+# the capture stop at whichever limit comes first, turning a pathological VLAN
+# into a bounded SAMPLE of the window instead of hundreds of MB.
+#
+# Sizing: a quiet infra VLAN sees ~1e3 frames in 120s, so this is ~20x headroom
+# and does not bind in the normal case. Where it DOES bind, the derived rates stay
+# correct: completed_at is stamped when tshark exits, so the pps / %-of-observed
+# math divides by the ACTUAL (shorter) window, not the requested duration.
+# NOTE `-c` counts frames READ off the wire, i.e. before the `-Y` display filter.
+# On a normal switched port (no SPAN/mirror) the sensor only sees broadcast /
+# multicast / its own unicast, so nearly everything read is also printed.
+PACKET_CAP = 20000
+
+# Cap on the per-frame evidence list. `raw` is evidence, not a counter — the
+# packet counts below are tallied before it and are unaffected by this bound.
+RAW_FRAME_CAP = 5000
+
+# The layers a per-frame `raw` record is worth keeping for. A frame carrying none
+# of them is just a broadcast/multicast tally — its summary would be an empty
+# dict — so it never enters `raw`.
+_RAW_LAYERS = frozenset({"stp", "lldp", "cdp", "dhcp", "bootp", "arp"})
+
 
 def run_capture(*, interface: str, seconds: int) -> CaptureResult:
-    """Run tshark for `seconds` and parse out the structured events we care about."""
+    """Run tshark for `seconds` (or `PACKET_CAP` frames, whichever comes first)
+    and parse out the structured events we care about."""
     started_at = datetime.now(UTC)
     cmd = [
         "tshark",
         "-i", interface,
         "-a", f"duration:{seconds}",
+        "-c", str(PACKET_CAP),   # volume backstop; see PACKET_CAP
         "-Y", CAPTURE_FILTER,
         "-T", "ek",   # elastic-stack JSON (one JSON object per line)
         "-n",         # no name resolution
@@ -102,10 +129,13 @@ def run_capture(*, interface: str, seconds: int) -> CaptureResult:
             if evt:
                 result.stp.append(evt)
 
-        result.raw.append({
-            "ts": packet.get("timestamp"),
-            "summary": {k: v for k, v in layers.items() if k in {"stp", "lldp", "cdp", "dhcp", "bootp", "arp"}},
-        })
+        # Bounded evidence: keep the control-plane frames that matter, skip the
+        # bare broadcast/multicast ones (they summarize to {} — they only ever
+        # contributed to the counts above), and stop appending at the cap.
+        if len(result.raw) < RAW_FRAME_CAP:
+            summary = {k: v for k, v in layers.items() if k in _RAW_LAYERS}
+            if summary:
+                result.raw.append({"ts": packet.get("timestamp"), "summary": summary})
     return result
 
 

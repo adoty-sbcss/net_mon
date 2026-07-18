@@ -37,6 +37,7 @@ unit tests) import cleanly on a box without it.
 """
 from __future__ import annotations
 
+import ipaddress
 import socket
 import struct
 from datetime import UTC, datetime
@@ -355,7 +356,13 @@ def _scope_clients(dce2: Any, dhcpm: Any, sid: int) -> tuple[int | None, dict[in
     try:
         ci = resp["ClientsInfo"]
         n = _num(ci["NumElements"]) if ci else 0
-        for i in range(n):
+    except Exception:  # noqa: BLE001 — empty / null / misparse
+        return count, leases
+    # Per-RECORD guard (mirrors _extract_elements): one malformed client must not
+    # discard every lease after it — the old single wrapping try/except dropped the
+    # rest of the scope's leases on the first bad record.
+    for i in range(n):
+        try:
             d = ci["Clients"][i]["Data"]
             ip_int = _num(d["ClientIpAddress"])
             hw = d["ClientHardwareAddress"]
@@ -367,8 +374,8 @@ def _scope_clients(dce2: Any, dhcpm: Any, sid: int) -> tuple[int | None, dict[in
                 "name": _wstr(d["ClientName"]),
                 "expiry": _filetime_iso(_num(dt["dwLowDateTime"]), _num(dt["dwHighDateTime"])),
             }
-    except Exception:  # noqa: BLE001
-        pass
+        except Exception:  # noqa: BLE001
+            continue
     return count, leases
 
 
@@ -464,8 +471,23 @@ def collect(
     elif "\\" in user:
         domain, username = user.split("\\", 1)
 
+    def _hept_map(uuid: Any) -> Any:
+        """Resolve the interface's dynamic port via the endpoint mapper (tcp/135).
+
+        hept_map opens its OWN connection and exposes NO timeout knob (set_connect_timeout
+        below only bounds the RESOLVED port's binding), so a firewalled/dead server blocks
+        here for the OS connect timeout — ~1-2 min PER bind, which alone blows the pass's
+        wall-clock budget. The process-wide default is the only lever impacket leaves us;
+        it's set for this call only and restored either way."""
+        prev = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(timeout)
+        try:
+            return epm.hept_map(fqdn, uuid, protocol="ncacn_ip_tcp")
+        finally:
+            socket.setdefaulttimeout(prev)
+
     def _bind(uuid: Any) -> Any:
-        string_binding = epm.hept_map(fqdn, uuid, protocol="ncacn_ip_tcp")
+        string_binding = _hept_map(uuid)
         rpc = transport.DCERPCTransportFactory(string_binding)
         if hasattr(rpc, "set_connect_timeout"):
             rpc.set_connect_timeout(timeout)
@@ -475,7 +497,17 @@ def collect(
         dce = rpc.get_dce_rpc()
         dce.set_auth_level(RPC_C_AUTHN_LEVEL_PKT_PRIVACY)
         dce.connect()
-        dce.bind(uuid)
+        try:
+            dce.bind(uuid)
+        except Exception:  # noqa: BLE001 — never leak the CONNECTED transport
+            # bind() raising left the socket open and unreachable (we neither return
+            # nor disconnect it) — one leaked socket per poll on a bind-failing
+            # server, e.g. the dhcpsrv2 interface the caller tolerates below.
+            try:
+                dce.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         return dce
 
     # dhcpsrv = scopes + options; dhcpsrv2 = leases/ranges (utilization). If the
@@ -533,6 +565,22 @@ def _server_options(dce1: Any, dhcpm: Any) -> list[dict[str, Any]]:
         return []
 
 
+def _hostname(fqdn: str) -> str | None:
+    """Short hostname from the target the caller dialed, or None when it can't be
+    derived. The RPC path is dialed BY IP (dhcp_server._collect_via_rpc passes the
+    target's ip), and splitting an IP on "." yields a bogus hostname of "10"/"192" —
+    so an IP literal reports NO hostname rather than a fabricated one. The dashboard
+    falls back to the server_ip / label for the display name."""
+    value = (fqdn or "").strip()
+    if not value:
+        return None
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return value.split(".", 1)[0].upper()
+    return None  # an IP literal carries no hostname
+
+
 def _collect_over_dce(dce1: Any, dce2: Any, dhcpm: Any, fqdn: str) -> dict[str, Any]:
     server_options = _server_options(dce1, dhcpm)
 
@@ -540,8 +588,16 @@ def _collect_over_dce(dce1: Any, dce2: Any, dhcpm: Any, fqdn: str) -> dict[str, 
     try:
         for e in dhcpm.hDhcpEnumSubnets(dce1)["EnumInfo"]["Elements"] or []:
             subnet_ints.append(_num(e))
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # A genuinely EMPTY server answers ERROR_NO_MORE_ITEMS — an ok, zero-scope
+        # result (the same convention _scope_clients uses). Any OTHER failure
+        # (access denied, a broken/hardened service) is REAL and must not be
+        # swallowed into an "ok" with total_scopes: 0 that reads identically to an
+        # empty server while hiding the actual reason. Raise: collect()'s contract
+        # is that the caller (dhcp_server._collect_via_rpc) renders status="error".
+        if "NO_MORE_ITEMS" not in str(exc):
+            raise
+        subnet_ints = []
 
     scopes: list[dict[str, Any]] = []
     total_addr = 0
@@ -559,7 +615,7 @@ def _collect_over_dce(dce1: Any, dce2: Any, dhcpm: Any, fqdn: str) -> dict[str, 
 
     pct = round((total_in_use / total_addr) * 100, 2) if total_addr else None
     return {
-        "hostname": fqdn.split(".", 1)[0].upper(),
+        "hostname": _hostname(fqdn),
         "is_authorized": None,   # not exposed over the MS-DHCPM enum surface
         "is_domain_joined": None,
         "server_stats": {

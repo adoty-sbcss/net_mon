@@ -1,0 +1,14 @@
+-- Terminal state for a bundle the uploader will never ship (F-COL-20).
+--
+-- Before this, a bundle whose upload kept failing stayed pending FOREVER: every
+-- hourly tick re-tried the whole pending set serially, so a long depot outage
+-- grew the queue unboundedly while each tick spent longer and longer failing.
+-- `gave_up_at` is the tombstone that lets the queue drain: the flush sweep sets
+-- it once a bundle is too old (built_at < NOW() - 7 days) or has burned too many
+-- retries (retry_count >= 60), unlinks the local ZIP to reclaim disk, and stops
+-- re-trying it. Bounds the pending set at ~168 files (7d x 24h).
+--
+-- Terminal for AUTOMATION only: an operator's explicit `upload-now` rebuilds the
+-- hour, and record_bundle_built resets gave_up_at back to NULL (db.py) so a
+-- manual retry after the outage is fixed still works.
+ALTER TABLE bundle_uploads ADD COLUMN IF NOT EXISTS gave_up_at TIMESTAMPTZ;

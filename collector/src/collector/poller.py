@@ -7,7 +7,7 @@ import time
 import structlog
 
 from .config import get_settings
-from .db import purge_old_scans, recent_network_scan
+from .db import purge_heavy_snmp_polls, purge_old_scans, recent_network_scan
 from .discovery import device_config, dhcp_server
 from .discovery import interfaces as iface_mod
 from .scan import _vlan_of, run_scan
@@ -34,9 +34,12 @@ def _network_id(gateway_mac: str | None, cidr: str | None) -> str | None:
 def _maybe_purge(settings) -> None:  # noqa: ANN001
     """Local-DB retention: at most once/day, drop scan_runs (and cascaded per-scan
     tables) older than the configured window so the collector's own Postgres can't
-    grow unbounded. A restart just runs it once on the next tick — harmless."""
+    grow unbounded, then purge the HEAVY topology SNMP rows on their own, shorter
+    window — they alone were ~92% of a live box's entire db (see
+    db.HEAVY_SNMP_OID_NAMES). A restart just runs it once on the next tick —
+    harmless. Each knob disables independently at <=0."""
     global _last_purge
-    if settings.local_retention_days <= 0:
+    if settings.local_retention_days <= 0 and settings.snmp_bulk_retention_days <= 0:
         return
     now = time.monotonic()
     if _last_purge is not None and (now - _last_purge) < 24 * 3600:
@@ -49,6 +52,15 @@ def _maybe_purge(settings) -> None:  # noqa: ANN001
                      deleted=n, retention_days=settings.local_retention_days)
     except Exception as exc:  # pragma: no cover — keep loop alive
         log.warning("local retention purge failed", error=str(exc))
+    # Separate try: a failure purging the heavy rows must not mask the scan purge
+    # above, and vice versa.
+    try:
+        n = purge_heavy_snmp_polls(settings.snmp_bulk_retention_days)
+        if n:
+            log.info("local retention: purged heavy SNMP topology rows",
+                     deleted=n, retention_days=settings.snmp_bulk_retention_days)
+    except Exception as exc:  # pragma: no cover — keep loop alive
+        log.warning("heavy SNMP retention purge failed", error=str(exc))
 
 
 def run_poller() -> None:
@@ -59,6 +71,20 @@ def run_poller() -> None:
     log.info("poller started",
              poll_interval=settings.poll_interval,
              rescan_interval=settings.rescan_interval)
+
+    # A light capture pass goes through run_scan(force=False), so it is subject to
+    # the cooldown_seconds anti-flap floor: set capture_interval BELOW cooldown and
+    # EVERY light pass is silently rejected ("cooldown active, skipping") — the
+    # feature reads as enabled but never runs. The defaults (900 > 300) are safe, so
+    # this only fires on a real misconfig; name both values so it's actionable.
+    if 0 < settings.capture_interval < settings.cooldown_seconds:
+        log.warning(
+            "capture_interval is below cooldown_seconds — light capture passes will "
+            "be skipped by the cooldown; raise NETMON_CAPTURE_INTERVAL above "
+            "NETMON_COOLDOWN_SECONDS (or lower the cooldown) for it to take effect",
+            capture_interval=settings.capture_interval,
+            cooldown_seconds=settings.cooldown_seconds,
+        )
 
     while not _stop:
         try:
@@ -81,6 +107,10 @@ def tick() -> None:
         tick (within poll_interval seconds of link-up).
       - A stable network gets re-scanned once the rescan interval elapses,
         producing fresh hourly data for the uploader to bundle.
+      - Between those full re-scans, a lighter capture-only pass (passive
+        tshark + ARP, no SNMP/reachability/DNS/mDNS) runs every
+        capture_interval, so sporadic DHCP/STP is sampled far more often than
+        the hourly full scan without paying for the full discovery each time.
       - State lives in the DB (scan_runs), so a collector restart doesn't
         reset the schedule or cause a thundering re-scan.
 
@@ -120,23 +150,36 @@ def tick() -> None:
             continue
 
         net_id = _network_id(st.gateway_mac, st.primary_cidr)
-
-        # Due for a scan if this network has NOT been scanned within the
-        # rescan interval. recent_network_scan returns the most recent scan
-        # row for net_id inside the window, or None.
-        if net_id is not None:
-            recent = recent_network_scan(net_id, settings.rescan_interval)
-            if recent is not None:
-                continue  # scanned recently enough; not due yet
-
         is_primary = (st.name == primary)
-        log.info("triggering scan",
-                 interface=st.name, cidr=st.primary_cidr,
-                 gateway=st.gateway_ip, is_primary=is_primary,
-                 reason="due_for_scan")
-        run_scan(
-            interface=st.name,
-            trigger_reason="periodic" if net_id else "link_up",
-            force=False,
-            is_primary=is_primary,
-        )
+
+        # No stable network id yet (e.g. just linked up, no gateway) -> full scan.
+        if net_id is None:
+            log.info("triggering scan", interface=st.name, cidr=st.primary_cidr,
+                     gateway=st.gateway_ip, is_primary=is_primary, reason="link_up")
+            run_scan(interface=st.name, trigger_reason="link_up",
+                     force=False, is_primary=is_primary)
+            continue
+
+        # Due for a FULL scan if this network has NOT had a full scan within the
+        # rescan interval. exclude_capture=True is essential: the light capture
+        # pass below writes a scan_runs row every capture_interval, and without
+        # this filter those rows would keep satisfying the (longer) rescan window
+        # and starve the full scan forever once light passes are enabled.
+        if recent_network_scan(
+                net_id, settings.rescan_interval, exclude_capture=True) is None:
+            log.info("triggering scan", interface=st.name, cidr=st.primary_cidr,
+                     gateway=st.gateway_ip, is_primary=is_primary, reason="due_for_scan")
+            run_scan(interface=st.name, trigger_reason="periodic",
+                     force=False, is_primary=is_primary)
+            continue
+
+        # Not due for a full scan. Run a LIGHT capture-only pass if the network
+        # hasn't had ANY scan within capture_interval -> samples DHCP/STP far more
+        # often than the hourly full scan without paying for full discovery. A
+        # full scan also captures, so it resets this clock too.
+        if settings.capture_interval > 0 and (
+                recent_network_scan(net_id, settings.capture_interval) is None):
+            log.info("triggering light capture", interface=st.name,
+                     cidr=st.primary_cidr, is_primary=is_primary, reason="capture_due")
+            run_scan(interface=st.name, trigger_reason="capture",
+                     force=False, is_primary=is_primary, light=True)

@@ -15,12 +15,21 @@ class Settings(BaseSettings):
     postgres_password: str = Field(default="netmon", alias="POSTGRES_PASSWORD")
     postgres_db: str = Field(default="netmon", alias="POSTGRES_DB")
 
-    capture_seconds: int = Field(default=60, alias="NETMON_CAPTURE_SECONDS")
+    # Passive-capture window length per scan (full OR light): tshark listens
+    # this long for DHCP/STP/ARP/broadcast on the scanned interface.
+    capture_seconds: int = Field(default=120, alias="NETMON_CAPTURE_SECONDS")
     poll_interval: int = Field(default=30, alias="NETMON_POLL_INTERVAL")
     # The poller re-scans any active interface whose network hasn't been
     # scanned within this window. Covers both link-up (no prior scan) and
     # periodic re-scan of a stable network. Replaces the old field/monitor mode.
     rescan_interval: int = Field(default=3600, alias="NETMON_RESCAN_INTERVAL")
+    # Between full re-scans, run a LIGHT capture-only pass (passive tshark + a
+    # quick ARP sweep — no LLDP / nmap / SNMP / reachability / DNS / mDNS)
+    # whenever the network hasn't had ANY scan within this window. Lets sporadic
+    # DHCP/STP get sampled far more often than the hourly full scan without
+    # paying for full discovery each time. Must be < rescan_interval to have any
+    # effect; a full scan also resets this clock. 0 disables the light pass.
+    capture_interval: int = Field(default=900, alias="NETMON_CAPTURE_INTERVAL")
     # Anti-flap floor only: never scan the same network twice within this many
     # seconds, even if something asks. Much smaller than rescan_interval.
     cooldown_seconds: int = Field(default=300, alias="NETMON_COOLDOWN_SECONDS")
@@ -30,6 +39,16 @@ class Settings(BaseSettings):
     # without this the local db grows unbounded. The durable inventory survives
     # (its scan FK is SET NULL, not CASCADE). 0 disables.
     local_retention_days: int = Field(default=14, alias="NETMON_LOCAL_RETENTION_DAYS")
+    # A much SHORTER window for the heavy topology SNMP rows (db.HEAVY_SNMP_OID_NAMES:
+    # dot1dStpPortTable, entPhysical*, ifName/ifTable, dot1dBasePortIfIndex,
+    # dot1qTpFdbPort). Measured on a live box, snmp_polls was 13 GB / 45.7M rows =
+    # 95% of its whole db, and those slow-changing topology OIDs are ~97% of that —
+    # stored IN FULL on every bulk walk. Retention was never broken (the oldest row
+    # sat exactly at the local_retention_days window); the problem is VOLUME. They
+    # ship in the hourly bundle and the dashboard is their durable home, so the box
+    # only needs them briefly. Genuine host inventory keeps local_retention_days.
+    # Keep this ABOVE snmp_bulk_interval (see db.HEAVY_SNMP_OID_NAMES). 0 disables.
+    snmp_bulk_retention_days: int = Field(default=3, alias="NETMON_SNMP_BULK_RETENTION_DAYS")
     exclude_ifaces: str = Field(
         default="lo,docker0,br-,veth,virbr,tun,tap",
         alias="NETMON_EXCLUDE_IFACES",
