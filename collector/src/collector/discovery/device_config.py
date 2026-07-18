@@ -337,6 +337,12 @@ def _fetch_one(
     cmds = _PLATFORM_CMDS.get(platform)
     if not cmds:
         return _fail("reach", "error.unsupported_platform")
+    # Narrow before use: `startup` is legitimately None for platforms with no separate
+    # startup config (Junos, EXOS), but `running` being absent would be a table bug.
+    run_cmd = cmds.get("running")
+    start_cmd = cmds.get("startup")
+    if not run_cmd:
+        return _fail("reach", "error.unsupported_platform")
 
     user = str(target.get("ssh_user") or "")
     password = str(target.get("ssh_password") or "")
@@ -364,10 +370,13 @@ def _fetch_one(
             fast_cli=False,
         )
         authenticated = True  # past this line, no failure can be a credential problem
-        running = conn.send_command(cmds["running"], read_timeout=ssh_timeout * 2)
-        if cmds["startup"]:
+        # str(): netmiko types send_command as str | list | dict (it can parse
+        # structured output with a TextFSM template). We never pass one, so the
+        # runtime value is always str — the cast is for the type checker.
+        running = str(conn.send_command(run_cmd, read_timeout=ssh_timeout * 2))
+        if start_cmd:
             try:
-                startup = conn.send_command(cmds["startup"], read_timeout=ssh_timeout * 2)
+                startup = str(conn.send_command(start_cmd, read_timeout=ssh_timeout * 2))
             except Exception:  # noqa: BLE001 — startup is optional (may be unset)
                 startup = None
     except Exception as exc:  # noqa: BLE001 — connect / auth / timeout / read
