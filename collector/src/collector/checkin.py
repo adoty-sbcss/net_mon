@@ -646,6 +646,25 @@ def _run_command(command: str) -> tuple[str, dict]:
             remote = config_backup_mod.upload_backup()
             return "done", {"remote": str(remote)}
 
+        # NOTE: `config-backup` above is the sensor's OWN config. The two below act
+        # on NETWORK DEVICES (switches/routers) over SSH — different subsystem,
+        # hence the distinct names.
+        if command.startswith("device-ssh-test"):
+            from .discovery import device_config as devcfg
+
+            res = devcfg.test_targets()
+            return "done", res
+
+        if command.startswith("device-backup-now"):
+            from .discovery import device_config as devcfg
+
+            targets = devcfg.load_targets()
+            if not targets:
+                return "failed", {"error": "no device targets configured"}
+            res = devcfg.fetch_all(targets)
+            devcfg._store(res)  # noqa: SLF001 — same module, mirrors collect_and_store
+            return "done", {"stats": res.get("stats", {})}
+
         return "failed", {"error": f"unknown command {command!r}"}
     except Exception as exc:  # noqa: BLE001
         log.warning("command failed", command=command, error=str(exc))
