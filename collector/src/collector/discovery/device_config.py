@@ -54,6 +54,8 @@ from typing import Any
 
 import structlog
 
+from . import device_ssh_diag as ssh_diag
+
 log = structlog.get_logger(__name__)
 
 # Target list (0600, secrets) written by checkin from the dashboard push, and the
@@ -288,8 +290,26 @@ def _redact_key() -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def _fetch_one(target: dict[str, Any], *, key: bytes, ssh_timeout: int) -> dict[str, Any]:
-    """Fetch one device's running (+ startup) config over SSH. Never raises."""
+def _fetch_one(
+    target: dict[str, Any],
+    *,
+    key: bytes,
+    ssh_timeout: int,
+    discard_output: bool = False,
+) -> dict[str, Any]:
+    """Fetch one device's running (+ startup) config over SSH. Never raises.
+
+    `discard_output=True` runs the IDENTICAL path — same platform profile, same
+    commands, same timeouts — but throws the config away and reports only stage
+    results. That is what "Test SSH" runs, and running the same code is the whole
+    point: a passing test is a promise that tonight's backup will work. A test that
+    exercised a lighter path would be a liar.
+
+    Every failure is reported as a (stage, code) from device_ssh_diag, so the
+    dashboard renders on-demand and nightly failures through one ladder with one
+    vocabulary.
+    """
+    started = time.monotonic()
     host = str(target.get("host") or "").strip()
     platform = str(target.get("platform") or "").strip()
     base = {
@@ -299,14 +319,30 @@ def _fetch_one(target: dict[str, Any], *, key: bytes, ssh_timeout: int) -> dict[
         "platform": platform,
     }
 
+    def _fail(stage: str, code: str, **extra: Any) -> dict[str, Any]:
+        elapsed = int((time.monotonic() - started) * 1000)
+        return {
+            **base,
+            "status": "error",
+            "stage": stage,
+            "code": code,
+            "error": code,  # legacy field; the CODE, never raw exception text
+            "ladder": ssh_diag.stage_ladder(stage),
+            "elapsed_ms": elapsed,
+            **extra,
+        }
+
     if not host:
-        return {**base, "status": "error", "error": "no host"}
+        return _fail("reach", "error.no_host")
     cmds = _PLATFORM_CMDS.get(platform)
     if not cmds:
-        return {**base, "status": "error", "error": f"unsupported platform '{platform}'"}
-    run_cmd = cmds["running"]
-    if run_cmd is None:  # defensive — every supported platform defines a running cmd
-        return {**base, "status": "error", "error": f"no running-config command for '{platform}'"}
+        return _fail("reach", "error.unsupported_platform")
+    # Narrow before use: `startup` is legitimately None for platforms with no separate
+    # startup config (Junos, EXOS), but `running` being absent would be a table bug.
+    run_cmd = cmds.get("running")
+    start_cmd = cmds.get("startup")
+    if not run_cmd:
+        return _fail("reach", "error.unsupported_platform")
 
     user = str(target.get("ssh_user") or "")
     password = str(target.get("ssh_password") or "")
@@ -320,6 +356,7 @@ def _fetch_one(target: dict[str, Any], *, key: bytes, ssh_timeout: int) -> dict[
     conn = None
     running: str | None = None
     startup: str | None = None
+    authenticated = False
     try:
         conn = ConnectHandler(
             device_type=platform,
@@ -332,14 +369,25 @@ def _fetch_one(target: dict[str, Any], *, key: bytes, ssh_timeout: int) -> dict[
             banner_timeout=ssh_timeout,
             fast_cli=False,
         )
+        authenticated = True  # past this line, no failure can be a credential problem
+        # str(): netmiko types send_command as str | list | dict (it can parse
+        # structured output with a TextFSM template). We never pass one, so the
+        # runtime value is always str — the cast is for the type checker.
         running = str(conn.send_command(run_cmd, read_timeout=ssh_timeout * 2))
-        if cmds["startup"]:
+        if start_cmd:
             try:
-                startup = str(conn.send_command(cmds["startup"], read_timeout=ssh_timeout * 2))
+                startup = str(conn.send_command(start_cmd, read_timeout=ssh_timeout * 2))
             except Exception:  # noqa: BLE001 — startup is optional (may be unset)
                 startup = None
     except Exception as exc:  # noqa: BLE001 — connect / auth / timeout / read
-        return {**base, "status": "error", "error": _short(_scrub(str(exc), password))}
+        # Probe liveness ONLY for a pre-auth failure, and only to split the two
+        # reach timeouts: "answers but SSH is filtered/off" vs "nothing there at
+        # all" look identical to the SSH client and send the operator to different
+        # buildings.
+        ping_ok = None if authenticated else ssh_diag.tcp_ping(host, port)
+        stage, code = ssh_diag.classify_exception(exc, ping_ok=ping_ok, authenticated=authenticated)
+        log.info("device ssh failed", host=host, stage=stage, code=code)
+        return _fail(stage, code, ping_ok=ping_ok)
     finally:
         if conn is not None:
             try:
@@ -347,10 +395,31 @@ def _fetch_one(target: dict[str, Any], *, key: bytes, ssh_timeout: int) -> dict[
             except Exception:  # noqa: BLE001
                 pass
 
-    if not running or len(running) > _MAX_CONFIG_BYTES:
-        return {**base, "status": "error", "error": "running config missing or too large"}
+    # Signed in, but the account isn't permitted to read the config. The password is
+    # RIGHT — the least-privilege role was never applied to this box — and calling
+    # this an auth failure sends the operator to rotate working credentials.
+    if ssh_diag.looks_like_authz_denial(running):
+        return _fail("authz", "authz.no_read_access")
+
+    if not running or not running.strip():
+        return _fail("read", "read.empty")
+    if len(running) > _MAX_CONFIG_BYTES:
+        return _fail("read", "read.too_large")
     if startup and len(startup) > _MAX_CONFIG_BYTES:
         startup = None
+
+    # Test mode: identical path, output discarded. Report stages + sizes only.
+    if discard_output:
+        return {
+            **base,
+            "status": "ok",
+            "stage": None,
+            "code": None,
+            "ladder": ssh_diag.stage_ladder(None),
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "bytes_read": len(running),
+            "has_startup": startup is not None,
+        }
 
     red_run, sus_run = _redact_config(running, key)
     red_start, sus_start = _redact_config(startup, key)
@@ -359,8 +428,7 @@ def _fetch_one(target: dict[str, Any], *, key: bytes, ssh_timeout: int) -> dict[
     # unacceptable, so surface it as an error the operator sees instead.
     for red in (red_run, red_start):
         if red and _LEAKED_KEY_RE.search(red):
-            return {**base, "status": "error",
-                    "error": "redaction incomplete (private key survived); config not shipped"}
+            return _fail("save", "save.redaction_failed")
     return {
         **base,
         "status": "ok",
@@ -417,6 +485,90 @@ def fetch_all(
             "errors": len(devices) - ok,
             "elapsed_sec": round(time.monotonic() - start, 2),
             "budget_exhausted": budget_exhausted,
+        },
+    }
+
+
+def test_targets(
+    target_ids: list[int] | None = None,
+    *,
+    ssh_timeout: int = 20,
+    time_budget: int = 900,
+    max_workers: int = 4,
+) -> dict[str, Any]:
+    """On-demand SSH reachability test — a DRY RUN of the nightly backup.
+
+    Runs the identical fetch path with the output discarded, so a pass is a real
+    promise about tonight's run rather than a lighter-weight approximation.
+
+    Two behaviors worth knowing about:
+
+    * **Auth circuit breaker.** If the same credential set is rejected by 3
+      consecutive devices, the run STOPS. A district-wide password typo must produce
+      3 failed logins, not 110 — 110 is how you lock the shared read-only account on
+      every switch at once, and take out your own AAA server while you're at it.
+    * **Bounded concurrency.** School control planes are often aging hardware; four
+      parallel sessions is plenty and won't spike CPU across the fleet mid-lesson.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    start = time.monotonic()
+    key = _redact_key()
+    targets = load_targets()
+    if target_ids:
+        wanted = set(target_ids)
+        targets = [t for t in targets if t.get("target_id") in wanted]
+
+    results: list[dict[str, Any]] = []
+    consecutive_auth_failures = 0
+    stopped_early = False
+
+    def _one(target: dict[str, Any]) -> dict[str, Any]:
+        return _fetch_one(target, key=key, ssh_timeout=ssh_timeout, discard_output=True)
+
+    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, 8))) as pool:
+        # Submitted in small waves so the breaker can actually stop the run; a single
+        # bulk submit would have every device in flight before the third rejection.
+        for i in range(0, len(targets), max_workers):
+            if time.monotonic() - start > time_budget:
+                for t in targets[i:]:
+                    results.append({
+                        "target_id": t.get("target_id"),
+                        "host": str(t.get("host") or ""),
+                        "status": "skipped",
+                        "code": "job.budget_exhausted",
+                    })
+                break
+            if consecutive_auth_failures >= 3:
+                stopped_early = True
+                for t in targets[i:]:
+                    results.append({
+                        "target_id": t.get("target_id"),
+                        "host": str(t.get("host") or ""),
+                        "status": "skipped",
+                        "code": "job.stopped_auth_failures",
+                    })
+                break
+
+            wave = list(pool.map(_one, targets[i : i + max_workers]))
+            for entry in wave:
+                if entry.get("stage") == "auth":
+                    consecutive_auth_failures += 1
+                elif entry.get("status") == "ok":
+                    consecutive_auth_failures = 0
+            results.extend(wave)
+
+    passed = sum(1 for r in results if r.get("status") == "ok")
+    return {
+        "tested_at": datetime.now(UTC).isoformat(),
+        "devices": results,
+        "stats": {
+            "targets": len(targets),
+            "passed": passed,
+            "failed": sum(1 for r in results if r.get("status") == "error"),
+            "skipped": sum(1 for r in results if r.get("status") == "skipped"),
+            "elapsed_sec": round(time.monotonic() - start, 2),
+            "stopped_early": stopped_early,
         },
     }
 
