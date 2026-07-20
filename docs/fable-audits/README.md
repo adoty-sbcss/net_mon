@@ -41,28 +41,29 @@ If you act on nothing else, act on these — ranked by field impact:
 ## Remediation ledger
 
 Kept current so the reports stay a WORKLIST, not a museum — check here before
-re-fixing something. Dashboard PRs #127–#132 were built the night of
-**2026-07-19/20** with GitHub Actions billing-blocked, so they carry local-gate
-proof and merge when Actions is restored ("open" below = ready, unmerged).
+re-fixing something. The 2026-07-19/20 night-shift queue (dashboard #127–#133,
+built under the Actions billing block) **all merged + deployed 2026-07-20**;
+collector #51 merged the same day. Remaining open: A1 #9 and the vitest
+skeleton.
 
 | Finding | Status | Where |
 |---|---|---|
-| A1 #1 bundle idempotency (Critical) | **fix open** | dashboard #127 — builtAt-aware re-ingest + mtime-aware re-download, validator-pinned (`ingest:check`) |
+| A1 #1 bundle idempotency (Critical) | **✅ fixed (2026-07-20)** | dashboard #127 — builtAt-aware re-ingest + mtime-aware re-download, validator-pinned (`ingest:check`) |
 | A1 #2 backfill for missed hours | **✅ fixed** | collector `_catch_up_missed_hours` (+ `test_uploader_catchup.py`) |
 | A1 #3 perf results lost on failed POST | **✅ fixed** | collector result spool + drain (`test_result_spool.py`) |
-| A1 #4 perf invisible to AI | **partial** | `throughput_history` (speedtest+iperf) + `wifi_experience` (webperf) shipped; `latency_results` + `uplink_samples` still unexposed |
-| A1 #5 revoked token never self-heals | **fix open** | collector [#51](https://github.com/adoty-sbcss/net_mon/pull/51) — 3×401 → clear file token + re-enroll; enroll-refusal backoff. Deliberately NOT self-merged (enroll path → fleet) |
-| A1 #6 / A3 §D `saveSensorConfigAction` replace-not-merge | **fix open** | dashboard #129 — merges like its siblings (still dead code, now defused) |
-| A1 #7 out-of-order ingest (uplink drop, survey regress) | **fix open** | dashboard #127 — hour-order sort + survey generated_at guard |
-| A1 #8 commands stuck `sent` / `scheduled` coerced | **fix open** | dashboard #132 — `scheduled`+`expired` states, route honesty, 24h maintenance sweep |
+| A1 #4 perf invisible to AI | **✅ fixed (2026-07-20)** | `throughput_history` (speedtest+iperf, + gateway latency, WAN-uplink daily utilization, committed-rate comparison — dashboard #133) + `wifi_experience` (webperf) |
+| A1 #5 revoked token never self-heals | **✅ fixed (2026-07-20)** | collector [#51](https://github.com/adoty-sbcss/net_mon/pull/51) merged (8c4357a0) — 3×401 → clear file token + re-enroll; enroll-refusal backoff; reaches the fleet on the nightly auto-update |
+| A1 #6 / A3 §D `saveSensorConfigAction` replace-not-merge | **✅ fixed (2026-07-20)** | dashboard #129 — merges like its siblings (still dead code, now defused) |
+| A1 #7 out-of-order ingest (uplink drop, survey regress) | **✅ fixed (2026-07-20)** | dashboard #127 — hour-order sort + survey generated_at guard |
+| A1 #8 commands stuck `sent` / `scheduled` coerced | **✅ fixed (2026-07-20)** | dashboard #132 — `scheduled`+`expired` states, route honesty, 24h maintenance sweep |
 | A1 #9 pre-identity boxes | open | unchanged |
 | A1 #10 corrupt artifacts swallowed | **✅ fixed** | dashboard F-DASH-8 (`parseErrors` → durable `parse_error` + loud log) |
 | A2 #1/#2 bicep env-wipe + AUTH_SECRET rotation | **✅ fixed (2026-07-02/03)** | `env:check` drift validator (dashboard #29) + the FULL bicep reconciliation: dashboard #31 (8 out-of-band env + 3 KV secret refs into the web app; AUTH_SECRET/DATABASE_URL can no longer rotate on apply), #32/#33 (job/CAE field reconcile) — all `az what-if`-verified; see `infra/WHATIF.md`. A full apply is now a no-op modulo documented benign what-if artifacts |
-| A2 #3/#6 deploy.yml has no gate | **fix open** | dashboard #128 — pre-deploy `check` job + `needs:` + deploy concurrency queue |
-| A3 gap 1 sensor fleet health invisible to AI | **fix open** | dashboard #130 — `sensor_health` tool (same flags as /sensors page) + prompt routing |
-| A3 gap 5 check-in drops 5 config keys | **fix open** | dashboard #129 — whole `currentConfig` persisted verbatim (`reported_config` jsonb) + shown on the sensor page |
+| A2 #3/#6 deploy.yml has no gate | **✅ fixed (2026-07-20)** | #128's substance landed via the Actions-consumption work: ci.yml runs tsc + `next build`; deploy.yml has a pre-deploy `check` job (`needs:`) + the `deploy-prod` concurrency queue |
+| A3 gap 1 sensor fleet health invisible to AI | **✅ fixed (2026-07-20)** | dashboard #130 — `sensor_health` tool (same flags as /sensors page) + prompt routing |
+| A3 gap 5 check-in drops 5 config keys | **✅ fixed (2026-07-20)** | dashboard #129 — whole `currentConfig` persisted verbatim (`reported_config` jsonb) + shown on the sensor page |
 | A4 collector pytest harness | **✅ done** | `collector/tests/` (13 files, incl. #15 self-heal tests shipping with A1 #5) + CI |
-| A4 dashboard harness | **partial** | tsx-validator idiom extended (`ingest:check`, `env:check`) + tsc/`next build` CI gates in #128; vitest skeleton still open |
+| A4 dashboard harness | **partial** | tsx-validator idiom extended (`ingest:check`, `env:check`) + tsc/`next build` CI gates live in ci.yml; vitest skeleton still open |
 
 **Cross-cutting themes:** (a) *silent-because-swallowed* — `_post` and several ingest paths log-and-continue, so failures never surface (A1 #3, #10); (b) *shipped-but-unconsumed* — perf data, traffic stats, `inventory.json`, reported topology config are collected but dropped before AI/DB (A3); (c) *no safety net* — no tests, no post-deploy healthcheck, a no-op DB rollback (A2 #3/#5, A4). Recurring root cause: green checks that verify a *different* condition than the one that matters.
 
