@@ -57,7 +57,7 @@ proof and merge when Actions is restored ("open" below = ready, unmerged).
 | A1 #8 commands stuck `sent` / `scheduled` coerced | **fix open** | dashboard #132 — `scheduled`+`expired` states, route honesty, 24h maintenance sweep |
 | A1 #9 pre-identity boxes | open | unchanged |
 | A1 #10 corrupt artifacts swallowed | **✅ fixed** | dashboard F-DASH-8 (`parseErrors` → durable `parse_error` + loud log) |
-| A2 #1 bicep env-wipe class | **guarded, not reconciled** | `env:check` drift validator + baseline shipped; the bicep reconciliation itself still open — deliberately left for an ATTENDED session (unverifiable-without-apply edits to the highest-blast-radius file are a mine, not progress) |
+| A2 #1/#2 bicep env-wipe + AUTH_SECRET rotation | **✅ fixed (2026-07-02/03)** | `env:check` drift validator (dashboard #29) + the FULL bicep reconciliation: dashboard #31 (8 out-of-band env + 3 KV secret refs into the web app; AUTH_SECRET/DATABASE_URL can no longer rotate on apply), #32/#33 (job/CAE field reconcile) — all `az what-if`-verified; see `infra/WHATIF.md`. A full apply is now a no-op modulo documented benign what-if artifacts |
 | A2 #3/#6 deploy.yml has no gate | **fix open** | dashboard #128 — pre-deploy `check` job + `needs:` + deploy concurrency queue |
 | A3 gap 1 sensor fleet health invisible to AI | **fix open** | dashboard #130 — `sensor_health` tool (same flags as /sensors page) + prompt routing |
 | A3 gap 5 check-in drops 5 config keys | **fix open** | dashboard #129 — whole `currentConfig` persisted verbatim (`reported_config` jsonb) + shown on the sensor page |
