@@ -31,14 +31,14 @@ def host_discovery(cidr: str, timeout: int = 120) -> list[dict[str, Any]]:
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     except FileNotFoundError:
-        log.warning("nmap not found")
-        return []
+        raise RuntimeError("nmap executable not found") from None
     except subprocess.TimeoutExpired:
-        log.warning("nmap timed out", cidr=cidr)
-        return []
+        raise RuntimeError(f"nmap timed out scanning {cidr}") from None
     if out.returncode != 0:
-        log.warning("nmap failed", stderr=out.stderr.strip())
-        return []
+        raise RuntimeError(
+            f"nmap failed scanning {cidr} (rc={out.returncode}): "
+            f"{(out.stderr or '').strip()[:500]}"
+        )
     return _parse_xml(out.stdout)
 
 
@@ -48,8 +48,7 @@ def _parse_xml(xml_text: str) -> list[dict[str, Any]]:
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as exc:
-        log.warning("nmap XML parse failed", error=str(exc))
-        return []
+        raise RuntimeError(f"nmap returned invalid XML: {exc}") from exc
     results: list[dict[str, Any]] = []
     for host in root.findall("host"):
         status = host.find("status")

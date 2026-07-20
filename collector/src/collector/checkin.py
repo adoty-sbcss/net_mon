@@ -178,12 +178,21 @@ def _read_applied_version() -> int | None:
         return None
 
 
+def _write_file_atomic(path: Path, payload: str, mode: int = 0o600) -> None:
+    """Atomically and durably replace one sensor state/config file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / (path.name + ".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    os.fchmod(fd, mode)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(str(tmp), str(path))
+
+
 def _write_applied_version(v: int) -> None:
-    try:
-        APPLIED_VERSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        APPLIED_VERSION_FILE.write_text(str(v))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not persist applied config version", error=str(exc))
+    _write_file_atomic(APPLIED_VERSION_FILE, str(v), 0o644)
 
 
 def _update_env_file(path: Path, mapping: dict[str, str]) -> None:
@@ -218,7 +227,59 @@ def _update_env_file(path: Path, mapping: dict[str, str]) -> None:
     os.replace(str(tmp), str(path))
 
 
+def _bounded_config_int(
+    data: dict, key: str, *, minimum: int, maximum: int
+) -> int:
+    """Parse and validate a dashboard numeric setting before touching disk."""
+    raw = data.get(key)
+    if raw is None or isinstance(raw, bool):
+        raise ValueError(f"{key} must be an integer")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer") from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{key} must be between {minimum} and {maximum}")
+    return value
+
+
+_CONFIG_INT_BOUNDS: dict[str, tuple[int, int]] = {
+    "rescan_interval": (60, 604800),
+    "snmp_topology_max_depth": (1, 32),
+    "snmp_topology_time_budget": (10, 3600),
+    "snmp_topology_interval": (0, 365 * 24 * 3600),
+    "snmp_topology_max_nodes": (1, 10000),
+    "snmp_topology_fanout_cap": (1, 1000),
+    "snmp_poll_max_candidates": (1, 1024),
+    "snmp_poll_time_budget": (10, 3600),
+    "sftp_port": (1, 65535),
+    "iperf_port": (1, 65535),
+    "iperf_schedule_sec": (60, 30 * 24 * 3600),
+    "iperf_duration": (1, 60),
+    "speedtest_schedule_sec": (900, 30 * 24 * 3600),
+    "webperf_schedule_sec": (60, 30 * 24 * 3600),
+    "wifi_join_schedule_sec": (0, 30 * 24 * 3600),
+    "dhcp_intel_interval": (60, 30 * 24 * 3600),
+    "device_config_interval": (300, 365 * 24 * 3600),
+}
+
+
+def _validate_desired_config(data: dict) -> None:
+    """Validate the whole numeric generation before any side file is written."""
+    for key, (minimum, maximum) in _CONFIG_INT_BOUNDS.items():
+        if key in data and data.get(key) is not None:
+            _bounded_config_int(data, key, minimum=minimum, maximum=maximum)
+    if "rescan_interval" in data and data.get("rescan_interval") is not None:
+        requested = _bounded_config_int(
+            data, "rescan_interval", minimum=60, maximum=604800
+        )
+        capture_interval = get_settings().capture_interval
+        if capture_interval and requested <= capture_interval:
+            raise ValueError("rescan_interval must exceed the current capture_interval")
+
+
 def _apply_config(data: dict) -> None:
+    _validate_desired_config(data)
     mapping: dict[str, str] = {}
     if "snmp_communities" in data:
         mapping["NETMON_SNMP_COMMUNITIES"] = str(data.get("snmp_communities") or "")
@@ -228,8 +289,14 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_SNMP_EXTRA_TARGETS"] = str(data.get("snmp_targets") or "")
     if "snmp_exclude" in data:
         mapping["NETMON_SNMP_EXCLUDE"] = str(data.get("snmp_exclude") or "")
-    if data.get("rescan_interval"):
-        mapping["NETMON_RESCAN_INTERVAL"] = str(int(data["rescan_interval"]))
+    if "rescan_interval" in data and data.get("rescan_interval") is not None:
+        rescan_interval = _bounded_config_int(
+            data, "rescan_interval", minimum=60, maximum=604800
+        )
+        capture_interval = get_settings().capture_interval
+        if capture_interval and rescan_interval <= capture_interval:
+            raise ValueError("rescan_interval must exceed the current capture_interval")
+        mapping["NETMON_RESCAN_INTERVAL"] = str(rescan_interval)
     # SNMP topology crawl (pushed from the dashboard so 'spine' / 'full' + tuning
     # are flippable without SSH). scope is validated to the known set; the rest are
     # ints. Mirrors the topology settings in config.py.
@@ -238,16 +305,27 @@ def _apply_config(data: dict) -> None:
     if "snmp_topology_scope" in data:
         scope = str(data.get("snmp_topology_scope") or "full").lower()
         mapping["NETMON_SNMP_TOPOLOGY_SCOPE"] = scope if scope in ("full", "spine") else "full"
-    if data.get("snmp_topology_max_depth"):
-        mapping["NETMON_SNMP_TOPOLOGY_MAX_DEPTH"] = str(int(data["snmp_topology_max_depth"]))
-    if data.get("snmp_topology_time_budget"):
-        mapping["NETMON_SNMP_TOPOLOGY_TIME_BUDGET"] = str(int(data["snmp_topology_time_budget"]))
+    if "snmp_topology_max_depth" in data and data.get("snmp_topology_max_depth") is not None:
+        mapping["NETMON_SNMP_TOPOLOGY_MAX_DEPTH"] = str(_bounded_config_int(
+            data, "snmp_topology_max_depth", minimum=1, maximum=32))
+    if "snmp_topology_time_budget" in data and data.get("snmp_topology_time_budget") is not None:
+        mapping["NETMON_SNMP_TOPOLOGY_TIME_BUDGET"] = str(_bounded_config_int(
+            data, "snmp_topology_time_budget", minimum=10, maximum=3600))
     if "snmp_topology_interval" in data and data.get("snmp_topology_interval") is not None:
-        mapping["NETMON_SNMP_TOPOLOGY_INTERVAL"] = str(int(data["snmp_topology_interval"]))
-    if data.get("snmp_topology_max_nodes"):
-        mapping["NETMON_SNMP_TOPOLOGY_MAX_NODES"] = str(int(data["snmp_topology_max_nodes"]))
-    if data.get("snmp_topology_fanout_cap"):
-        mapping["NETMON_SNMP_TOPOLOGY_FANOUT_CAP"] = str(int(data["snmp_topology_fanout_cap"]))
+        mapping["NETMON_SNMP_TOPOLOGY_INTERVAL"] = str(_bounded_config_int(
+            data, "snmp_topology_interval", minimum=0, maximum=365 * 24 * 3600))
+    if "snmp_topology_max_nodes" in data and data.get("snmp_topology_max_nodes") is not None:
+        mapping["NETMON_SNMP_TOPOLOGY_MAX_NODES"] = str(_bounded_config_int(
+            data, "snmp_topology_max_nodes", minimum=1, maximum=10000))
+    if "snmp_topology_fanout_cap" in data and data.get("snmp_topology_fanout_cap") is not None:
+        mapping["NETMON_SNMP_TOPOLOGY_FANOUT_CAP"] = str(_bounded_config_int(
+            data, "snmp_topology_fanout_cap", minimum=1, maximum=1000))
+    if "snmp_poll_max_candidates" in data and data.get("snmp_poll_max_candidates") is not None:
+        mapping["NETMON_SNMP_POLL_MAX_CANDIDATES"] = str(_bounded_config_int(
+            data, "snmp_poll_max_candidates", minimum=1, maximum=1024))
+    if "snmp_poll_time_budget" in data and data.get("snmp_poll_time_budget") is not None:
+        mapping["NETMON_SNMP_POLL_TIME_BUDGET"] = str(_bounded_config_int(
+            data, "snmp_poll_time_budget", minimum=10, maximum=3600))
     # Release channel (consumed by scripts/auto-update.sh on the host).
     if "update_channel" in data:
         ch = str(data.get("update_channel") or "stable").lower()
@@ -259,8 +337,9 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_SFTP_ENABLED"] = "true" if data.get("sftp_enabled") else "false"
     if "sftp_host" in data:
         mapping["NETMON_SFTP_HOST"] = str(data.get("sftp_host") or "")
-    if data.get("sftp_port"):
-        mapping["NETMON_SFTP_PORT"] = str(int(data["sftp_port"]))
+    if "sftp_port" in data and data.get("sftp_port") is not None:
+        mapping["NETMON_SFTP_PORT"] = str(_bounded_config_int(
+            data, "sftp_port", minimum=1, maximum=65535))
     if "sftp_user" in data:
         mapping["NETMON_SFTP_USER"] = str(data.get("sftp_user") or "")
     if data.get("sftp_password"):  # only overwrite when a value is provided
@@ -276,12 +355,15 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_IPERF_ENABLED"] = "true" if data.get("iperf_enabled") else "false"
     if "iperf_server" in data:
         mapping["NETMON_IPERF_SERVER"] = str(data.get("iperf_server") or "")
-    if data.get("iperf_port"):
-        mapping["NETMON_IPERF_PORT"] = str(int(data["iperf_port"]))
-    if data.get("iperf_schedule_sec"):
-        mapping["NETMON_IPERF_SCHEDULE_SEC"] = str(int(data["iperf_schedule_sec"]))
-    if data.get("iperf_duration"):
-        mapping["NETMON_IPERF_DURATION"] = str(int(data["iperf_duration"]))
+    if "iperf_port" in data and data.get("iperf_port") is not None:
+        mapping["NETMON_IPERF_PORT"] = str(_bounded_config_int(
+            data, "iperf_port", minimum=1, maximum=65535))
+    if "iperf_schedule_sec" in data and data.get("iperf_schedule_sec") is not None:
+        mapping["NETMON_IPERF_SCHEDULE_SEC"] = str(_bounded_config_int(
+            data, "iperf_schedule_sec", minimum=60, maximum=30 * 24 * 3600))
+    if "iperf_duration" in data and data.get("iperf_duration") is not None:
+        mapping["NETMON_IPERF_DURATION"] = str(_bounded_config_int(
+            data, "iperf_duration", minimum=1, maximum=60))
     if "iperf_direction" in data:
         mapping["NETMON_IPERF_DIRECTION"] = str(data.get("iperf_direction") or "down")
     if "iperf_protocol" in data:
@@ -298,8 +380,9 @@ def _apply_config(data: dict) -> None:
     if "speedtest_providers" in data:
         # Cloudflare is the only provider now (Ookla removed); normalize anything.
         mapping["NETMON_SPEEDTEST_PROVIDERS"] = "cloudflare"
-    if data.get("speedtest_schedule_sec"):
-        mapping["NETMON_SPEEDTEST_SCHEDULE_SEC"] = str(int(data["speedtest_schedule_sec"]))
+    if "speedtest_schedule_sec" in data and data.get("speedtest_schedule_sec") is not None:
+        mapping["NETMON_SPEEDTEST_SCHEDULE_SEC"] = str(_bounded_config_int(
+            data, "speedtest_schedule_sec", minimum=900, maximum=30 * 24 * 3600))
     # Latency probes (PERF-4) pushed from the dashboard.
     if "latency_enabled" in data:
         mapping["NETMON_LATENCY_ENABLED"] = "true" if data.get("latency_enabled") else "false"
@@ -309,8 +392,9 @@ def _apply_config(data: dict) -> None:
     # 0644 JSON file (a real list — quotes/slashes don't belong in EnvironmentFile).
     if "webperf_enabled" in data:
         mapping["NETMON_WEBPERF_ENABLED"] = "true" if data.get("webperf_enabled") else "false"
-    if data.get("webperf_schedule_sec"):
-        mapping["NETMON_WEBPERF_SCHEDULE_SEC"] = str(int(data["webperf_schedule_sec"]))
+    if "webperf_schedule_sec" in data and data.get("webperf_schedule_sec") is not None:
+        mapping["NETMON_WEBPERF_SCHEDULE_SEC"] = str(_bounded_config_int(
+            data, "webperf_schedule_sec", minimum=60, maximum=30 * 24 * 3600))
     if "webperf_urls" in data:
         _write_webperf_urls(data.get("webperf_urls") or [])
     # VLAN trunk monitoring config. Writing these only records the desired sub-
@@ -354,7 +438,8 @@ def _apply_config(data: dict) -> None:
         _write_wifi_profiles(data.get("wifi_join_profiles") or [])
     # WIFI-6 unattended scheduler cadence (0 = manual only) + optional quiet hours.
     if "wifi_join_schedule_sec" in data and data.get("wifi_join_schedule_sec") is not None:
-        mapping["NETMON_WIFI_JOIN_SCHEDULE_SEC"] = str(int(data["wifi_join_schedule_sec"]))
+        mapping["NETMON_WIFI_JOIN_SCHEDULE_SEC"] = str(_bounded_config_int(
+            data, "wifi_join_schedule_sec", minimum=0, maximum=30 * 24 * 3600))
     if "wifi_join_quiet" in data:
         mapping["NETMON_WIFI_JOIN_QUIET"] = re.sub(r"[^0-9\-]", "", str(data.get("wifi_join_quiet") or ""))
     # Authoritative DHCP server intelligence (DHCP-2). The enable flag + cadence
@@ -364,8 +449,9 @@ def _apply_config(data: dict) -> None:
     # (the feature stays gated by dhcp_intel_enabled).
     if "dhcp_intel_enabled" in data:
         mapping["NETMON_DHCP_INTEL_ENABLED"] = "true" if data.get("dhcp_intel_enabled") else "false"
-    if data.get("dhcp_intel_interval"):
-        mapping["NETMON_DHCP_INTEL_INTERVAL"] = str(int(data["dhcp_intel_interval"]))
+    if "dhcp_intel_interval" in data and data.get("dhcp_intel_interval") is not None:
+        mapping["NETMON_DHCP_INTEL_INTERVAL"] = str(_bounded_config_int(
+            data, "dhcp_intel_interval", minimum=60, maximum=30 * 24 * 3600))
     if "dhcp_targets" in data:
         _write_dhcp_targets(data.get("dhcp_targets") or [])
     # Network DEVICE config backup (NCM-1). Same shape as DHCP: the enable flag +
@@ -374,8 +460,9 @@ def _apply_config(data: dict) -> None:
     # an empty list clears it (the feature stays gated by device_config_enabled).
     if "device_config_enabled" in data:
         mapping["NETMON_DEVICE_CONFIG_ENABLED"] = "true" if data.get("device_config_enabled") else "false"
-    if data.get("device_config_interval"):
-        mapping["NETMON_DEVICE_CONFIG_INTERVAL"] = str(int(data["device_config_interval"]))
+    if "device_config_interval" in data and data.get("device_config_interval") is not None:
+        mapping["NETMON_DEVICE_CONFIG_INTERVAL"] = str(_bounded_config_int(
+            data, "device_config_interval", minimum=300, maximum=365 * 24 * 3600))
     if "device_config_targets" in data:
         _write_device_config_targets(data.get("device_config_targets") or [])
     if mapping:
@@ -875,11 +962,7 @@ IPERF_SLOT_GRACE_SEC = 45 * 60
 
 def _write_iperf_schedules(schedules: list) -> None:
     """Persist the pushed iperf schedule list to the JSON file the scheduler reads."""
-    try:
-        IPERF_SCHEDULES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        IPERF_SCHEDULES_FILE.write_text(json.dumps(schedules))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not persist iperf schedules", error=str(exc))
+    _write_file_atomic(IPERF_SCHEDULES_FILE, json.dumps(schedules), 0o644)
 
 
 def _write_wifi_profiles(profiles: list) -> None:
@@ -889,16 +972,8 @@ def _write_wifi_profiles(profiles: list) -> None:
     secret (PSK / 802.1X password). Written to a temp created 0600 from the start,
     then atomically renamed, so the secret is never briefly world-readable nor a
     partial write ever seen by the host script."""
-    try:
-        WIFI_PROFILES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(profiles if isinstance(profiles, list) else [])
-        tmp = WIFI_PROFILES_FILE.with_suffix(".json.tmp")
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(payload)
-        os.replace(str(tmp), str(WIFI_PROFILES_FILE))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not persist wifi profiles", error=str(exc))
+    payload = json.dumps(profiles if isinstance(profiles, list) else [])
+    _write_file_atomic(WIFI_PROFILES_FILE, payload)
 
 
 def _write_dhcp_targets(targets: list) -> None:
@@ -908,16 +983,9 @@ def _write_dhcp_targets(targets: list) -> None:
     renamed, so the secret is never briefly world-readable nor a partial write ever
     read. Full-replace, like the Wi-Fi profiles (an empty list clears it)."""
     from .discovery.dhcp_server import TARGETS_FILE
-    try:
-        TARGETS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(targets if isinstance(targets, list) else [])
-        tmp = TARGETS_FILE.with_suffix(".json.tmp")
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(payload)
-        os.replace(str(tmp), str(TARGETS_FILE))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not persist dhcp targets", error=str(exc))
+
+    payload = json.dumps(targets if isinstance(targets, list) else [])
+    _write_file_atomic(TARGETS_FILE, payload)
 
 
 def _write_device_config_targets(targets: list) -> None:
@@ -927,16 +995,9 @@ def _write_device_config_targets(targets: list) -> None:
     the secret is never briefly world-readable nor a partial write ever read.
     Full-replace, like the DHCP targets (an empty list clears it)."""
     from .discovery.device_config import TARGETS_FILE
-    try:
-        TARGETS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(targets if isinstance(targets, list) else [])
-        tmp = TARGETS_FILE.with_suffix(".json.tmp")
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(payload)
-        os.replace(str(tmp), str(TARGETS_FILE))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not persist device config targets", error=str(exc))
+
+    payload = json.dumps(targets if isinstance(targets, list) else [])
+    _write_file_atomic(TARGETS_FILE, payload)
 
 
 def _report_iperf(url: str, token: str | None, res: dict, trigger: str) -> None:
@@ -1195,11 +1256,11 @@ def _report_latency(url: str, token: str | None, results: list[dict], trigger: s
 def _write_webperf_urls(urls: list) -> None:
     """Persist the pushed website list (PERF-5) to the JSON file the prober reads —
     a real list, so it rides a file not the env (cf. _write_iperf_schedules)."""
-    try:
-        WEBPERF_URLS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        WEBPERF_URLS_FILE.write_text(json.dumps(urls if isinstance(urls, list) else []))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not persist webperf urls", error=str(exc))
+    _write_file_atomic(
+        WEBPERF_URLS_FILE,
+        json.dumps(urls if isinstance(urls, list) else []),
+        0o644,
+    )
 
 
 def _load_webperf_urls() -> list[str]:
@@ -1406,9 +1467,10 @@ def run_console_poll() -> int:
             continue
         status, result = _spawn_console_session(cmd.get("args") or {})
         audit("console_poll_command_ran", id=cid, command=name, status=status)
-        _post(
-            f"{url}/api/sensor/result",
+        _post_result(
+            url,
             token,
+            "/api/sensor/result",
             {"commandId": cid, "status": status, "result": result, "configVersion": applied},
         )
     return 0
@@ -1533,9 +1595,10 @@ def run_checkin() -> int:
         else:
             status, result = _run_command(str(name))
         audit("dashboard_command_ran", id=cid, command=name, status=status)
-        _post(
-            f"{url}/api/sensor/result",
+        _post_result(
+            url,
             token,
+            "/api/sensor/result",
             {"commandId": cid, "status": status, "result": result, "configVersion": applied},
         )
 

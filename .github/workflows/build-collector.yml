@@ -1,27 +1,22 @@
 name: Build & publish collector image
 
-# REL-3 Phase 1: build the collector image once in CI and publish it to GHCR, so
-# field boxes can `docker pull` a finished image instead of building the
-# Dockerfile locally (which broke behind school egress filtering — see the Ookla
-# removal). This phase has ZERO box impact: boxes keep building locally until the
-# Phase-2 docker-compose/auto-update cutover. It just starts publishing images.
+# Build the collector once after the main-branch CI workflow passes and publish
+# it to GHCR, so field boxes can pull a finished immutable image instead of
+# building the Dockerfile locally behind school egress filtering.
 #
 # Image: ghcr.io/adoty-sbcss/netmon-collector
-#   :canary       — every push to main (bleeding edge; the 'canary' channel)
-#   :stable       — also every main push for now (the 'stable' channel currently
-#                   tracks origin/main; a gated promotion can replace this later)
-#   :<git-sha>    — immutable per-commit tag (what a pinned 'stable' ref maps to)
+#   :canary/:stable — compatibility aliases for the latest CI-passing main image
+#   :<git-sha>      — immutable tag used by every sensor update channel
 #
 # ONE-TIME after the first successful run: make the GHCR package PUBLIC
 # (github.com → your packages → netmon-collector → Package settings → Change
 # visibility → Public) so field boxes pull with no credentials.
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
-    paths:
-      - "collector/**"
-      - ".github/workflows/build-collector.yml"
   workflow_dispatch: {}
 
 permissions:
@@ -30,13 +25,17 @@ permissions:
 
 env:
   IMAGE: ghcr.io/adoty-sbcss/netmon-collector
+  COMMIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
   build:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ env.COMMIT_SHA }}
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
@@ -58,7 +57,7 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:canary
             ${{ env.IMAGE }}:stable
-            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:${{ env.COMMIT_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
@@ -68,6 +67,6 @@ jobs:
           echo "Pushed:" >> "$GITHUB_STEP_SUMMARY"
           echo "- \`${IMAGE}:canary\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- \`${IMAGE}:stable\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`${IMAGE}:${GITHUB_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${IMAGE}:${COMMIT_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "If this is the first run, make the package PUBLIC in GHCR package settings." >> "$GITHUB_STEP_SUMMARY"

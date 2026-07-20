@@ -10,14 +10,19 @@ import structlog
 
 from .config import get_settings
 from .db import (
+    DbConnection,
     complete_scan_run,
+    connect,
     get_snmp_credentials,
     insert_many,
     insert_scan_run,
+    insert_topology,
     last_dns_probe,
     last_snmp_bulk,
     last_topology_crawl,
     recent_network_scan,
+    try_scan_lock,
+    upsert_inventory_devices,
 )
 from .discovery import arp as arp_mod
 from .discovery import dns_health as dns_mod
@@ -113,6 +118,25 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
     crawl), DNS health, reachability, and mDNS/SSDP. The poller uses it to
     sample DHCP/STP between full scans without paying the full-scan cost.
     """
+    with try_scan_lock() as acquired:
+        if not acquired:
+            log.warning(
+                "scan already running, skipping overlapping trigger",
+                interface=interface,
+                trigger_reason=trigger_reason,
+            )
+            return None
+        return _run_scan_locked(
+            interface=interface,
+            trigger_reason=trigger_reason,
+            force=force,
+            is_primary=is_primary,
+            light=light,
+        )
+
+
+def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
+                     is_primary: bool = False, light: bool = False) -> int | None:
     settings = get_settings()
 
     state = iface_mod.get_one(interface)
@@ -167,6 +191,7 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
     )
 
     error: str | None = None
+    section_errors: dict[str, str] = {}
     try:
         # 1. Counter snapshot pre-capture
         pre_counters = iface_mod.read_counters(state.name)
@@ -215,10 +240,23 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
         if settings.snmp_enabled and snmp_candidates_list:
             include_bulk = force or _snmp_bulk_due(net_id, settings.snmp_bulk_interval)
             try:
-                snmp_results = snmp_mod.poll(snmp_candidates_list, include_bulk=include_bulk)
+                snmp_status: dict[str, Any] = {}
+                snmp_results = snmp_mod.poll(
+                    snmp_candidates_list,
+                    include_bulk=include_bulk,
+                    status=snmp_status,
+                )
                 ctx.raw_outputs["snmp"] = snmp_results
+                ctx.raw_outputs["snmp_status"] = snmp_status
+                if snmp_status.get("truncated"):
+                    section_errors["snmp"] = (
+                        "poll truncated: "
+                        f"attempted={snmp_status.get('attempted')}/"
+                        f"{snmp_status.get('candidates')}"
+                    )
             except Exception as exc:  # pragma: no cover — defensive
                 log.warning("snmp poll failed", error=str(exc))
+                section_errors["snmp"] = str(exc)
 
         # 7b. Optional SNMP topology crawl. Reuses the same candidate IPs as
         # seeds (gateway + LLDP mgmt IPs + network-vendor OUIs) and the same
@@ -253,6 +291,7 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
                          stats=topology.get("stats"))
             except Exception as exc:  # pragma: no cover — defensive
                 log.warning("snmp topology crawl failed", error=str(exc))
+                section_errors["snmp_topology"] = str(exc)
 
         # 7c. DNS health probes. Cheap (~1s of UDP). Run at most once per
         # rescan_interval BOX-WIDE — the resolver path (public list + the box's
@@ -265,6 +304,7 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
                 dns_results = dns_mod.probe_all()
             except Exception as exc:  # pragma: no cover — defensive
                 log.warning("dns probes failed", error=str(exc))
+                section_errors["dns"] = str(exc)
 
         # 7d. Network-device reachability — ping + traceroute + SNMP-response for
         # the infrastructure candidate set. Surfaces which switches are out there
@@ -282,6 +322,7 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
                          ping_ok=sum(1 for r in reachability if r.get("ping_alive")))
             except Exception as exc:  # pragma: no cover — defensive
                 log.warning("reachability probe failed", error=str(exc))
+                section_errors["reachability"] = str(exc)
 
         # 7e. mDNS (Bonjour) + SSDP (UPnP) service discovery. A few small
         # multicast queries surface the service-advertising devices ARP/nmap
@@ -299,22 +340,25 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
                 ctx.raw_outputs["service_discovery"] = services
             except Exception as exc:  # pragma: no cover — defensive
                 log.warning("service discovery failed", error=str(exc))
+                section_errors["service_discovery"] = str(exc)
 
         # 8. Persist everything
-        _persist(
-            ctx,
-            pre_counters=pre_counters,
-            post_counters=post_counters,
-            cap_results=cap_results,
-            lldp_neighbors=lldp_neighbors,
-            arp_results=arp_results,
-            nmap_results=nmap_results,
-            snmp_results=snmp_results,
-            topology=topology,
-            dns_results=dns_results,
-            reachability=reachability,
-            services=services,
-        )
+        with connect() as connection:
+            _persist(
+                ctx,
+                connection=connection,
+                pre_counters=pre_counters,
+                post_counters=post_counters,
+                cap_results=cap_results,
+                lldp_neighbors=lldp_neighbors,
+                arp_results=arp_results,
+                nmap_results=nmap_results,
+                snmp_results=snmp_results,
+                topology=topology,
+                dns_results=dns_results,
+                reachability=reachability,
+                services=services,
+            )
 
     except Exception as exc:
         log.exception("scan failed", scan_id=scan_id, error=str(exc))
@@ -322,12 +366,17 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
         error = str(exc)
     finally:
         duration = int(time.monotonic() - ctx.started_monotonic)
-        complete_scan_run(scan_id, duration_sec=duration, error=error)
+        notes = (
+            json.dumps({"section_errors": section_errors}, sort_keys=True)
+            if section_errors
+            else None
+        )
+        complete_scan_run(scan_id, duration_sec=duration, error=error, notes=notes)
         log.info("scan complete", scan_id=scan_id, duration_sec=duration, error=error)
         audit("scan_completed", scan_id=scan_id, duration_sec=duration,
-              error=error or "none")
+              error=error or "none", section_errors=section_errors)
 
-    return scan_id
+    return scan_id if error is None else None
 
 
 _NETWORK_VENDOR_HINTS = (
@@ -453,9 +502,21 @@ def _probe_reachability(
     )
 
 
+def _counter_delta(
+    before: dict[str, int], after: dict[str, int], key: str
+) -> int | None:
+    """Return a trustworthy monotonic counter delta, otherwise NULL."""
+    before_value = before.get(key)
+    after_value = after.get(key)
+    if before_value is None or after_value is None or after_value < before_value:
+        return None
+    return after_value - before_value
+
+
 def _persist(
     ctx: ScanContext,
     *,
+    connection: DbConnection,
     pre_counters: dict[str, int],
     post_counters: dict[str, int],
     cap_results: tshark_mod.CaptureResult,
@@ -600,29 +661,25 @@ def _persist(
                 }),
             }
 
-    insert_many("devices", list(seen.values()))
+    insert_many("devices", list(seen.values()), connection=connection)
 
     # Persistent MAC-keyed inventory rollup. The per-scan `devices` rows above
     # answer "what did this scan see"; this upsert maintains the durable
     # cross-scan "what devices exist on the networks this box monitors" inventory
-    # that the discovery/security/fleet features build on. Best-effort: a failure
-    # here must not fail the scan or lose the per-scan tables already committed.
+    # that the discovery/security/fleet features build on. It shares the scan's
+    # transaction, so a failure rolls back every per-scan and inventory write.
     if settings.inventory_enabled:
-        try:
-            inv_rows = _inventory_rows(seen.values(), ctx)
-            if inv_rows:
-                from .db import upsert_inventory_devices
-                upserted, new = upsert_inventory_devices(inv_rows)
-                log.info("inventory updated", scan_id=ctx.scan_id,
-                         upserted=upserted, new=new)
-        except Exception as exc:  # pragma: no cover — defensive
-            log.warning("inventory upsert failed", error=str(exc))
+        inv_rows = _inventory_rows(seen.values(), ctx)
+        if inv_rows:
+            upserted, new = upsert_inventory_devices(inv_rows, connection=connection)
+            log.info("inventory updated", scan_id=ctx.scan_id,
+                     upserted=upserted, new=new)
 
     insert_many("neighbors", [
         {**n, "scan_run_id": ctx.scan_id, "extra": "{}",
          "capabilities": n.get("capabilities") or None}
         for n in lldp_neighbors
-    ])
+    ], connection=connection)
 
     insert_many("arp_entries", [
         {
@@ -634,19 +691,19 @@ def _persist(
         }
         for r in arp_results
         if r.get("ip") and r.get("mac")
-    ])
+    ], connection=connection)
 
     insert_many("dhcp_observations", [
         {**d, "scan_run_id": ctx.scan_id} for d in cap_results.dhcp
-    ])
+    ], connection=connection)
 
     insert_many("stp_events", [
         {**s, "scan_run_id": ctx.scan_id} for s in cap_results.stp
-    ])
+    ], connection=connection)
 
     insert_many("snmp_polls", [
         {**p, "scan_run_id": ctx.scan_id} for p in snmp_results
-    ])
+    ], connection=connection)
 
     # Traffic counters delta — a single row covering the capture window.
     bucket = {
@@ -654,26 +711,26 @@ def _persist(
         "interface": ctx.interface,
         "bucket_start": cap_results.started_at,
         "bucket_end": cap_results.completed_at,
-        "rx_packets": post_counters.get("rx_packets", 0) - pre_counters.get("rx_packets", 0),
-        "rx_bytes": post_counters.get("rx_bytes", 0) - pre_counters.get("rx_bytes", 0),
-        "rx_errors": post_counters.get("rx_errors", 0) - pre_counters.get("rx_errors", 0),
-        "rx_dropped": post_counters.get("rx_dropped", 0) - pre_counters.get("rx_dropped", 0),
-        "tx_packets": post_counters.get("tx_packets", 0) - pre_counters.get("tx_packets", 0),
-        "tx_bytes": post_counters.get("tx_bytes", 0) - pre_counters.get("tx_bytes", 0),
+        "rx_packets": _counter_delta(pre_counters, post_counters, "rx_packets"),
+        "rx_bytes": _counter_delta(pre_counters, post_counters, "rx_bytes"),
+        "rx_errors": _counter_delta(pre_counters, post_counters, "rx_errors"),
+        "rx_dropped": _counter_delta(pre_counters, post_counters, "rx_dropped"),
+        "tx_packets": _counter_delta(pre_counters, post_counters, "tx_packets"),
+        "tx_bytes": _counter_delta(pre_counters, post_counters, "tx_bytes"),
         "broadcast_packets": cap_results.broadcast_packets,
         "multicast_packets": cap_results.multicast_packets,
         "tshark_total_packets": cap_results.total_packets,
     }
-    insert_many("traffic_stats", [bucket])
+    insert_many("traffic_stats", [bucket], connection=connection)
 
     # Topology crawl results, if any. Persisted as nodes + edges so they
     # land in the bundle alongside the per-scan tables.
     if topology and (topology.get("nodes") or topology.get("edges")):
-        from .db import insert_topology
         insert_topology(
             ctx.scan_id,
             topology.get("nodes", []),
             topology.get("edges", []),
+            connection=connection,
         )
 
     # DNS health probe rows. Per-(resolver, query_name), recorded as one row
@@ -694,7 +751,7 @@ def _persist(
                 "error": r.error,
             }
             for r in dns_results
-        ])
+        ], connection=connection)
 
     # Network-device reachability rows (ping + traceroute + SNMP-response).
     if reachability:
@@ -714,7 +771,7 @@ def _persist(
                 "traceroute_path": json.dumps(r.get("traceroute_path") or []),
             }
             for r in reachability
-        ])
+        ], connection=connection)
 
     # mDNS/SSDP service-discovery rows (one per responder IP + protocol).
     if services:
@@ -730,7 +787,7 @@ def _persist(
             }
             for s in services
             if s.get("ip")
-        ])
+        ], connection=connection)
 
 
 def _merge_extra(extra: Any, add: dict[str, Any]) -> str:

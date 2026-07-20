@@ -128,7 +128,21 @@ _SKIP_MARKERS = (
 # ---------------------------------------------------------------------------
 
 
-def poll(candidate_ips: list[str], include_bulk: bool = True) -> list[dict[str, Any]]:
+class _PollBudgetExceeded(Exception):
+    pass
+
+
+def _check_budget(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise _PollBudgetExceeded
+
+
+def poll(
+    candidate_ips: list[str],
+    include_bulk: bool = True,
+    *,
+    status: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Try SNMP against each candidate IP. Returns a flat list of poll rows.
 
     include_bulk=False skips the heavy slow-changing bulk OIDs (BULK_OID_NAMES) —
@@ -142,19 +156,50 @@ def poll(candidate_ips: list[str], include_bulk: bool = True) -> list[dict[str, 
         return []
 
     if shutil.which("snmpget") is None or shutil.which("snmpbulkwalk") is None:
-        log.warning("net-snmp tools not found in container (snmpget/snmpbulkwalk); "
-                    "skipping SNMP — ensure the 'snmp' apt package is installed")
-        return []
+        raise RuntimeError("net-snmp tools not found in container (snmpget/snmpbulkwalk)")
 
+    unique_candidates = list(dict.fromkeys(candidate_ips))
+    candidates = unique_candidates[: settings.snmp_poll_max_candidates]
+    deadline = time.monotonic() + settings.snmp_poll_time_budget
     out: list[dict[str, Any]] = []
-    for ip in candidate_ips:
-        community = _select_community(ip, communities)
-        if community is None:
-            continue
-        out.extend(_poll_oids(ip, community, include_bulk=include_bulk))
+    attempted = 0
+    completed = 0
+    budget_exhausted = False
+    for ip in candidates:
+        try:
+            _check_budget(deadline)
+            attempted += 1
+            community = _select_community(ip, communities, deadline=deadline)
+            if community is not None:
+                out.extend(
+                    _poll_oids(
+                        ip,
+                        community,
+                        include_bulk=include_bulk,
+                        deadline=deadline,
+                    )
+                )
+            completed += 1
+        except _PollBudgetExceeded:
+            budget_exhausted = True
+            break
 
-    log.info("snmp poll complete", candidates=len(candidate_ips), rows=len(out),
-             include_bulk=include_bulk)
+    truncated = len(candidates) < len(unique_candidates) or budget_exhausted
+    if status is not None:
+        status.update(
+            {
+                "candidates": len(unique_candidates),
+                "attempted": attempted,
+                "completed": completed,
+                "candidate_cap": settings.snmp_poll_max_candidates,
+                "time_budget_sec": settings.snmp_poll_time_budget,
+                "truncated": truncated,
+            }
+        )
+
+    log.info("snmp poll complete", candidates=len(unique_candidates), attempted=attempted,
+             completed=completed, rows=len(out), include_bulk=include_bulk,
+             truncated=truncated)
     return out
 
 
@@ -163,7 +208,9 @@ def poll(candidate_ips: list[str], include_bulk: bool = True) -> list[dict[str, 
 # ---------------------------------------------------------------------------
 
 
-def _select_community(ip: str, communities: list[str]) -> str | None:
+def _select_community(
+    ip: str, communities: list[str], *, deadline: float = float("inf")
+) -> str | None:
     """Return a community known to work for `ip`, or None if nothing works."""
     cached = get_snmp_credential(ip)
 
@@ -178,6 +225,7 @@ def _select_community(ip: str, communities: list[str]) -> str | None:
 
     # 1. Cached community first.
     if cached and cached.get("community"):
+        _check_budget(deadline)
         if _probe(ip, cached["community"]):
             log.debug("snmp cache hit", ip=ip)
             record_snmp_success(ip, cached["community"], cached.get("version") or "2c")
@@ -186,6 +234,7 @@ def _select_community(ip: str, communities: list[str]) -> str | None:
 
     # 2. Trial the configured list.
     for community in communities:
+        _check_budget(deadline)
         if cached and community == cached.get("community"):
             continue  # already failed above
         if _probe(ip, community):
@@ -219,9 +268,16 @@ def _probe(ip: str, community: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _poll_oids(ip: str, community: str, include_bulk: bool = True) -> list[dict[str, Any]]:
+def _poll_oids(
+    ip: str,
+    community: str,
+    include_bulk: bool = True,
+    *,
+    deadline: float = float("inf"),
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for name, oid, is_walk in DEFAULT_OIDS:
+        _check_budget(deadline)
         if not include_bulk and name in BULK_OID_NAMES:
             continue  # heavy bulk walk not due this scan
         tool = "snmpbulkwalk" if is_walk else "snmpget"

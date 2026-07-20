@@ -7,19 +7,18 @@
 #
 # Behavior:
 #   1. git fetch — bail clean if remote is unreachable
-#   2. Compare HEAD to origin/main — exit 0 if already up to date
-#   3. Pre-update safety:
+#   2. Resolve the target commit and immutable image for the configured channel
+#   3. Pre-update safety when the target changed:
 #        - pg_dump current DB to /var/lib/netmon/db-snapshots/
-#        - Tag current docker image as netmon/collector:previous
 #        - Save current SHA to /var/lib/netmon/last-known-good-sha
-#   4. git pull --ff-only
-#   5. Rebuild if container code changed
+#   4. Reset the checkout to the resolved target
+#   5. Pull the immutable image (or build it locally as a fallback)
 #   6. docker compose up -d  (applies migrations on collector startup)
-#   7. Post-update healthcheck (wait 2min, run collector selftest)
+#   7. Post-update healthcheck (wait 2min, run the blocking readiness command)
 #   8. On healthcheck failure: invoke scripts/rollback.sh automatically
 #
 # Exit codes:
-#   0 — success or no-op (already up to date) — OR successful auto-rollback
+#   0 — successful reconciliation/update, or successful auto-rollback
 #   1 — recoverable failure (network, git, docker, healthcheck) — try again next run
 #   2 — non-recoverable (working tree dirty, fast-forward not possible)
 
@@ -232,14 +231,13 @@ UPDATE_REF="$(read_env NETMON_UPDATE_REF)"
 case "$UPDATE_CHANNEL" in
     hold)
         log "update channel=hold; skipping auto-update"
-        record_current_sha
         RESULT_STATUS="skipped"; RESULT_REASON="update channel=hold (updates paused)"
         exit 0
         ;;
     canary)
         REMOTE=$(git rev-parse origin/main)
-        IMAGE_TAG="canary"
-        log "update channel=canary -> origin/main ${REMOTE:0:8} (image :canary)"
+        IMAGE_TAG="$REMOTE"
+        log "update channel=canary -> origin/main ${REMOTE:0:8} (immutable image :${REMOTE:0:8})"
         ;;
     stable|"")
         if [[ -n "$UPDATE_REF" ]] && REMOTE=$(git rev-parse --verify "${UPDATE_REF}^{commit}" 2>/dev/null); then
@@ -249,37 +247,26 @@ case "$UPDATE_CHANNEL" in
         else
             [[ -n "$UPDATE_REF" ]] && log "WARN: pinned ref '${UPDATE_REF}' not found after fetch; tracking origin/main"
             REMOTE=$(git rev-parse origin/main)
-            IMAGE_TAG="stable"
-            log "update channel=stable -> origin/main ${REMOTE:0:8} (image :stable)"
+            IMAGE_TAG="$REMOTE"
+            log "update channel=stable -> origin/main ${REMOTE:0:8} (immutable image :${REMOTE:0:8})"
         fi
         ;;
     *)
         REMOTE=$(git rev-parse origin/main)
-        IMAGE_TAG="stable"
-        log "WARN: unknown update channel '${UPDATE_CHANNEL}'; tracking origin/main (image :stable)"
+        IMAGE_TAG="$REMOTE"
+        log "WARN: unknown update channel '${UPDATE_CHANNEL}'; tracking origin/main (immutable image :${REMOTE:0:8})"
         ;;
 esac
 
-# Skip the no-op early-exit when a self-heal re-clone asked for a forced refresh:
-# after a re-clone git is already at HEAD (LOCAL==REMOTE), but the box is still
-# running the OLD image, so we must fall through to pull + recreate.
-if [[ "$LOCAL" == "$REMOTE" && -z "${NETMON_FORCE_REFRESH:-}" ]]; then
-    log "already up to date at ${LOCAL:0:8}"
-    record_current_sha
-    RESULT_STATUS="ok"; RESULT_REASON="already up to date at ${LOCAL:0:8}"
-    # Even when we don't pull, record the current SHA as last-known-good
-    # so manual rollback has a target.
-    if [[ ! -f "$SHA_FILE" ]] || [[ "$(cat "$SHA_FILE")" != "$LOCAL" ]]; then
-        sudo install -d -m 755 /var/lib/netmon
-        echo "$LOCAL" | sudo tee "$SHA_FILE" >/dev/null
-    fi
-    exit 0
+# Reconcile image and container state even when Git is already current. This is
+# what lets the next timer run recover after a prior pull/build/recreate failure.
+TARGET_CHANGED=1
+if [[ "$LOCAL" == "$REMOTE" ]]; then
+    TARGET_CHANGED=0
+    log "source is current at ${LOCAL:0:8}; reconciling image and container state"
+else
+    log "update available: ${LOCAL:0:8} -> ${REMOTE:0:8} (channel=${UPDATE_CHANNEL:-stable})"
 fi
-if [[ -n "${NETMON_FORCE_REFRESH:-}" ]]; then
-    log "post-reclone: forcing an image refresh even though git is current (${LOCAL:0:8})"
-fi
-
-log "update available: ${LOCAL:0:8} -> ${REMOTE:0:8} (channel=${UPDATE_CHANNEL:-stable})"
 
 # 2. Inspect what changed.
 CHANGED=$(git diff --name-only "$LOCAL" "$REMOTE")
@@ -301,12 +288,16 @@ fi
 log "pre-update: saving rollback state"
 
 # 3a. Save current SHA as the rollback target.
-sudo install -d -m 755 /var/lib/netmon
-echo "$LOCAL" | sudo tee "$SHA_FILE" >/dev/null
-log "  saved current SHA $LOCAL as rollback target"
+if [[ "$TARGET_CHANGED" -eq 1 ]]; then
+    sudo install -d -m 755 /var/lib/netmon
+    echo "$LOCAL" | sudo tee "$SHA_FILE" >/dev/null
+    log "  saved current SHA $LOCAL as rollback target"
+else
+    log "  preserving existing rollback target during reconciliation"
+fi
 
 # 3b. pg_dump. Skip silently if the script isn't present (very old clones).
-if [[ -x "$REPO_DIR/scripts/db-snapshot.sh" ]]; then
+if [[ "$TARGET_CHANGED" -eq 1 && -x "$REPO_DIR/scripts/db-snapshot.sh" ]]; then
     log "  taking pre-update DB snapshot"
     if ! "$REPO_DIR/scripts/db-snapshot.sh" 2>&1 | while read -r ln; do log "    $ln"; done; then
         log "WARN: pre-update snapshot failed; rollback will lose any new DB state"
@@ -328,11 +319,7 @@ if ! git reset --hard --quiet "$REMOTE"; then
     exit 2
 fi
 NEW_HEAD=$(git rev-parse HEAD)
-record_current_sha
 log "updated to ${NEW_HEAD:0:8}"
-
-# Select the image tag for compose (stable | canary | <sha>) before pull/up.
-write_image_tag_env "$IMAGE_TAG"
 
 # 4b. Run path migration with the freshly-pulled code.
 log "ensuring canonical paths (and migrating legacy layout if needed)"
@@ -358,16 +345,20 @@ fi
 # build only if the registry is unreachable (e.g. a school that blocks ghcr.io)
 # — the build is reliable again now that the Ookla install was removed.
 log "pulling collector image (ghcr.io/adoty-sbcss/netmon-collector:${IMAGE_TAG})"
-if docker compose pull collector >/dev/null 2>&1; then
+if NETMON_IMAGE_TAG="$IMAGE_TAG" docker compose pull collector >/dev/null 2>&1; then
     log "  image pulled"
 else
     log "WARN: image pull failed (registry unreachable?); building collector locally"
-    if ! docker compose build --pull --quiet collector 2>&1 | while read -r ln; do log "  $ln"; done; then
+    if ! NETMON_IMAGE_TAG="$IMAGE_TAG" docker compose build --pull --quiet collector 2>&1 | while read -r ln; do log "  $ln"; done; then
         log "ERROR: image pull AND local build both failed"
         RESULT_STATUS="failed"; RESULT_REASON="image pull AND local build both failed (registry + build deps unreachable — egress filtering?)"
         exit 1
     fi
 fi
+
+# Persist the target only after the image exists locally. A failed pull/build
+# must not leave future compose invocations pointing at an unavailable image.
+write_image_tag_env "$IMAGE_TAG"
 
 # 6. Bring containers up.
 COMPOSE_ARGS="up -d --remove-orphans"
@@ -390,12 +381,13 @@ if echo "$CHANGED" | grep -q '^db/migrations/'; then
 fi
 
 # 7. Post-update healthcheck. Wait HEALTHCHECK_WAIT_SECONDS for the collector
-# to settle, then run selftest. If it fails, the new release is broken —
+# to settle, then run the blocking readiness command. If it fails, the release is broken —
 # auto-rollback to the saved SHA + :previous image + latest snapshot.
 log "post-update healthcheck: waiting ${HEALTHCHECK_WAIT_SECONDS}s for collector to settle"
 sleep "$HEALTHCHECK_WAIT_SECONDS"
 
-if docker compose exec -T collector python -m collector selftest >/dev/null 2>&1; then
+if docker compose exec -T collector python -m collector healthcheck --verbose >/dev/null 2>&1; then
+    record_current_sha
     log "healthcheck passed; update complete at ${NEW_HEAD:0:8}"
     RESULT_STATUS="ok"; RESULT_REASON="updated ${LOCAL:0:8} -> ${NEW_HEAD:0:8}; healthcheck passed"
     exit 0

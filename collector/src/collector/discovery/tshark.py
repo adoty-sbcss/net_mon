@@ -89,14 +89,13 @@ def run_capture(*, interface: str, seconds: int) -> CaptureResult:
             check=False,
         )
     except FileNotFoundError:
-        log.warning("tshark not found")
-        return CaptureResult(started_at=started_at, completed_at=datetime.now(UTC))
+        raise RuntimeError("tshark executable not found") from None
     except subprocess.TimeoutExpired:
-        log.warning("tshark hard-timeout", seconds=seconds)
-        return CaptureResult(started_at=started_at, completed_at=datetime.now(UTC))
+        raise RuntimeError(f"tshark timed out after {seconds + 30}s") from None
 
     if proc.returncode not in (0, 1):  # 1 means it captured nothing matching
-        log.warning("tshark failed", returncode=proc.returncode, stderr=proc.stderr[:500])
+        detail = (proc.stderr or "").strip()[:500]
+        raise RuntimeError(f"tshark failed (rc={proc.returncode}): {detail}")
 
     result = CaptureResult(started_at=started_at, completed_at=datetime.now(UTC))
     for line in proc.stdout.splitlines():
@@ -109,6 +108,7 @@ def run_capture(*, interface: str, seconds: int) -> CaptureResult:
         layers = (packet.get("layers") or {})
         eth = layers.get("eth", {})
         dst = (_scalar(eth.get("eth_eth_dst")) or "").lower()
+        observed_at = _packet_timestamp(packet, layers)
 
         result.total_packets += 1
         if dst == "ff:ff:ff:ff:ff:ff":
@@ -122,11 +122,13 @@ def run_capture(*, interface: str, seconds: int) -> CaptureResult:
         if isinstance(dhcp_body, dict):
             evt = _parse_dhcp(dhcp_body, eth)
             if evt:
+                evt["seen_at"] = observed_at or started_at
                 result.dhcp.append(evt)
 
         if "stp" in layers:
             evt = _parse_stp(layers["stp"])
             if evt:
+                evt["seen_at"] = observed_at or started_at
                 result.stp.append(evt)
 
         # Bounded evidence: keep the control-plane frames that matter, skip the
@@ -137,6 +139,17 @@ def run_capture(*, interface: str, seconds: int) -> CaptureResult:
             if summary:
                 result.raw.append({"ts": packet.get("timestamp"), "summary": summary})
     return result
+
+
+def _packet_timestamp(packet: dict[str, Any], layers: dict[str, Any]) -> datetime | None:
+    """Parse the frame's capture time from common tshark EK representations."""
+    frame_value = layers.get("frame")
+    frame = frame_value if isinstance(frame_value, dict) else {}
+    raw = packet.get("timestamp") or _scalar(frame.get("frame_frame_time_epoch"))
+    try:
+        return datetime.fromtimestamp(float(raw), UTC)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
 
 
 def _is_multicast(mac: str) -> bool:

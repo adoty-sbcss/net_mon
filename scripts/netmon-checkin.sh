@@ -10,11 +10,26 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
 LOG_TAG="netmon-checkin"
+APPLIED_VERSION_FILE="/var/lib/netmon/applied-config-version"
 log() {
     if command -v logger >/dev/null 2>&1; then
         logger -t "$LOG_TAG" "$*"
     fi
     printf '[%s] %s\n' "$(date -Iseconds)" "$*"
+}
+
+mark_config_pending() {
+    # The collector records the desired version before asking this host wrapper
+    # to recreate it. If recreation fails, remove that acknowledgement so the
+    # next check-in reapplies the config and retries the recreate.
+    if rm -f "$APPLIED_VERSION_FILE" 2>/dev/null; then
+        log "config left pending for retry"
+    elif sudo -n rm -f "$APPLIED_VERSION_FILE" 2>/dev/null; then
+        log "config left pending for retry"
+    else
+        log "ERROR: could not mark config pending after recreate failure"
+        return 1
+    fi
 }
 
 if id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
@@ -43,6 +58,8 @@ if [ "$rc" = "10" ]; then
         log "collector recreated"
     else
         log "collector recreate FAILED"
+        mark_config_pending || true
+        exit 1
     fi
     exit 0
 elif [ "$rc" = "11" ]; then
@@ -56,6 +73,7 @@ elif [ "$rc" = "11" ]; then
         log "collector recreated (any pushed config applied)"
     else
         log "collector recreate FAILED"
+        mark_config_pending || true
     fi
     if systemctl list-unit-files netmon-update.service 2>/dev/null | grep -q netmon-update; then
         if [ "$(id -u)" = "0" ]; then
@@ -86,6 +104,7 @@ elif [ "$rc" = "12" ]; then
         log "collector recreated (any pushed config applied)"
     else
         log "collector recreate FAILED"
+        mark_config_pending || true
     fi
     if [ -x "$REPO_DIR/scripts/host-action.sh" ]; then
         "$REPO_DIR/scripts/host-action.sh" --drain 2>&1 \

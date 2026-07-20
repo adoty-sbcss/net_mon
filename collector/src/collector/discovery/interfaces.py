@@ -67,12 +67,6 @@ def primary_interface() -> str | None:
     return None
 
 
-def _is_vlan_subif(iface: str) -> bool:
-    """True for a VLAN sub-interface name like eth0.10 / enp0s31f6.100."""
-    parent, _, tag = iface.rpartition(".")
-    return bool(parent) and tag.isdigit() and 1 <= int(tag) <= 4094
-
-
 def _default_route_via(iface: str) -> tuple[str | None, str | None]:
     """Find the default gateway IP and MAC for traffic leaving `iface`."""
     routes = _run_ip_json(["ip", "-j", "route", "show", "default"]) or []
@@ -81,15 +75,6 @@ def _default_route_via(iface: str) -> tuple[str | None, str | None]:
         if r.get("dev") == iface and r.get("gateway"):
             gw_ip = r["gateway"]
             break
-    if gw_ip is None and not _is_vlan_subif(iface):
-        # Fall back to the global default for a plain interface with no default
-        # route of its own. NOT for a VLAN monitoring sub-interface (eth0.10):
-        # those run with routes OFF, so borrowing the box's uplink gateway would
-        # mis-attribute every VLAN scan and misdirect its ARP/SNMP/reach probes.
-        for r in routes:
-            if r.get("gateway"):
-                gw_ip = r["gateway"]
-                break
     if not gw_ip:
         return None, None
     gw_mac = _arp_lookup(gw_ip, iface)
@@ -131,7 +116,11 @@ def _run_ip_json(cmd: list[str]) -> list[dict] | None:
 
 
 def read_counters(name: str) -> dict[str, int]:
-    """Read /sys/class/net/<name>/statistics counters as a dict."""
+    """Read available /sys/class/net/<name>/statistics counters as a dict.
+
+    Missing or unreadable counters are omitted so callers do not mistake an I/O
+    failure for a real zero and calculate a negative traffic delta.
+    """
     base = Path(f"/sys/class/net/{name}/statistics")
     if not base.is_dir():
         return {}
@@ -146,5 +135,5 @@ def read_counters(name: str) -> dict[str, int]:
         try:
             out[k] = int(p.read_text().strip())
         except (FileNotFoundError, ValueError, PermissionError):
-            out[k] = 0
+            continue
     return out
