@@ -73,7 +73,16 @@ EXIT_HOST_ACTION = 12
 DEFAULT_DASHBOARD_URL = ""
 
 
-def _post(url: str, token: str | None, body: dict) -> dict | None:
+def _post_status(url: str, token: str | None, body: dict) -> tuple[dict | None, int | None]:
+    """Like _post, but also returns the HTTP status when the server answered.
+
+    (payload, status): payload is the parsed JSON on 2xx else None; status is the
+    HTTP code whenever the server RESPONDED (2xx or an HTTPError like 401/409),
+    and None when the request never completed (DNS/TCP/timeout). The distinction
+    is what the enroll self-heal keys on — a 401 is a fact about our credential,
+    a timeout is a fact about the network, and reacting to the wrong one would
+    wipe a healthy box's token during an outage.
+    """
     data = json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if token:
@@ -82,12 +91,18 @@ def _post(url: str, token: str | None, body: dict) -> dict | None:
     try:
         with urllib.request.urlopen(req, timeout=25) as resp:
             raw = resp.read().decode("utf-8") or "{}"
-            return json.loads(raw)
+            return json.loads(raw), resp.status
     except urllib.error.HTTPError as exc:
         log.warning("checkin http error", status=exc.code, url=url)
+        return None, exc.code
     except Exception as exc:  # noqa: BLE001 — network is best-effort
         log.warning("checkin request failed", error=str(exc), url=url)
-    return None
+        return None, None
+
+
+def _post(url: str, token: str | None, body: dict) -> dict | None:
+    payload, _status = _post_status(url, token, body)
+    return payload
 
 
 # --- Result-delivery spool (Fable audit 01 #3: scheduled perf resilience) ----
@@ -722,6 +737,83 @@ def _current_token(settings) -> str:
         return ""
 
 
+# --- 401 self-heal (Fable audit 01 #5) --------------------------------------
+# A stored token can die while the box is healthy: a superadmin rotates or
+# clears the enrollment (the dashboard's own re-pair flow), a DB restore, or a
+# slug-collision enroll under the old pre-hardening behavior. The box then 401s
+# on every check-in FOREVER — auto-enroll only runs when the token is EMPTY, so
+# a stale token never heals, and every failure is swallowed as a warning. The
+# dashboard's "clear the enrollment to let the box auto-re-pair" flow silently
+# assumed this self-heal existed.
+#
+# On 3 CONSECUTIVE check-in 401s (persisted across runs — check-in is a fresh
+# process each cycle), a FILE-sourced token is deleted so the next cycle
+# auto-enrolls. An ENV-sourced token (NETMON_ENROLL_TOKEN) is never touched:
+# the operator pinned it on purpose, and we log instead. Three-in-a-row is
+# cheap insurance against a one-off middlebox/deploy blip; a real revocation
+# clears in ~3 cycles (~15 min). Clearing the local token cannot enable a
+# hijack — minting is refused server-side while an active enrollment exists.
+CHECKIN_401_COUNT_FILE = Path("/var/lib/netmon/checkin-401-count")
+CHECKIN_401_CLEAR_THRESHOLD = 3
+# After the dashboard REFUSES an enroll (bad key, or 409 already-enrolled), hold
+# off for an hour instead of re-asking every cycle — a 409 needs a superadmin to
+# clear the old enrollment, and hammering it just floods the security-event log.
+# Network failures do NOT back off; retrying an outage next cycle is correct.
+ENROLL_BACKOFF_FILE = Path("/var/lib/netmon/enroll-backoff")
+ENROLL_BACKOFF_SEC = 60 * 60
+
+
+def _read_int_file(path: Path) -> int:
+    try:
+        return int(path.read_text().strip())
+    except Exception:
+        return 0
+
+
+def _write_int_file(path: Path, value: int) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(value))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not persist state file", path=str(path), error=str(exc))
+
+
+def _note_checkin_auth(settings, status: int | None) -> None:
+    """Track consecutive check-in 401s; clear a dead FILE token at the threshold."""
+    if status != 401:
+        # Any answered non-401 (or network failure, status None) breaks the
+        # consecutive-401 evidence. Only touch the fs when there is a count.
+        if _read_int_file(CHECKIN_401_COUNT_FILE) != 0:
+            _write_int_file(CHECKIN_401_COUNT_FILE, 0)
+        return
+    count = _read_int_file(CHECKIN_401_COUNT_FILE) + 1
+    _write_int_file(CHECKIN_401_COUNT_FILE, count)
+    if count < CHECKIN_401_CLEAR_THRESHOLD:
+        log.warning("check-in unauthorized (token revoked?)", consecutive=count)
+        return
+    if settings.enroll_token:
+        # Operator-pinned env token: never delete config we don't own. Loud log —
+        # this box needs a rotated NETMON_ENROLL_TOKEN installed.
+        log.error(
+            "check-in unauthorized %d times in a row with an ENV-provided token — "
+            "NETMON_ENROLL_TOKEN is revoked or wrong; install a rotated token",
+            count,
+        )
+        return
+    try:
+        TOKEN_FILE.unlink(missing_ok=True)
+        _write_int_file(CHECKIN_401_COUNT_FILE, 0)
+        log.error(
+            "stored enroll token rejected %d times in a row — cleared it; will "
+            "auto-re-enroll next cycle (needs the enrollment cleared dashboard-side "
+            "if this box was deliberately revoked)",
+            count,
+        )
+        audit("enroll_token_self_cleared", consecutive_401s=count)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not clear rejected enroll token", error=str(exc))
+
+
 def _auto_enroll(settings, url: str) -> str:
     """Self-register with the shared bootstrap key; return the issued token or ''."""
     if not settings.bootstrap_key:
@@ -730,15 +822,37 @@ def _auto_enroll(settings, url: str) -> str:
     if not (d and s and dev):
         log.warning("auto-enroll skipped: identity slugs (district/school/device) not set")
         return ""
-    resp = _post(
+    import time
+
+    last_refused = _read_int_file(ENROLL_BACKOFF_FILE)
+    if last_refused and time.time() - last_refused < ENROLL_BACKOFF_SEC:
+        log.info("auto-enroll backing off (dashboard refused recently; superadmin action needed)")
+        return ""
+    resp, status = _post_status(
         f"{url}/api/sensor/enroll",
         None,
         {"bootstrapKey": settings.bootstrap_key, "district": d, "school": s, "device": dev},
     )
     token = (resp or {}).get("token") if isinstance(resp, dict) else None
     if not token:
-        log.warning("auto-enroll failed (dashboard refused the bootstrap key or was unreachable)")
+        if status is not None and 400 <= status < 500:
+            # The dashboard ANSWERED and said no (bad key, or 409: identity already
+            # enrolled — someone must clear the old enrollment / install a rotated
+            # token). Asking again every cycle can't succeed and floods the
+            # security log, so hold off for a while.
+            _write_int_file(ENROLL_BACKOFF_FILE, int(time.time()))
+            log.warning(
+                "auto-enroll refused by dashboard",
+                status=status,
+                hint="409 = identity already enrolled; a superadmin must clear it",
+            )
+        else:
+            log.warning("auto-enroll failed (dashboard unreachable); will retry next cycle")
         return ""
+    try:
+        ENROLL_BACKOFF_FILE.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
     _store_token(token)
     log.info("auto-enrolled with dashboard; per-sensor token stored")
     audit("dashboard_auto_enrolled", district=d, school=s, device=dev)
@@ -1321,7 +1435,7 @@ def run_checkin() -> int:
     wait_for_db()
     applied = _read_applied_version()
     local_ip, iface, cidr = _local_net()
-    resp = _post(
+    resp, http_status = _post_status(
         f"{url}/api/sensor/checkin",
         token,
         {
@@ -1363,6 +1477,10 @@ def run_checkin() -> int:
             },
         },
     )
+    # A1 #5: consecutive check-in 401s mean OUR credential is dead (revoked /
+    # rotated dashboard-side) — track them and self-heal a file-sourced token so
+    # the box can auto-re-pair instead of 401ing silently forever.
+    _note_checkin_auth(settings, http_status)
     if resp is None:
         return 1
 
