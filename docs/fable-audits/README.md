@@ -38,6 +38,32 @@ If you act on nothing else, act on these — ranked by field impact:
 3. **[A4 Phase 1] Stand up the test harness (~1 day).** Reuses the codebase's own text-parse drift-guard idiom. Catches, structurally: the proxy.ts build-breaker, un-allowlisted sensor routes, collector↔dashboard contract drift, the bicep env-wipe class, and surfaces two live bugs as red tests. This is the highest-leverage follow-up the whole program points to.
 4. **[A3 gap 1, best AI win] Sensor fleet health is invisible to the AI.** Add a `sensor_health` chat tool + analysis-context block so "which sensors are unhealthy/failed update" can become an insight. Smallest change, on-strategy.
 
+## Remediation ledger
+
+Kept current so the reports stay a WORKLIST, not a museum — check here before
+re-fixing something. Dashboard PRs #127–#132 were built the night of
+**2026-07-19/20** with GitHub Actions billing-blocked, so they carry local-gate
+proof and merge when Actions is restored ("open" below = ready, unmerged).
+
+| Finding | Status | Where |
+|---|---|---|
+| A1 #1 bundle idempotency (Critical) | **fix open** | dashboard #127 — builtAt-aware re-ingest + mtime-aware re-download, validator-pinned (`ingest:check`) |
+| A1 #2 backfill for missed hours | **✅ fixed** | collector `_catch_up_missed_hours` (+ `test_uploader_catchup.py`) |
+| A1 #3 perf results lost on failed POST | **✅ fixed** | collector result spool + drain (`test_result_spool.py`) |
+| A1 #4 perf invisible to AI | **partial** | `throughput_history` (speedtest+iperf) + `wifi_experience` (webperf) shipped; `latency_results` + `uplink_samples` still unexposed |
+| A1 #5 revoked token never self-heals | **fix open** | collector [#51](https://github.com/adoty-sbcss/net_mon/pull/51) — 3×401 → clear file token + re-enroll; enroll-refusal backoff. Deliberately NOT self-merged (enroll path → fleet) |
+| A1 #6 / A3 §D `saveSensorConfigAction` replace-not-merge | **fix open** | dashboard #129 — merges like its siblings (still dead code, now defused) |
+| A1 #7 out-of-order ingest (uplink drop, survey regress) | **fix open** | dashboard #127 — hour-order sort + survey generated_at guard |
+| A1 #8 commands stuck `sent` / `scheduled` coerced | **fix open** | dashboard #132 — `scheduled`+`expired` states, route honesty, 24h maintenance sweep |
+| A1 #9 pre-identity boxes | open | unchanged |
+| A1 #10 corrupt artifacts swallowed | **✅ fixed** | dashboard F-DASH-8 (`parseErrors` → durable `parse_error` + loud log) |
+| A2 #1 bicep env-wipe class | **guarded, not reconciled** | `env:check` drift validator + baseline shipped; the bicep reconciliation itself still open — deliberately left for an ATTENDED session (unverifiable-without-apply edits to the highest-blast-radius file are a mine, not progress) |
+| A2 #3/#6 deploy.yml has no gate | **fix open** | dashboard #128 — pre-deploy `check` job + `needs:` + deploy concurrency queue |
+| A3 gap 1 sensor fleet health invisible to AI | **fix open** | dashboard #130 — `sensor_health` tool (same flags as /sensors page) + prompt routing |
+| A3 gap 5 check-in drops 5 config keys | **fix open** | dashboard #129 — whole `currentConfig` persisted verbatim (`reported_config` jsonb) + shown on the sensor page |
+| A4 collector pytest harness | **✅ done** | `collector/tests/` (13 files, incl. #15 self-heal tests shipping with A1 #5) + CI |
+| A4 dashboard harness | **partial** | tsx-validator idiom extended (`ingest:check`, `env:check`) + tsc/`next build` CI gates in #128; vitest skeleton still open |
+
 **Cross-cutting themes:** (a) *silent-because-swallowed* — `_post` and several ingest paths log-and-continue, so failures never surface (A1 #3, #10); (b) *shipped-but-unconsumed* — perf data, traffic stats, `inventory.json`, reported topology config are collected but dropped before AI/DB (A3); (c) *no safety net* — no tests, no post-deploy healthcheck, a no-op DB rollback (A2 #3/#5, A4). Recurring root cause: green checks that verify a *different* condition than the one that matters.
 
 Two findings were independently re-discovered by more than one audit (the `saveSensorConfigAction` replace-not-merge bug: A1 #6 = A3 §D; the perf→AI gap: A1 #4 ⊂ A3) — corroboration, not duplication.
