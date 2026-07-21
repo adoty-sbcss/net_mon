@@ -1,44 +1,49 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from typing import Any, Self
 
-from pydantic import Field
+import structlog
+from pydantic import Field, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+log = structlog.get_logger(__name__)
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="", env_file=None, extra="ignore")
 
     postgres_host: str = Field(default="127.0.0.1", alias="POSTGRES_HOST")
-    postgres_port: int = Field(default=5432, alias="POSTGRES_PORT")
+    postgres_port: int = Field(default=5432, ge=1, le=65535, alias="POSTGRES_PORT")
     postgres_user: str = Field(default="netmon", alias="POSTGRES_USER")
     postgres_password: str = Field(default="netmon", alias="POSTGRES_PASSWORD")
     postgres_db: str = Field(default="netmon", alias="POSTGRES_DB")
 
     # Passive-capture window length per scan (full OR light): tshark listens
     # this long for DHCP/STP/ARP/broadcast on the scanned interface.
-    capture_seconds: int = Field(default=120, alias="NETMON_CAPTURE_SECONDS")
-    poll_interval: int = Field(default=30, alias="NETMON_POLL_INTERVAL")
+    capture_seconds: int = Field(default=120, ge=1, le=3600, alias="NETMON_CAPTURE_SECONDS")
+    poll_interval: int = Field(default=30, ge=1, le=3600, alias="NETMON_POLL_INTERVAL")
     # The poller re-scans any active interface whose network hasn't been
     # scanned within this window. Covers both link-up (no prior scan) and
     # periodic re-scan of a stable network. Replaces the old field/monitor mode.
-    rescan_interval: int = Field(default=3600, alias="NETMON_RESCAN_INTERVAL")
+    rescan_interval: int = Field(default=3600, ge=60, le=604800, alias="NETMON_RESCAN_INTERVAL")
     # Between full re-scans, run a LIGHT capture-only pass (passive tshark + a
     # quick ARP sweep — no LLDP / nmap / SNMP / reachability / DNS / mDNS)
     # whenever the network hasn't had ANY scan within this window. Lets sporadic
     # DHCP/STP get sampled far more often than the hourly full scan without
     # paying for full discovery each time. Must be < rescan_interval to have any
     # effect; a full scan also resets this clock. 0 disables the light pass.
-    capture_interval: int = Field(default=900, alias="NETMON_CAPTURE_INTERVAL")
+    capture_interval: int = Field(default=900, ge=0, le=604800, alias="NETMON_CAPTURE_INTERVAL")
     # Anti-flap floor only: never scan the same network twice within this many
     # seconds, even if something asks. Much smaller than rescan_interval.
-    cooldown_seconds: int = Field(default=300, alias="NETMON_COOLDOWN_SECONDS")
+    cooldown_seconds: int = Field(default=300, ge=0, le=86400, alias="NETMON_COOLDOWN_SECONDS")
     # Local Postgres retention: delete scan_runs (+ cascaded per-scan tables)
     # older than this many days from the COLLECTOR's OWN db. Bundles upload hourly,
     # so the box only needs recent scans for bundling + the crawl-gate lookups;
     # without this the local db grows unbounded. The durable inventory survives
     # (its scan FK is SET NULL, not CASCADE). 0 disables.
-    local_retention_days: int = Field(default=14, alias="NETMON_LOCAL_RETENTION_DAYS")
+    local_retention_days: int = Field(default=14, ge=0, le=3650, alias="NETMON_LOCAL_RETENTION_DAYS")
     # A much SHORTER window for the heavy topology SNMP rows (db.HEAVY_SNMP_OID_NAMES:
     # dot1dStpPortTable, entPhysical*, ifName/ifTable, dot1dBasePortIfIndex,
     # dot1qTpFdbPort). Measured on a live box, snmp_polls was 13 GB / 45.7M rows =
@@ -48,7 +53,9 @@ class Settings(BaseSettings):
     # ship in the hourly bundle and the dashboard is their durable home, so the box
     # only needs them briefly. Genuine host inventory keeps local_retention_days.
     # Keep this ABOVE snmp_bulk_interval (see db.HEAVY_SNMP_OID_NAMES). 0 disables.
-    snmp_bulk_retention_days: int = Field(default=3, alias="NETMON_SNMP_BULK_RETENTION_DAYS")
+    snmp_bulk_retention_days: int = Field(
+        default=3, ge=0, le=365, alias="NETMON_SNMP_BULK_RETENTION_DAYS"
+    )
     exclude_ifaces: str = Field(
         default="lo,docker0,br-,veth,virbr,tun,tap",
         alias="NETMON_EXCLUDE_IFACES",
@@ -69,6 +76,15 @@ class Settings(BaseSettings):
     # every discovered host so printers / PCs / IoT get classified via SNMP
     # (Printer-MIB, Host-Resources, etc.). Costs a community trial per host.
     snmp_poll_all_hosts: bool = Field(default=False, alias="NETMON_SNMP_POLL_ALL_HOSTS")
+    # Hard bounds for the optional poll-all-hosts mode. The time budget is for
+    # the whole identity/bulk pass; one in-flight net-snmp command may finish
+    # just after it expires, but no new work starts beyond the deadline.
+    snmp_poll_max_candidates: int = Field(
+        default=64, ge=1, le=1024, alias="NETMON_SNMP_POLL_MAX_CANDIDATES"
+    )
+    snmp_poll_time_budget: int = Field(
+        default=120, ge=10, le=3600, alias="NETMON_SNMP_POLL_TIME_BUDGET"
+    )
     # Explicit extra SNMP target IPs beyond the auto-discovered candidate set,
     # pushed from the dashboard equipment registry (devices the operator marked
     # monitor=SNMP) so registered gear is always polled even when the OUI/heuristic
@@ -86,20 +102,28 @@ class Settings(BaseSettings):
     snmp_topology_enabled: bool = Field(default=False, alias="NETMON_SNMP_TOPOLOGY_ENABLED")
     # Max hops from a seed device. 5 covers most school-district fabrics
     # without going wild on internet-facing gear.
-    snmp_topology_max_depth: int = Field(default=5, alias="NETMON_SNMP_TOPOLOGY_MAX_DEPTH")
+    snmp_topology_max_depth: int = Field(
+        default=5, ge=1, le=32, alias="NETMON_SNMP_TOPOLOGY_MAX_DEPTH"
+    )
     # Wall-clock cap per crawl so it can't blow scan duration on a large
     # fabric. Stops cleanly when the budget is reached. Because the crawl is
     # interval-gated (see below) it runs at most ~weekly by default, so we can
     # afford a generous budget to "really crawl" without slowing hourly scans.
-    snmp_topology_time_budget: int = Field(default=300, alias="NETMON_SNMP_TOPOLOGY_TIME_BUDGET")
+    snmp_topology_time_budget: int = Field(
+        default=300, ge=10, le=3600, alias="NETMON_SNMP_TOPOLOGY_TIME_BUDGET"
+    )
     # How often to actually run the crawl, per monitored network. Topology
     # changes slowly (it's physical cabling + switch config), so rediscovering
     # it every hourly scan is wasted compute. Default 7 days; the crawl runs
     # only if the last one for this network was longer ago than this. A manual
     # `./netmon scan` (force=True) always crawls, giving an on-demand override.
     # Set to 0 to crawl on every scan (the old behavior).
-    snmp_topology_interval: int = Field(default=7 * 24 * 3600,
-                                        alias="NETMON_SNMP_TOPOLOGY_INTERVAL")
+    snmp_topology_interval: int = Field(
+        default=7 * 24 * 3600,
+        ge=0,
+        le=365 * 24 * 3600,
+        alias="NETMON_SNMP_TOPOLOGY_INTERVAL",
+    )
     # Crawl SCOPE. 'spine' (default) = directional: from the local switch, follow
     # only the uplink toward the internet (gateway-MAC FDB port -> STP root port ->
     # toward-gateway), so the crawl stops climbing at the L3 edge instead of
@@ -113,8 +137,12 @@ class Settings(BaseSettings):
     # Safety backstops (apply to BOTH scopes): stop enqueuing once this many nodes
     # are known, and never fan out into more than N neighbors from one device — so
     # a 200-port core can't explode the crawl regardless of depth/time.
-    snmp_topology_max_nodes: int = Field(default=600, alias="NETMON_SNMP_TOPOLOGY_MAX_NODES")
-    snmp_topology_fanout_cap: int = Field(default=40, alias="NETMON_SNMP_TOPOLOGY_FANOUT_CAP")
+    snmp_topology_max_nodes: int = Field(
+        default=600, ge=1, le=10000, alias="NETMON_SNMP_TOPOLOGY_MAX_NODES"
+    )
+    snmp_topology_fanout_cap: int = Field(
+        default=40, ge=1, le=1000, alias="NETMON_SNMP_TOPOLOGY_FANOUT_CAP"
+    )
     # How often to walk the HEAVY bulk SNMP OIDs (ifTable, the bridge FDB tables,
     # ipNetToMediaTable). These are large — one row per interface / learned MAC /
     # ARP entry — and change slowly, so walking them every hourly scan wastes
@@ -122,7 +150,9 @@ class Settings(BaseSettings):
     # network (default daily); the small identity/STP/port OIDs are still polled
     # every scan. A manual `./netmon scan` (force=True) always walks them. 0 =
     # every scan (the old behavior).
-    snmp_bulk_interval: int = Field(default=24 * 3600, alias="NETMON_SNMP_BULK_INTERVAL")
+    snmp_bulk_interval: int = Field(
+        default=24 * 3600, ge=0, le=365 * 24 * 3600, alias="NETMON_SNMP_BULK_INTERVAL"
+    )
 
     # Release channel (read by scripts/auto-update.sh; reported at check-in so the
     # dashboard rollout view knows each box's channel). 'stable' (default) tracks
@@ -138,7 +168,7 @@ class Settings(BaseSettings):
     # rather than only nmap's container resolver — which is often public DNS with
     # no internal records. Fills internal hostnames nmap can't.
     rdns_enabled: bool = Field(default=True, alias="NETMON_RDNS_ENABLED")
-    rdns_timeout_sec: int = Field(default=2, alias="NETMON_RDNS_TIMEOUT_SEC")
+    rdns_timeout_sec: int = Field(default=2, ge=1, le=30, alias="NETMON_RDNS_TIMEOUT_SEC")
 
     # --- Persistent device inventory ---
     # Maintain a durable, MAC-keyed inventory across scans (first/last seen,
@@ -157,8 +187,8 @@ class Settings(BaseSettings):
     # and read-only beyond the small query packets; time-bounded by the seconds
     # below so it can't stretch a scan.
     mdns_enabled: bool = Field(default=True, alias="NETMON_MDNS_ENABLED")
-    mdns_seconds: float = Field(default=3.0, alias="NETMON_MDNS_SECONDS")
-    ssdp_seconds: float = Field(default=3.0, alias="NETMON_SSDP_SECONDS")
+    mdns_seconds: float = Field(default=3.0, ge=0.1, le=60, alias="NETMON_MDNS_SECONDS")
+    ssdp_seconds: float = Field(default=3.0, ge=0.1, le=60, alias="NETMON_SSDP_SECONDS")
 
     # --- Network-device reachability (ping + traceroute + SNMP-response) ---
     # Each scan, probe the infrastructure candidate set (gateway + LLDP mgmt IPs
@@ -167,7 +197,9 @@ class Settings(BaseSettings):
     # gracefully if the binary is missing.
     reachability_enabled: bool = Field(default=True, alias="NETMON_REACHABILITY_ENABLED")
     reachability_traceroute: bool = Field(default=True, alias="NETMON_REACHABILITY_TRACEROUTE")
-    reachability_max_hops: int = Field(default=10, alias="NETMON_REACHABILITY_MAX_HOPS")
+    reachability_max_hops: int = Field(
+        default=10, ge=1, le=64, alias="NETMON_REACHABILITY_MAX_HOPS"
+    )
 
     # --- DNS health probes ---
     # Per scan, query each test name against each resolver (public + DHCP).
@@ -183,7 +215,7 @@ class Settings(BaseSettings):
         alias="NETMON_DNS_TEST_NAMES",
     )
     # Per-query timeout (seconds). dig +time=N +tries=1.
-    dns_timeout_sec: int = Field(default=2, alias="NETMON_DNS_TIMEOUT_SEC")
+    dns_timeout_sec: int = Field(default=2, ge=1, le=30, alias="NETMON_DNS_TIMEOUT_SEC")
     # Send a unique nonexistent name per scan to catch resolvers that rewrite
     # NXDOMAIN to an ad/filter page.
     dns_include_nxdomain_probe: bool = Field(
@@ -204,7 +236,9 @@ class Settings(BaseSettings):
     wifi_district_ssids: str = Field(default="", alias="NETMON_WIFI_DISTRICT_SSIDS")
     # Treat the envelope as stale past this age (sec); the bundle still ships it
     # with stale=true so the dashboard can show "as of HH:MM". Default 30 min.
-    wifi_survey_max_age: int = Field(default=1800, alias="NETMON_WIFI_SURVEY_MAX_AGE")
+    wifi_survey_max_age: int = Field(
+        default=1800, ge=60, le=604800, alias="NETMON_WIFI_SURVEY_MAX_AGE"
+    )
 
     # --- Wi-Fi analysis-radio JOIN (WIFI-1) ---
     # Join a spare Wi-Fi NIC to a network so the poller can analyze it like any other
@@ -224,7 +258,9 @@ class Settings(BaseSettings):
     # "START-END" (24h, may wrap midnight, e.g. "22-6") where it won't fire. The host
     # timer + tick (scripts/netmon-wifi-experience-tick.sh) read these from netmon.env;
     # the multi-profile list itself rides WIFI_PROFILES_FILE.
-    wifi_join_schedule_sec: int = Field(default=0, alias="NETMON_WIFI_JOIN_SCHEDULE_SEC")
+    wifi_join_schedule_sec: int = Field(
+        default=0, ge=0, le=30 * 24 * 3600, alias="NETMON_WIFI_JOIN_SCHEDULE_SEC"
+    )
     wifi_join_quiet: str = Field(default="", alias="NETMON_WIFI_JOIN_QUIET")
 
     # --- Authoritative DHCP server intelligence (DHCP-2) ---
@@ -239,27 +275,39 @@ class Settings(BaseSettings):
     dhcp_intel_enabled: bool = Field(default=False, alias="NETMON_DHCP_INTEL_ENABLED")
     # How often to query each server (seconds). Scope config changes slowly, so we
     # don't re-query every poll. Default 1h; a manual `dhcp-intel` run overrides.
-    dhcp_intel_interval: int = Field(default=3600, alias="NETMON_DHCP_INTEL_INTERVAL")
+    dhcp_intel_interval: int = Field(
+        default=3600, ge=60, le=30 * 24 * 3600, alias="NETMON_DHCP_INTEL_INTERVAL"
+    )
     # Wall-clock cap for the whole DHCP pass across all targets, so a slow/unreachable
     # server can't stretch the poll loop.
-    dhcp_intel_time_budget: int = Field(default=120, alias="NETMON_DHCP_INTEL_TIME_BUDGET")
+    dhcp_intel_time_budget: int = Field(
+        default=120, ge=10, le=3600, alias="NETMON_DHCP_INTEL_TIME_BUDGET"
+    )
     # Per-server WinRM operation timeout (seconds).
-    dhcp_intel_winrm_timeout: int = Field(default=30, alias="NETMON_DHCP_INTEL_WINRM_TIMEOUT")
+    dhcp_intel_winrm_timeout: int = Field(
+        default=30, ge=1, le=300, alias="NETMON_DHCP_INTEL_WINRM_TIMEOUT"
+    )
 
     # --- Network DEVICE config backup (NCM-1): fetch running/startup configs over
     #     READ-ONLY SSH from the district's managed devices. OFF by default; the
     #     target list + per-device SSH creds ride a 0600 JSON file (like DHCP). ---
     device_config_enabled: bool = Field(default=False, alias="NETMON_DEVICE_CONFIG_ENABLED")
     # How often to back up each device (seconds). Configs change slowly; default 24h.
-    device_config_interval: int = Field(default=86400, alias="NETMON_DEVICE_CONFIG_INTERVAL")
+    device_config_interval: int = Field(
+        default=86400, ge=300, le=365 * 24 * 3600, alias="NETMON_DEVICE_CONFIG_INTERVAL"
+    )
     # Wall-clock cap for the whole config-backup pass across all devices.
-    device_config_time_budget: int = Field(default=300, alias="NETMON_DEVICE_CONFIG_TIME_BUDGET")
+    device_config_time_budget: int = Field(
+        default=300, ge=10, le=7200, alias="NETMON_DEVICE_CONFIG_TIME_BUDGET"
+    )
     # Per-device SSH connect/read timeout (seconds).
-    device_config_ssh_timeout: int = Field(default=30, alias="NETMON_DEVICE_CONFIG_SSH_TIMEOUT")
+    device_config_ssh_timeout: int = Field(
+        default=30, ge=1, le=300, alias="NETMON_DEVICE_CONFIG_SSH_TIMEOUT"
+    )
 
     sftp_enabled: bool = Field(default=False, alias="NETMON_SFTP_ENABLED")
     sftp_host: str = Field(default="", alias="NETMON_SFTP_HOST")
-    sftp_port: int = Field(default=22, alias="NETMON_SFTP_PORT")
+    sftp_port: int = Field(default=22, ge=1, le=65535, alias="NETMON_SFTP_PORT")
     sftp_user: str = Field(default="", alias="NETMON_SFTP_USER")
     sftp_password: str = Field(default="", alias="NETMON_SFTP_PASSWORD")
     sftp_remote_path: str = Field(default="/", alias="NETMON_SFTP_REMOTE_PATH")
@@ -272,9 +320,11 @@ class Settings(BaseSettings):
     # iperf3 throughput testing (#10). Pushed from the dashboard via desired_config.
     iperf_enabled: bool = Field(default=False, alias="NETMON_IPERF_ENABLED")
     iperf_server: str = Field(default="", alias="NETMON_IPERF_SERVER")
-    iperf_port: int = Field(default=5201, alias="NETMON_IPERF_PORT")
-    iperf_schedule_sec: int = Field(default=3600, alias="NETMON_IPERF_SCHEDULE_SEC")
-    iperf_duration: int = Field(default=10, alias="NETMON_IPERF_DURATION")
+    iperf_port: int = Field(default=5201, ge=1, le=65535, alias="NETMON_IPERF_PORT")
+    iperf_schedule_sec: int = Field(
+        default=3600, ge=60, le=30 * 24 * 3600, alias="NETMON_IPERF_SCHEDULE_SEC"
+    )
+    iperf_duration: int = Field(default=10, ge=1, le=60, alias="NETMON_IPERF_DURATION")
     iperf_direction: str = Field(default="down", alias="NETMON_IPERF_DIRECTION")
     iperf_protocol: str = Field(default="tcp", alias="NETMON_IPERF_PROTOCOL")
     # Timezone the multi-schedule cron times are evaluated in (IANA name). The box
@@ -291,7 +341,9 @@ class Settings(BaseSettings):
     # "cloudflare" by the runner.
     speedtest_providers: str = Field(default="cloudflare", alias="NETMON_SPEEDTEST_PROVIDERS")
     # Default 6h — speed tests consume real bandwidth, so less frequent than iperf.
-    speedtest_schedule_sec: int = Field(default=6 * 3600, alias="NETMON_SPEEDTEST_SCHEDULE_SEC")
+    speedtest_schedule_sec: int = Field(
+        default=6 * 3600, ge=900, le=30 * 24 * 3600, alias="NETMON_SPEEDTEST_SCHEDULE_SEC"
+    )
 
     # Latency / jitter / loss probes (PERF-4). Cheap pings each check-in when on.
     latency_enabled: bool = Field(default=False, alias="NETMON_LATENCY_ENABLED")
@@ -303,7 +355,9 @@ class Settings(BaseSettings):
     # rides a JSON file (checkin.WEBPERF_URLS_FILE), pushed from the dashboard's
     # district-managed website list; run on a cadence (default 15m) like speedtest.
     webperf_enabled: bool = Field(default=False, alias="NETMON_WEBPERF_ENABLED")
-    webperf_schedule_sec: int = Field(default=900, alias="NETMON_WEBPERF_SCHEDULE_SEC")
+    webperf_schedule_sec: int = Field(
+        default=900, ge=60, le=30 * 24 * 3600, alias="NETMON_WEBPERF_SCHEDULE_SEC"
+    )
 
     # Box identity (set by the first-boot wizard; empty on pre-wizard installs).
     # Used to tag scan_runs rows and, in a future phase, to drive the
@@ -325,6 +379,39 @@ class Settings(BaseSettings):
     bootstrap_key: str = Field(default="", alias="NETMON_BOOTSTRAP_KEY")
 
     bundle_dir: Path = Field(default=Path("/var/lib/netmon/bundles"), alias="NETMON_BUNDLE_DIR")
+
+    @model_validator(mode="after")
+    def validate_cadence_relationships(self) -> Self:
+        # The collector's OWN env belongs to the operator; a bad cadence
+        # relationship should degrade gracefully (warn + tolerate), NOT
+        # crash-loop the collector on a value it accepted before these checks
+        # existed. Dashboard-PUSHED config is still hard-rejected upstream
+        # (checkin._validate_desired_config), so this only softens self-config.
+        if self.capture_interval and self.capture_interval >= self.rescan_interval:
+            log.warning(
+                "capture_interval >= rescan_interval; light passes will be ineffective",
+                capture_interval=self.capture_interval,
+                rescan_interval=self.rescan_interval,
+            )
+        if self.capture_interval and self.cooldown_seconds > self.capture_interval:
+            log.warning(
+                "cooldown_seconds > capture_interval; light passes will be skipped "
+                "by the cooldown floor",
+                cooldown_seconds=self.cooldown_seconds,
+                capture_interval=self.capture_interval,
+            )
+        if (
+            self.snmp_bulk_retention_days
+            and self.snmp_bulk_interval
+            and self.snmp_bulk_retention_days * 86400 <= self.snmp_bulk_interval
+        ):
+            log.warning(
+                "snmp_bulk_retention shorter than the bulk poll interval; heavy rows "
+                "may be purged before the next bulk poll",
+                retention_days=self.snmp_bulk_retention_days,
+                bulk_interval=self.snmp_bulk_interval,
+            )
+        return self
 
     @property
     def dsn(self) -> str:
@@ -365,8 +452,57 @@ class Settings(BaseSettings):
 _settings: Settings | None = None
 
 
+def _build_settings() -> Settings:
+    """Construct Settings, clamping any out-of-range env var to its bound.
+
+    The field bounds exist to catch fat-fingered config, but the collector's OWN
+    env must never crash-loop the box on a value that was tolerated before a
+    bound was added — clamp + warn instead, using each field's declared bound as
+    the single source of truth. Dashboard-pushed config is validated separately
+    (hard-reject) in checkin._validate_desired_config, so this does not weaken it.
+    """
+    try:
+        return Settings()
+    except ValidationError:
+        pass  # fall through and clamp the offending value(s)
+
+    overrides: dict[str, Any] = {}
+    for name, field in Settings.model_fields.items():
+        if field.annotation not in (int, float):
+            continue
+        ge = le = None
+        for meta in field.metadata:
+            if getattr(meta, "ge", None) is not None:
+                ge = meta.ge
+            if getattr(meta, "le", None) is not None:
+                le = meta.le
+        if ge is None and le is None:
+            continue
+        key = field.alias or name  # env vars / init kwargs populate by alias
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            continue  # non-numeric env for a numeric field; let Settings() surface it
+        clamped = value
+        if ge is not None and clamped < ge:
+            clamped = ge
+        if le is not None and clamped > le:
+            clamped = le
+        if clamped != value:
+            coerced: Any = int(clamped) if field.annotation is int else clamped
+            overrides[key] = coerced
+            log.warning(
+                "clamped out-of-range setting to its bound",
+                setting=key, given=raw, clamped=coerced, minimum=ge, maximum=le,
+            )
+    return Settings(**overrides)
+
+
 def get_settings() -> Settings:
     global _settings
     if _settings is None:
-        _settings = Settings()
+        _settings = _build_settings()
     return _settings

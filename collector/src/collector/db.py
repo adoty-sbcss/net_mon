@@ -13,10 +13,15 @@ from psycopg.rows import DictRow, dict_row
 from .config import get_settings
 
 log = structlog.get_logger(__name__)
+DbConnection = psycopg.Connection[DictRow]
+
+# One sensor-wide session lock. PostgreSQL releases it automatically if the
+# collector process dies or loses its DB connection.
+_SCAN_LOCK_ID = 0x4E65744D6F6E
 
 
 @contextmanager
-def connect() -> Iterator[psycopg.Connection[DictRow]]:
+def connect() -> Iterator[DbConnection]:
     # row_factory=dict_row makes every cursor yield dict rows (not tuples), so
     # the connection is typed Connection[DictRow]. Without this annotation mypy
     # assumes the default tuple rows and flags every row["col"] access.
@@ -30,6 +35,61 @@ def connect() -> Iterator[psycopg.Connection[DictRow]]:
         raise
     finally:
         conn.close()
+
+
+@contextmanager
+def connection_scope(connection: DbConnection | None = None) -> Iterator[DbConnection]:
+    """Use an existing transaction, or create and own one when omitted."""
+    if connection is not None:
+        yield connection
+        return
+    with connect() as owned_connection:
+        yield owned_connection
+
+
+@contextmanager
+def try_scan_lock() -> Iterator[bool]:
+    """Try to exclude every other scan process for the lifetime of the context."""
+    settings = get_settings()
+    with psycopg.connect(
+        settings.dsn, row_factory=dict_row, autocommit=True
+    ) as connection:
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT pg_try_advisory_lock(%s) AS acquired",
+                (_SCAN_LOCK_ID,),
+            )
+            row = cur.fetchone()
+            acquired = bool(row and row["acquired"])
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                with connection.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s)", (_SCAN_LOCK_ID,))
+
+
+@contextmanager
+def bundle_build_lock(filename: str) -> Iterator[None]:
+    """Serialize query/build/record for one hourly bundle across processes."""
+    settings = get_settings()
+    lock_name = f"netmon-bundle:{filename}"
+    with psycopg.connect(
+        settings.dsn, row_factory=dict_row, autocommit=True
+    ) as connection:
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+                (lock_name,),
+            )
+        try:
+            yield
+        finally:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                    (lock_name,),
+                )
 
 
 def wait_for_db(timeout_seconds: int = 60) -> None:
@@ -110,7 +170,10 @@ def complete_scan_run(
 
 
 def recent_network_scan(
-    network_id: str, within_seconds: int, exclude_capture: bool = False
+    network_id: str,
+    within_seconds: int,
+    exclude_capture: bool = False,
+    require_success: bool = True,
 ) -> dict[str, Any] | None:
     """Most recent scan_runs row for this network inside the window, or None.
 
@@ -120,14 +183,24 @@ def recent_network_scan(
     if those counted toward the (longer) rescan window the full periodic scan
     would be starved forever once light passes are enabled. The light-pass gate
     leaves it False so a full scan still resets the capture clock.
+
+    require_success=True (the freshness/cadence gates) counts only successfully
+    completed scans, so a failed scan doesn't masquerade as fresh data. The
+    anti-flap cooldown floor passes require_success=False so it also counts
+    failed/in-progress attempts — otherwise a persistently failing scan would
+    never count as "recent" and would be retried every poll tick with no backoff.
     """
+    success_filter = (
+        "AND completed_at IS NOT NULL AND error IS NULL" if require_success else ""
+    )
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT id, started_at
                   FROM scan_runs
                  WHERE network_id = %s
+                   {success_filter}
                    AND started_at > NOW() - (%s || ' seconds')::interval
                    AND (NOT %s OR trigger_reason IS DISTINCT FROM 'capture')
                  ORDER BY started_at DESC
@@ -278,6 +351,7 @@ def list_scan_runs_in_window(start, end) -> list[dict[str, Any]]:
                        gateway_ip, mode, duration_sec, error, trigger_reason
                   FROM scan_runs
                  WHERE completed_at IS NOT NULL
+                   AND error IS NULL
                    AND completed_at >= %s
                    AND completed_at <  %s
                  ORDER BY started_at ASC
@@ -531,6 +605,7 @@ def list_completed_scan_times_since(hours: int) -> list[Any]:
                 SELECT completed_at
                   FROM scan_runs
                  WHERE completed_at IS NOT NULL
+                   AND error IS NULL
                    AND completed_at >= NOW() - (%s || ' hours')::interval
                  ORDER BY completed_at ASC
                 """,
@@ -623,11 +698,17 @@ def list_uploaded_bundles_older_than(days: int) -> list[dict[str, Any]]:
             return list(cur.fetchall())
 
 
-def insert_topology(scan_run_id: int, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> None:
+def insert_topology(
+    scan_run_id: int,
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    *,
+    connection: DbConnection | None = None,
+) -> None:
     """Persist topology crawl output. Each node/edge is stamped with scan_run_id."""
     if not nodes and not edges:
         return
-    with connect() as conn:
+    with connection_scope(connection) as conn:
         with conn.cursor() as cur:
             for n in nodes:
                 cur.execute(
@@ -684,7 +765,9 @@ def insert_topology(scan_run_id: int, nodes: list[dict[str, Any]], edges: list[d
 # ---------------------------------------------------------------------------
 
 
-def upsert_inventory_devices(rows: list[dict[str, Any]]) -> tuple[int, int]:
+def upsert_inventory_devices(
+    rows: list[dict[str, Any]], *, connection: DbConnection | None = None
+) -> tuple[int, int]:
     """Upsert this scan's discovered devices into the persistent MAC-keyed
     inventory. Returns (upserted, new) where `new` counts first-time devices.
 
@@ -697,7 +780,7 @@ def upsert_inventory_devices(rows: list[dict[str, Any]]) -> tuple[int, int]:
         return (0, 0)
     upserted = 0
     new = 0
-    with connect() as conn:
+    with connection_scope(connection) as conn:
         with conn.cursor() as cur:
             for r in rows:
                 mac = r.get("mac")
@@ -781,7 +864,12 @@ def inventory_counts() -> dict[str, int]:
             }
 
 
-def insert_many(table: str, rows: list[dict[str, Any]]) -> None:
+def insert_many(
+    table: str,
+    rows: list[dict[str, Any]],
+    *,
+    connection: DbConnection | None = None,
+) -> None:
     """Insert a batch of rows by column-name dict. Table name is whitelisted."""
     if not rows:
         return
@@ -795,7 +883,7 @@ def insert_many(table: str, rows: list[dict[str, Any]]) -> None:
     cols = list(rows[0].keys())
     placeholders = ", ".join(["%s"] * len(cols))
     col_sql = ", ".join(cols)
-    with connect() as conn:
+    with connection_scope(connection) as conn:
         with conn.cursor() as cur:
             cur.executemany(
                 f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})",

@@ -56,14 +56,14 @@ def run(interface: str, timeout: int = 30) -> list[dict[str, Any]]:
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     except FileNotFoundError:
-        log.warning("arp-scan not found")
-        return []
+        raise RuntimeError("arp-scan executable not found") from None
     except subprocess.TimeoutExpired:
-        log.warning("arp-scan timed out", interface=interface)
-        return []
+        raise RuntimeError(f"arp-scan timed out on {interface}") from None
     if out.returncode != 0:
-        log.warning("arp-scan failed", stderr=out.stderr.strip())
-        # Don't return — partial stdout may still be useful.
+        raise RuntimeError(
+            f"arp-scan failed on {interface} (rc={out.returncode}): "
+            f"{(out.stderr or '').strip()[:500]}"
+        )
 
     results: list[dict[str, Any]] = []
     parser = _oui_lookup()

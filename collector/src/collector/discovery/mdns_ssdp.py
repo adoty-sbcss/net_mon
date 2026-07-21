@@ -177,9 +177,14 @@ def _ssdp_search(bind_ip: str, timeout: float) -> list[ServiceRecord]:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-        try:
+        if bind_ip:
+            sock.setsockopt(
+                socket.IPPROTO_IP,
+                socket.IP_MULTICAST_IF,
+                socket.inet_aton(bind_ip),
+            )
             sock.bind((bind_ip, 0))
-        except OSError:
+        else:
             sock.bind(("", 0))
         # UDP is lossy; send the query a few times.
         for _ in range(2):
@@ -208,7 +213,7 @@ def _ssdp_search(bind_ip: str, timeout: float) -> list[ServiceRecord]:
                 prev.device_hint = prev.device_hint or rec.device_hint
                 prev.details.update(rec.details)
     except Exception as exc:  # pragma: no cover — defensive
-        log.warning("ssdp search failed", error=str(exc))
+        raise RuntimeError(f"SSDP discovery failed on {bind_ip or 'all interfaces'}: {exc}") from exc
     finally:
         if sock is not None:
             try:
@@ -402,6 +407,12 @@ def _mdns_browse(bind_ip: str, timeout: float,
             except OSError:
                 pass
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        if bind_ip:
+            sock.setsockopt(
+                socket.IPPROTO_IP,
+                socket.IP_MULTICAST_IF,
+                socket.inet_aton(bind_ip),
+            )
         # Prefer binding 5353 + joining the group so we catch multicast replies
         # (most responders answer to the group, not unicast). Fall back to an
         # ephemeral port with the QU bit if 5353 is taken.
@@ -419,9 +430,14 @@ def _mdns_browse(bind_ip: str, timeout: float,
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-            try:
+            if bind_ip:
+                sock.setsockopt(
+                    socket.IPPROTO_IP,
+                    socket.IP_MULTICAST_IF,
+                    socket.inet_aton(bind_ip),
+                )
                 sock.bind((bind_ip, 0))
-            except OSError:
+            else:
                 sock.bind(("", 0))
             unicast = True
         query = _encode_query(list(service_types), unicast_response=unicast)
@@ -444,7 +460,7 @@ def _mdns_browse(bind_ip: str, timeout: float,
             if recs:
                 by_ip.setdefault(addr[0], []).extend(recs)
     except Exception as exc:  # pragma: no cover — defensive
-        log.warning("mdns browse failed", error=str(exc))
+        raise RuntimeError(f"mDNS discovery failed on {bind_ip or 'all interfaces'}: {exc}") from exc
     finally:
         if sock is not None:
             try:

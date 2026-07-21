@@ -12,6 +12,7 @@ import structlog
 from .bundle import build_hourly_bundle
 from .config import get_settings
 from .db import (
+    bundle_build_lock,
     get_bundle_rows,
     list_completed_scan_times_since,
     list_pending_bundles,
@@ -159,30 +160,33 @@ def _build_hour(window_end: datetime) -> tuple[str, int] | None:
     """
     settings = get_settings()
     window_start = window_end - timedelta(hours=1)
-    runs = list_scan_runs_in_window(window_start, window_end)
-    if not runs:
-        log.info("no scans in this hour, nothing new to bundle",
-                 start=window_start.isoformat(), end=window_end.isoformat())
-        return None
-
-    scan_ids = [int(r["id"]) for r in runs]
     filename = _filename_for(window_end)
-    bundle_path = settings.bundle_dir / filename
-    bundle_path.parent.mkdir(parents=True, exist_ok=True)
-    build_hourly_bundle(
-        scan_ids,
-        bundle_path,
-        device_name=device_name(),
-        window_start=window_start,
-        window_end=window_end,
-    )
-    try:
-        size = bundle_path.stat().st_size
-    except OSError:
-        size = 0
-    record_bundle_built(filename, str(bundle_path), size)
-    audit("bundle_built", filename=filename, size_bytes=size, scans=len(scan_ids))
-    return filename, len(scan_ids)
+    with bundle_build_lock(filename):
+        # The query belongs inside the lock. A builder that waited for another
+        # process must take a fresh snapshot, never overwrite it with an older one.
+        runs = list_scan_runs_in_window(window_start, window_end)
+        if not runs:
+            log.info("no scans in this hour, nothing new to bundle",
+                     start=window_start.isoformat(), end=window_end.isoformat())
+            return None
+
+        scan_ids = [int(r["id"]) for r in runs]
+        bundle_path = settings.bundle_dir / filename
+        bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        build_hourly_bundle(
+            scan_ids,
+            bundle_path,
+            device_name=device_name(),
+            window_start=window_start,
+            window_end=window_end,
+        )
+        try:
+            size = bundle_path.stat().st_size
+        except OSError:
+            size = 0
+        record_bundle_built(filename, str(bundle_path), size)
+        audit("bundle_built", filename=filename, size_bytes=size, scans=len(scan_ids))
+        return filename, len(scan_ids)
 
 
 def _hour_windows_with_scans(now: datetime | None = None) -> list[datetime]:
