@@ -142,14 +142,31 @@ def run_capture(*, interface: str, seconds: int) -> CaptureResult:
 
 
 def _packet_timestamp(packet: dict[str, Any], layers: dict[str, Any]) -> datetime | None:
-    """Parse the frame's capture time from common tshark EK representations."""
+    """Parse the frame's capture time from common tshark EK representations.
+
+    Two fields carry the time and they use DIFFERENT units:
+      * layers.frame.frame_frame_time_epoch — epoch SECONDS (fractional). The
+        authoritative per-frame capture time; prefer it.
+      * the EK envelope's top-level `timestamp` — epoch MILLISECONDS (to match
+        Elasticsearch's epoch_millis). Parsing it as seconds lands ~54,000 years
+        in the future and raises, so it must be divided by 1000.
+    Getting this wrong silently falls back to the scan-start time for every row.
+    """
     frame_value = layers.get("frame")
     frame = frame_value if isinstance(frame_value, dict) else {}
-    raw = packet.get("timestamp") or _scalar(frame.get("frame_frame_time_epoch"))
-    try:
-        return datetime.fromtimestamp(float(raw), UTC)
-    except (TypeError, ValueError, OSError, OverflowError):
-        return None
+    epoch_s = _scalar(frame.get("frame_frame_time_epoch"))
+    if epoch_s is not None:
+        try:
+            return datetime.fromtimestamp(float(epoch_s), UTC)
+        except (TypeError, ValueError, OSError, OverflowError):
+            pass
+    raw_ms = packet.get("timestamp")
+    if raw_ms is not None:
+        try:
+            return datetime.fromtimestamp(float(raw_ms) / 1000.0, UTC)
+        except (TypeError, ValueError, OSError, OverflowError):
+            pass
+    return None
 
 
 def _is_multicast(mac: str) -> bool:

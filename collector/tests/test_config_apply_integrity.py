@@ -79,15 +79,46 @@ def test_host_wrapper_retries_config_after_recreate_failure() -> None:
     "override",
     [
         {"NETMON_POLL_INTERVAL": 0},
-        {"NETMON_CAPTURE_INTERVAL": 900, "NETMON_RESCAN_INTERVAL": 900},
-        {"NETMON_CAPTURE_INTERVAL": 60, "NETMON_COOLDOWN_SECONDS": 61},
         {"NETMON_SNMP_POLL_MAX_CANDIDATES": 0},
         {"NETMON_SFTP_PORT": 70000},
     ],
 )
-def test_runtime_settings_reject_unsafe_numeric_values(override) -> None:
+def test_field_bounds_reject_unsafe_numeric_values(override) -> None:
+    # Per-field bounds still hard-fail at construction. The collector's OWN load
+    # clamps these instead of crashing (test_get_settings_clamps_out_of_range_env);
+    # dashboard-pushed config is hard-rejected upstream (_validate_desired_config).
     with pytest.raises(ValidationError):
         Settings(**override)
+
+
+def test_get_settings_clamps_out_of_range_env_instead_of_crashing(monkeypatch) -> None:
+    # A box whose EXISTING env holds an out-of-bounds value must not crash-loop
+    # the collector — get_settings() clamps to the bound and warns.
+    from collector import config
+
+    monkeypatch.setenv("NETMON_POLL_INTERVAL", "0")               # below ge=1
+    monkeypatch.setenv("NETMON_SNMP_POLL_TIME_BUDGET", "999999")  # above le=3600
+    monkeypatch.setattr(config, "_settings", None)
+
+    settings = config.get_settings()
+
+    assert settings.poll_interval == 1
+    assert settings.snmp_poll_time_budget == 3600
+
+
+def test_get_settings_tolerates_bad_cadence_relationship(monkeypatch) -> None:
+    # A bad cross-field relationship used to raise at load and crash-loop the
+    # collector on a box whose env predated the check; now it warns and loads.
+    from collector import config
+
+    monkeypatch.setenv("NETMON_CAPTURE_INTERVAL", "4000")
+    monkeypatch.setenv("NETMON_RESCAN_INTERVAL", "3600")
+    monkeypatch.setattr(config, "_settings", None)
+
+    settings = config.get_settings()  # must not raise
+
+    assert settings.capture_interval == 4000
+    assert settings.rescan_interval == 3600
 
 
 def test_dashboard_numeric_config_is_rejected_before_write(monkeypatch) -> None:

@@ -170,7 +170,10 @@ def complete_scan_run(
 
 
 def recent_network_scan(
-    network_id: str, within_seconds: int, exclude_capture: bool = False
+    network_id: str,
+    within_seconds: int,
+    exclude_capture: bool = False,
+    require_success: bool = True,
 ) -> dict[str, Any] | None:
     """Most recent scan_runs row for this network inside the window, or None.
 
@@ -180,16 +183,24 @@ def recent_network_scan(
     if those counted toward the (longer) rescan window the full periodic scan
     would be starved forever once light passes are enabled. The light-pass gate
     leaves it False so a full scan still resets the capture clock.
+
+    require_success=True (the freshness/cadence gates) counts only successfully
+    completed scans, so a failed scan doesn't masquerade as fresh data. The
+    anti-flap cooldown floor passes require_success=False so it also counts
+    failed/in-progress attempts — otherwise a persistently failing scan would
+    never count as "recent" and would be retried every poll tick with no backoff.
     """
+    success_filter = (
+        "AND completed_at IS NOT NULL AND error IS NULL" if require_success else ""
+    )
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT id, started_at
                   FROM scan_runs
                  WHERE network_id = %s
-                   AND completed_at IS NOT NULL
-                   AND error IS NULL
+                   {success_filter}
                    AND started_at > NOW() - (%s || ' seconds')::interval
                    AND (NOT %s OR trigger_reason IS DISTINCT FROM 'capture')
                  ORDER BY started_at DESC

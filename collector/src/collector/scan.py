@@ -154,8 +154,15 @@ def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
     # refuse to scan the same network twice within cooldown_seconds. Protects
     # against link flaps and a manual scan colliding with a periodic one.
     # `force=True` (manual `./netmon scan`) bypasses it.
+    #
+    # require_success=False so the floor counts EVERY recent attempt, not just
+    # successful ones. The poller's freshness gate is (correctly) success-only,
+    # so a failed scan is due for retry immediately — but without this floor that
+    # retry would fire every poll tick (~30s) with no backoff, hammering a box
+    # whose scan keeps failing. This bounds the failure retry to once per cooldown.
     if not force and net_id:
-        recent = recent_network_scan(net_id, settings.cooldown_seconds)
+        recent = recent_network_scan(
+            net_id, settings.cooldown_seconds, require_success=False)
         if recent:
             log.info("cooldown active, skipping", network_id=net_id, last_scan=recent["id"])
             return None
@@ -215,13 +222,22 @@ def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
         arp_results = arp_mod.run(state.name)
         ctx.raw_outputs["arp_scan"] = arp_results
 
-        # 6. nmap host discovery (ping sweep only) — skipped on a light pass
+        # 6. nmap host discovery (ping sweep only) — skipped on a light pass.
+        # Enrichment, NOT a required source: ARP + the passive capture already
+        # carry the device list (nmap is even skipped entirely on light passes),
+        # and nmap -sn on a large/filtered subnet is the most timeout-prone step.
+        # So a failure here DEGRADES the scan (section error) rather than failing
+        # it — otherwise one nmap timeout would discard the whole scan (capture,
+        # ARP, SNMP, topology) and ship nothing for that hour.
         cidr = state.primary_cidr
+        nmap_results: list[dict[str, Any]] = []
         if not light and cidr:
-            nmap_results = nmap_mod.host_discovery(cidr)
-            ctx.raw_outputs["nmap"] = nmap_results
-        else:
-            nmap_results = []
+            try:
+                nmap_results = nmap_mod.host_discovery(cidr)
+                ctx.raw_outputs["nmap"] = nmap_results
+            except Exception as exc:
+                log.warning("nmap host discovery failed", error=str(exc))
+                section_errors["nmap"] = str(exc)
 
         # Infrastructure candidate set (gateway + LLDP mgmt IPs + network-vendor
         # OUIs). Reused by SNMP polling, topology seeds, AND the reachability

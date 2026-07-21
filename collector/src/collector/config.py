@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
-from pydantic import Field, model_validator
+import structlog
+from pydantic import Field, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+log = structlog.get_logger(__name__)
 
 
 class Settings(BaseSettings):
@@ -378,16 +382,35 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_cadence_relationships(self) -> Self:
+        # The collector's OWN env belongs to the operator; a bad cadence
+        # relationship should degrade gracefully (warn + tolerate), NOT
+        # crash-loop the collector on a value it accepted before these checks
+        # existed. Dashboard-PUSHED config is still hard-rejected upstream
+        # (checkin._validate_desired_config), so this only softens self-config.
         if self.capture_interval and self.capture_interval >= self.rescan_interval:
-            raise ValueError("capture interval must be lower than rescan interval")
+            log.warning(
+                "capture_interval >= rescan_interval; light passes will be ineffective",
+                capture_interval=self.capture_interval,
+                rescan_interval=self.rescan_interval,
+            )
         if self.capture_interval and self.cooldown_seconds > self.capture_interval:
-            raise ValueError("cooldown must not exceed the light-capture interval")
+            log.warning(
+                "cooldown_seconds > capture_interval; light passes will be skipped "
+                "by the cooldown floor",
+                cooldown_seconds=self.cooldown_seconds,
+                capture_interval=self.capture_interval,
+            )
         if (
             self.snmp_bulk_retention_days
             and self.snmp_bulk_interval
             and self.snmp_bulk_retention_days * 86400 <= self.snmp_bulk_interval
         ):
-            raise ValueError("SNMP bulk retention must exceed the bulk poll interval")
+            log.warning(
+                "snmp_bulk_retention shorter than the bulk poll interval; heavy rows "
+                "may be purged before the next bulk poll",
+                retention_days=self.snmp_bulk_retention_days,
+                bulk_interval=self.snmp_bulk_interval,
+            )
         return self
 
     @property
@@ -429,8 +452,57 @@ class Settings(BaseSettings):
 _settings: Settings | None = None
 
 
+def _build_settings() -> Settings:
+    """Construct Settings, clamping any out-of-range env var to its bound.
+
+    The field bounds exist to catch fat-fingered config, but the collector's OWN
+    env must never crash-loop the box on a value that was tolerated before a
+    bound was added — clamp + warn instead, using each field's declared bound as
+    the single source of truth. Dashboard-pushed config is validated separately
+    (hard-reject) in checkin._validate_desired_config, so this does not weaken it.
+    """
+    try:
+        return Settings()
+    except ValidationError:
+        pass  # fall through and clamp the offending value(s)
+
+    overrides: dict[str, Any] = {}
+    for name, field in Settings.model_fields.items():
+        if field.annotation not in (int, float):
+            continue
+        ge = le = None
+        for meta in field.metadata:
+            if getattr(meta, "ge", None) is not None:
+                ge = meta.ge
+            if getattr(meta, "le", None) is not None:
+                le = meta.le
+        if ge is None and le is None:
+            continue
+        key = field.alias or name  # env vars / init kwargs populate by alias
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            continue  # non-numeric env for a numeric field; let Settings() surface it
+        clamped = value
+        if ge is not None and clamped < ge:
+            clamped = ge
+        if le is not None and clamped > le:
+            clamped = le
+        if clamped != value:
+            coerced: Any = int(clamped) if field.annotation is int else clamped
+            overrides[key] = coerced
+            log.warning(
+                "clamped out-of-range setting to its bound",
+                setting=key, given=raw, clamped=coerced, minimum=ge, maximum=le,
+            )
+    return Settings(**overrides)
+
+
 def get_settings() -> Settings:
     global _settings
     if _settings is None:
-        _settings = Settings()
+        _settings = _build_settings()
     return _settings
