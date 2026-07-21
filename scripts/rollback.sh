@@ -19,6 +19,7 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SNAP_DIR="/var/lib/netmon/db-snapshots"
 SHA_FILE="/var/lib/netmon/last-known-good-sha"
 LATEST_SNAP="$SNAP_DIR/latest.sql.gz"
+ENV_FILE="/etc/netmon/netmon.env"
 
 LOG_TAG="netmon-rollback"
 log() {
@@ -33,6 +34,25 @@ if id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
 else
     DC=(sudo docker compose)
 fi
+
+# Self-heal a root-owned netmon.env before the first compose call (mirrors
+# ensure_env_readable in scripts/auto-update.sh): compose reads the env_file
+# while building its project model, so an unprivileged rollback would fail on
+# `down`/`up` with "permission denied" — i.e. the exact drift that broke the
+# update would break its safety net too. chown never touches the 0600 mode.
+ensure_env_readable() {
+    [[ -e "$ENV_FILE" ]] || return 0    # pre-setup box: nothing to heal
+    [[ -r "$ENV_FILE" ]] && return 0    # already readable: silent no-op
+    local me grp owner
+    me="$(id -un)"; grp="$(id -gn)"; owner="$(stat -c %U "$ENV_FILE" 2>/dev/null || echo '?')"
+    log "env file $ENV_FILE is owned by '$owner' and unreadable by '$me' — docker compose would fail with 'permission denied'. Self-healing."
+    if sudo -n chown "$me:$grp" "$ENV_FILE" 2>/dev/null; then
+        log "self-healed: chowned $ENV_FILE back to $me:$grp (root-owned env drift from a root-run config apply; mode stays 0600)"
+    else
+        log "WARN: could not chown $ENV_FILE (no passwordless sudo). If compose fails with 'permission denied', run:  sudo chown $me:$grp $ENV_FILE"
+    fi
+}
+ensure_env_readable
 
 cd "$REPO_DIR"
 

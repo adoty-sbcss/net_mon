@@ -178,6 +178,49 @@ def _read_applied_version() -> int | None:
         return None
 
 
+def _match_owner_to_parent_dir(path: Path) -> None:
+    """Best-effort: hand a freshly written file to its parent directory's owner.
+
+    The collector runs as root inside the container while /etc/netmon and
+    /var/lib/netmon are host bind mounts owned by the unprivileged service user
+    (lib/paths.sh ensure_paths asserts that ownership on every setup/update).
+    An atomic rewrite creates a brand-new inode owned by the writing process,
+    so a dashboard config push silently flipped netmon.env to root:root 0600 —
+    after which every HOST-side `docker compose` command (compose reads
+    env_file while building its project model, and the update timer runs
+    compose unprivileged) failed with "permission denied". The nightly update
+    failed, its rollback ran compose and failed the same way, and the box
+    stayed down (Monitor1, 2026-07-21, ~1.3 days). Re-owning each write to the
+    directory's owner keeps host-side readers working AND heals a file that
+    already drifted to root — the parent dir still carries the correct owner
+    even when the file lost it.
+
+    Never raises: the write itself must succeed-or-raise atomically (torn-write
+    hardening); ownership is a host-side courtesy layered on top. A collector
+    legitimately running unprivileged just logs the failed chown and moves on.
+    A root-owned parent carries no signal about the intended service user (and
+    actively chowning INTO root is the exact failure mode this prevents), so
+    it is left alone.
+    """
+    chown = getattr(os, "chown", None)
+    if chown is None:  # platform without chown (Windows dev/test boxes)
+        return
+    try:
+        parent_st = os.stat(path.parent)
+        if parent_st.st_uid == 0:
+            return
+        file_st = os.stat(path)
+        if (file_st.st_uid, file_st.st_gid) == (parent_st.st_uid, parent_st.st_gid):
+            return
+        chown(path, parent_st.st_uid, parent_st.st_gid)
+    except OSError as exc:
+        log.warning(
+            "could not match file owner to its directory",
+            path=str(path),
+            error=str(exc),
+        )
+
+
 def _write_file_atomic(path: Path, payload: str, mode: int = 0o600) -> None:
     """Atomically and durably replace one sensor state/config file."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -189,6 +232,7 @@ def _write_file_atomic(path: Path, payload: str, mode: int = 0o600) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(str(tmp), str(path))
+    _match_owner_to_parent_dir(path)
 
 
 def _write_applied_version(v: int) -> None:
@@ -214,17 +258,13 @@ def _update_env_file(path: Path, mapping: dict[str, str]) -> None:
     # SNMP credentials + every NETMON_* setting. A torn write on power loss (these are
     # field boxes) would leave a mangled env that bricks the box's config and can zero
     # NETMON_DASHBOARD_URL, cutting off the remote config-push recovery path (→ truck
-    # roll). Mirror the module's other secret writers: a temp created 0600 from the
-    # start (so the mode never flips) and fsynced before the rename, so a crash can
-    # never leave an empty or partially written env behind.
+    # roll). _write_file_atomic gives the same guarantees as the module's other secret
+    # writers — a temp created 0600 from the start (so the mode never flips) and
+    # fsynced before the rename — and afterwards re-owns the file to the host service
+    # user (the parent dir's owner): a root-owned 0600 netmon.env breaks every
+    # host-side `docker compose` read, which is what kept Monitor1 down for ~1.3 days.
     data = "\n".join(out) + "\n"
-    tmp = path.parent / (path.name + ".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(data)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(str(tmp), str(path))
+    _write_file_atomic(path, data, 0o600)
 
 
 def _bounded_config_int(

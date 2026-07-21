@@ -10,6 +10,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATER = (REPO_ROOT / "scripts" / "auto-update.sh").read_text(encoding="utf-8")
+ROLLBACK = (REPO_ROOT / "scripts" / "rollback.sh").read_text(encoding="utf-8")
+CHECKIN = (REPO_ROOT / "scripts" / "netmon-checkin.sh").read_text(encoding="utf-8")
 BUILD_WORKFLOW = (
     REPO_ROOT / ".github" / "workflows" / "build-collector.yml"
 ).read_text(encoding="utf-8")
@@ -63,3 +65,52 @@ def test_ci_publishes_immutable_image_only_after_main_ci_passes() -> None:
     assert "workflow_run.conclusion == 'success'" in BUILD_WORKFLOW
     assert "github.event.workflow_run.head_sha || github.sha" in BUILD_WORKFLOW
     assert "${{ env.IMAGE }}:${{ env.COMMIT_SHA }}" in BUILD_WORKFLOW
+
+
+def test_updater_self_heals_unreadable_env_before_any_compose_use() -> None:
+    # A root-owned 0600 netmon.env (rewritten by the root collector container on
+    # a config push) makes every unprivileged `docker compose` invocation fail
+    # with "permission denied" — the update fails AND the rollback safety net
+    # fails the same way (Monitor1 was down ~1.3 days). The updater must heal
+    # the file before anything reads the env or parses the compose model.
+    define = UPDATER.index("ensure_env_readable() {")
+    call = UPDATER.index("\nensure_env_readable\n")
+
+    assert call > define
+    assert call < UPDATER.index("read_env NETMON_UPDATE_CHANNEL")
+    assert call < UPDATER.index("db-snapshot.sh")
+    assert call < UPDATER.index("docker compose pull collector")
+    assert call < UPDATER.index("docker compose $COMPOSE_ARGS")
+
+
+def test_env_self_heal_is_passwordless_sudo_and_non_fatal() -> None:
+    body = UPDATER[UPDATER.index("ensure_env_readable() {") :]
+    body = body[: body.index("\n}") + 2]
+
+    # Mirrors ensure_repo_ownership: sudo -n (never prompt on a timer), a loud
+    # actionable WARN on failure, and NEVER a hard exit — compose still gets its
+    # chance and the existing rollback path stays in charge of failures.
+    assert 'sudo -n chown "$me:$grp" "$ENV_FILE"' in body
+    assert "WARN" in body
+    assert "exit" not in body
+    assert body.count("return 0") == 2  # absent env + already-readable env no-op
+
+
+def test_rollback_also_self_heals_unreadable_env_before_compose() -> None:
+    define = ROLLBACK.index("ensure_env_readable() {")
+    call = ROLLBACK.index("\nensure_env_readable\n")
+
+    assert define < call < ROLLBACK.index('"${DC[@]}" down')
+    assert 'sudo -n chown "$me:$grp" "$ENV_FILE"' in ROLLBACK
+
+
+def test_checkin_wrapper_self_heals_unreadable_env_before_compose() -> None:
+    # The config-apply -> recreate path is the drift ORIGIN: the collector
+    # rewrites netmon.env (root-owned) then this wrapper runs compose
+    # unprivileged. Heal before the FIRST compose call (the `ps` probe), else a
+    # drifted box silently reports "collector not running" and skips forever.
+    define = CHECKIN.index("ensure_env_readable() {")
+    call = CHECKIN.index("\nensure_env_readable\n")
+
+    assert define < call < CHECKIN.index('"${DC[@]}" ps')
+    assert 'sudo -n chown "$me:$grp" "$ENV_FILE"' in CHECKIN

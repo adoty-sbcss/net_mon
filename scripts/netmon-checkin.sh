@@ -32,11 +32,34 @@ mark_config_pending() {
     fi
 }
 
+# Self-heal a root-owned netmon.env before ANY compose call (mirrors
+# ensure_env_readable in scripts/auto-update.sh + rollback.sh). This wrapper is
+# the drift ORIGIN: the collector applies a pushed config and — before the
+# collector-side ownership fix in checkin.py — rewrote netmon.env as root:root
+# 0600, then this wrapper's unprivileged `docker compose` (even the `ps` probe
+# below reads env_file while building its project model) failed with
+# "permission denied" — so a drifted box silently reports "collector not
+# running" and skips check-in forever. chown never touches the 0600 mode.
+ENV_FILE="/etc/netmon/netmon.env"
+ensure_env_readable() {
+    [[ -e "$ENV_FILE" ]] || return 0    # pre-setup box: nothing to heal
+    [[ -r "$ENV_FILE" ]] && return 0    # already readable: silent no-op
+    local me grp owner
+    me="$(id -un)"; grp="$(id -gn)"; owner="$(stat -c %U "$ENV_FILE" 2>/dev/null || echo '?')"
+    log "env file $ENV_FILE is owned by '$owner' and unreadable by '$me' — docker compose would fail with 'permission denied'. Self-healing."
+    if sudo -n chown "$me:$grp" "$ENV_FILE" 2>/dev/null; then
+        log "self-healed: chowned $ENV_FILE back to $me:$grp (root-owned env drift from a root-run config apply; mode stays 0600)"
+    else
+        log "WARN: could not chown $ENV_FILE (no passwordless sudo). If compose fails with 'permission denied', run:  sudo chown $me:$grp $ENV_FILE"
+    fi
+}
+
 if id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
     DC=(docker compose)
 else
     DC=(sudo docker compose)
 fi
+ensure_env_readable
 
 if ! "${DC[@]}" ps --status running 2>/dev/null | grep -q netmon-collector; then
     log "collector not running; skipping check-in"

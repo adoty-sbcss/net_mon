@@ -141,6 +141,30 @@ ensure_repo_ownership() {
 }
 ensure_repo_ownership
 
+# The companion self-heal for /etc/netmon/netmon.env: the collector container
+# runs as root with /etc/netmon bind-mounted, and (before the collector-side
+# ownership fix in checkin.py) any dashboard config push rewrote netmon.env as
+# root:root 0600. docker compose reads that env_file while building its project
+# model, so EVERY unprivileged compose command then failed with "permission
+# denied" — the nightly update failed, the pre-update DB snapshot silently
+# skipped, and the rollback path (also compose) failed the same way, leaving
+# the box down until a human logged in (Monitor1 lost ~1.3 days to this).
+# Heal it up front, before anything reads the env or touches compose, exactly
+# like the repo-ownership self-heal above. chown never touches the 0600 mode.
+ensure_env_readable() {
+    [[ -e "$ENV_FILE" ]] || return 0    # pre-setup box: nothing to heal
+    [[ -r "$ENV_FILE" ]] && return 0    # already readable: silent no-op
+    local me grp owner
+    me="$(id -un)"; grp="$(id -gn)"; owner="$(stat -c %U "$ENV_FILE" 2>/dev/null || echo '?')"
+    log "env file $ENV_FILE is owned by '$owner' and unreadable by '$me' — every docker compose command (update AND rollback) would fail with 'permission denied'. Self-healing."
+    if sudo -n chown "$me:$grp" "$ENV_FILE" 2>/dev/null; then
+        log "self-healed: chowned $ENV_FILE back to $me:$grp (root-owned env drift from a root-run config apply; mode stays 0600)"
+    else
+        log "WARN: could not chown $ENV_FILE (no passwordless sudo). docker compose will keep failing with 'permission denied' until an admin runs:  sudo chown $me:$grp $ENV_FILE"
+    fi
+}
+ensure_env_readable
+
 # REL-3/REL-2 last-resort self-heal: if git is wedged by ownership and we couldn't
 # chown (a locked-down box with no passwordless sudo — exactly what stranded a
 # field box on old code), re-clone the repo FRESH to a dir we own and swap it in.
