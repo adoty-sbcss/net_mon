@@ -5,7 +5,7 @@
 #
 # Provides:
 #   - C_OK / C_WARN / C_ERR / C_INFO / C_HEAD / C_DIM / C_OFF  (color codes)
-#   - log / ok / warn / die                                    (stderr-friendly output)
+#   - log / ok / warn / err / die                              (stderr-friendly output)
 #   - SUDO                                                     (empty if root, else "sudo")
 #   - require_linux                                            (fatal if not on Linux)
 
@@ -32,6 +32,7 @@ fi
 log()  { printf '%s==>%s %s\n' "$C_INFO" "$C_OFF" "$*"; }
 ok()   { printf '%s  ok%s %s\n' "$C_OK" "$C_OFF" "$*"; }
 warn() { printf '%s  !!%s %s\n' "$C_WARN" "$C_OFF" "$*" >&2; }
+err()  { printf '%s ERR%s %s\n' "$C_ERR" "$C_OFF" "$*" >&2; }
 die()  { printf '%sFAIL:%s %s\n' "$C_ERR" "$C_OFF" "$*" >&2; exit 1; }
 
 # --- sudo wrapper ---------------------------------------------------------
