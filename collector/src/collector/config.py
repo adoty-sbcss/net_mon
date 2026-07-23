@@ -339,8 +339,10 @@ class Settings(BaseSettings):
     # not an env var, since its quotes/commas don't survive EnvironmentFile parsing.
     iperf_timezone: str = Field(default="America/Los_Angeles", alias="NETMON_IPERF_TIMEZONE")
 
-    # Public internet speed test (PERF-2). Pushed from the dashboard via desired_config.
-    speedtest_enabled: bool = Field(default=False, alias="NETMON_SPEEDTEST_ENABLED")
+    # Public internet speed test (PERF-2). ON by default so every box reports
+    # bandwidth from day one; the schedule below keeps it infrequent (real
+    # bandwidth cost). Set false to opt a sensor out.
+    speedtest_enabled: bool = Field(default=True, alias="NETMON_SPEEDTEST_ENABLED")
     # Provider — Cloudflare only (Ookla removed: unreliable on filtered school
     # networks). Kept as a field for forward-compat; values are normalized to
     # "cloudflare" by the runner.
@@ -350,8 +352,9 @@ class Settings(BaseSettings):
         default=6 * 3600, ge=900, le=30 * 24 * 3600, alias="NETMON_SPEEDTEST_SCHEDULE_SEC"
     )
 
-    # Latency / jitter / loss probes (PERF-4). Cheap pings each check-in when on.
-    latency_enabled: bool = Field(default=False, alias="NETMON_LATENCY_ENABLED")
+    # Latency / jitter / loss probes (PERF-4). Cheap pings each check-in; ON by
+    # default (negligible cost, always-useful signal alongside the speed test).
+    latency_enabled: bool = Field(default=True, alias="NETMON_LATENCY_ENABLED")
     # CSV of internet targets to ping; gateway + DNS resolver are added automatically.
     latency_targets: str = Field(default="1.1.1.1,8.8.8.8", alias="NETMON_LATENCY_TARGETS")
 
