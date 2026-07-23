@@ -228,9 +228,10 @@ class Settings(BaseSettings):
     # scan itself runs HOST-side (scripts/netmon-wifi-survey.sh, on a timer)
     # because the container has no iw/nmcli and NM owns the radio; the collector
     # just reads + normalizes the envelope at /var/lib/netmon/wifi_survey.json and
-    # ships it in the hourly bundle. OFF by default — opt-in per sensor (a box
-    # needs a Wi-Fi NIC and the host timer installed for it to do anything).
-    wifi_survey_enabled: bool = Field(default=False, alias="NETMON_WIFI_SURVEY_ENABLED")
+    # ships it in the hourly bundle. ON by default — the passive survey is safe on a
+    # timer and a box with no Wi-Fi NIC just no-ops (empty envelope). Set false to
+    # opt a sensor out. (The active client-join test, WIFI-6, stays opt-in.)
+    wifi_survey_enabled: bool = Field(default=True, alias="NETMON_WIFI_SURVEY_ENABLED")
     # Comma-separated SSIDs owned by the district — used to flag is_district_ssid
     # (own APs vs. neighbors). Empty => the flag is left unknown (null).
     wifi_district_ssids: str = Field(default="", alias="NETMON_WIFI_DISTRICT_SSIDS")
@@ -311,10 +312,12 @@ class Settings(BaseSettings):
     sftp_user: str = Field(default="", alias="NETMON_SFTP_USER")
     sftp_password: str = Field(default="", alias="NETMON_SFTP_PASSWORD")
     sftp_remote_path: str = Field(default="/", alias="NETMON_SFTP_REMOTE_PATH")
-    # Bundle delivery transport (SFTP->HTTPS migration): "sftp" (paramiko upload
-    # to the depot, today) | "blob" (HTTPS PUT with a dashboard-minted SAS URL).
-    # Pushed from the dashboard via desired-config; inert until flipped to "blob".
-    bundle_transport: str = Field(default="sftp", alias="NETMON_BUNDLE_TRANSPORT")
+    # Bundle delivery transport (SFTP->HTTPS migration): "blob" (HTTPS PUT with a
+    # dashboard-minted SAS URL) | "sftp" (legacy paramiko upload to the depot).
+    # Default "blob": the fleet is blob-only post-cutover and the depot has SFTP
+    # disabled, so a fresh box uploads from first boot without waiting on a
+    # desired-config push. An explicit dashboard push still overrides this.
+    bundle_transport: str = Field(default="blob", alias="NETMON_BUNDLE_TRANSPORT")
     device_name: str = Field(default="", alias="NETMON_DEVICE_NAME")
 
     # iperf3 throughput testing (#10). Pushed from the dashboard via desired_config.
