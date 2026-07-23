@@ -82,7 +82,7 @@ def test_host_wrapper_retries_config_after_recreate_failure() -> None:
     [
         {"NETMON_POLL_INTERVAL": 0},
         {"NETMON_SNMP_POLL_MAX_CANDIDATES": 0},
-        {"NETMON_SFTP_PORT": 70000},
+        {"NETMON_IPERF_PORT": 70000},
     ],
 )
 def test_field_bounds_reject_unsafe_numeric_values(override) -> None:

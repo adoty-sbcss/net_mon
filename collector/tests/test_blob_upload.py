@@ -18,19 +18,21 @@ import pytest
 from collector import blob_upload, uploader
 
 # ---- transport selector (uploader._active_transport) ----
+# Blob is the only transport now: "blob" ships, anything else keeps bundles local.
 
-def test_active_transport_blob_wins_even_if_sftp_off():
-    s = SimpleNamespace(bundle_transport="blob", sftp_enabled=False)
+def test_active_transport_blob_ships():
+    s = SimpleNamespace(bundle_transport="blob")
     assert uploader._active_transport(s) == "blob"
 
 
-def test_active_transport_sftp_when_enabled():
-    s = SimpleNamespace(bundle_transport="sftp", sftp_enabled=True)
-    assert uploader._active_transport(s) == "sftp"
+def test_active_transport_sftp_value_is_now_off():
+    # "sftp" is the pre-install staging value — uploads OFF, no SFTP transport.
+    s = SimpleNamespace(bundle_transport="sftp")
+    assert uploader._active_transport(s) is None
 
 
-def test_active_transport_none_when_nothing_active():
-    s = SimpleNamespace(bundle_transport="sftp", sftp_enabled=False)
+def test_active_transport_none_when_not_blob():
+    s = SimpleNamespace(bundle_transport="")
     assert uploader._active_transport(s) is None
 
 

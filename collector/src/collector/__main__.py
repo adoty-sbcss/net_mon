@@ -35,12 +35,12 @@ def cli() -> None:
 
 @cli.command("run")
 def cmd_run() -> None:
-    """Run the interface poller and the hourly SFTP uploader."""
+    """Run the interface poller and the hourly bundle uploader."""
     settings = get_settings()
     log.info("collector starting",
              rescan_interval=settings.rescan_interval,
              poll_interval=settings.poll_interval,
-             sftp_enabled=settings.sftp_enabled,
+             bundle_transport=settings.bundle_transport,
              device=uploader_mod.device_name())
     wait_for_db()
     # Apply any pending schema migrations BEFORE we start collecting. If a
@@ -53,7 +53,7 @@ def cmd_run() -> None:
     # at boot and resolve once a cable is plugged in.
     selftest_mod.log_results(selftest_mod.run_all())
     audit("collector_started", rescan_interval=settings.rescan_interval,
-          sftp_enabled=settings.sftp_enabled,
+          bundle_transport=settings.bundle_transport,
           device=uploader_mod.device_name())
     uploader_mod.start_in_background()
     run_poller()
@@ -129,48 +129,38 @@ def cmd_bundle(scan_id: int, output: str | None) -> None:
 
 @cli.command("upload-test")
 def cmd_upload_test() -> None:
-    """Test the SFTP connection: connect, authenticate, list the remote path.
+    """Test bundle upload: prove the dashboard mints a SAS URL for this box.
 
-    NOTE: this only proves the *credentials* work — it deliberately bypasses the
-    NETMON_SFTP_ENABLED gate. A box can pass this test yet never actually upload
-    because uploads are disabled. We surface that here so a green test isn't
-    mistaken for "uploads are working".
+    Blob is the only transport. This exercises enrollment + dashboard URL + the
+    /api/sensor/bundle-upload-url route + the proxy allowlist WITHOUT writing a
+    probe blob. A box still in the pre-install staging state (bundle_transport !=
+    blob) reports uploads OFF instead — it isn't installed yet, so nothing ships.
     """
     settings = get_settings()
-    if settings.bundle_transport == "blob":
-        # Blob transport: prove the dashboard mints a SAS for us (exercises
-        # enrollment + dashboard URL + the /api/sensor/bundle-upload-url route +
-        # the proxy allowlist) WITHOUT writing a probe blob.
-        from . import blob_upload
-        slugs = uploader_mod._identity_slugs()
-        if slugs is None:
-            click.echo("FAIL blob transport needs box identity (run: sudo netmon-wizard)")
-            return
-        probe = f"{slugs[2]}_2000_01_01_00.zip"
-        try:
-            target = blob_upload.get_upload_target(probe)
-        except Exception as exc:
-            click.echo(f"FAIL blob mint failed: {exc}")
-            return
-        click.echo("OK   blob mint succeeded — dashboard issued a SAS URL")
-        click.echo(f"  transport:   blob (HTTPS PUT to the depot; expires {target.get('expiresAt')})")
-        click.echo("uploads:       ENABLED (bundle_transport=blob) — bundles ship via HTTPS")
-        return
+    if settings.bundle_transport != "blob":
+        click.echo("uploads:       DISABLED (bundle_transport != blob)")
+        click.echo("  ⚠ This box is in the pre-install staging state, so NO data reaches the")
+        click.echo("    dashboard. Enable uploads from the dashboard to flip it to blob.")
+        sys.exit(2)
 
-    ok, msg = uploader_mod.test_connection()
-    click.echo(("OK   " if ok else "FAIL ") + msg)
-    if ok:
-        settings = get_settings()
-        if settings.sftp_enabled:
-            click.echo("uploads:       ENABLED (NETMON_SFTP_ENABLED=true) — bundles will ship")
-        else:
-            click.echo("uploads:       DISABLED (NETMON_SFTP_ENABLED=false)")
-            click.echo("  ⚠ Credentials work but real uploads are OFF, so NO data reaches the")
-            click.echo("    dashboard. Enable from the dashboard (sensor SFTP settings -> save")
-            click.echo("    with 'Enable' checked) or on the box:")
-            click.echo("      sudo sed -i 's/^NETMON_SFTP_ENABLED=.*/NETMON_SFTP_ENABLED=true/' /etc/netmon/netmon.env")
-            click.echo("      docker compose up -d --force-recreate collector")
-    sys.exit(0 if ok else 2)
+    # Blob transport: prove the dashboard mints a SAS for us (exercises
+    # enrollment + dashboard URL + the /api/sensor/bundle-upload-url route +
+    # the proxy allowlist) WITHOUT writing a probe blob.
+    from . import blob_upload
+    slugs = uploader_mod._identity_slugs()
+    if slugs is None:
+        click.echo("FAIL blob transport needs box identity (run: sudo netmon-wizard)")
+        sys.exit(2)
+    probe = f"{slugs[2]}_2000_01_01_00.zip"
+    try:
+        target = blob_upload.get_upload_target(probe)
+    except Exception as exc:
+        click.echo(f"FAIL blob mint failed: {exc}")
+        sys.exit(2)
+    click.echo("OK   blob mint succeeded — dashboard issued a SAS URL")
+    click.echo(f"  transport:   blob (HTTPS PUT to the depot; expires {target.get('expiresAt')})")
+    click.echo("uploads:       ENABLED (bundle_transport=blob) — bundles ship via HTTPS")
+    sys.exit(0)
 
 
 @cli.command("upload-now")

@@ -306,19 +306,14 @@ class Settings(BaseSettings):
         default=30, ge=1, le=300, alias="NETMON_DEVICE_CONFIG_SSH_TIMEOUT"
     )
 
-    sftp_enabled: bool = Field(default=False, alias="NETMON_SFTP_ENABLED")
-    sftp_host: str = Field(default="", alias="NETMON_SFTP_HOST")
-    sftp_port: int = Field(default=22, ge=1, le=65535, alias="NETMON_SFTP_PORT")
-    sftp_user: str = Field(default="", alias="NETMON_SFTP_USER")
-    sftp_password: str = Field(default="", alias="NETMON_SFTP_PASSWORD")
-    sftp_remote_path: str = Field(default="/", alias="NETMON_SFTP_REMOTE_PATH")
-    # Bundle delivery transport (SFTP->HTTPS migration): "sftp" (paramiko upload
-    # to the depot, today) | "blob" (HTTPS PUT with a dashboard-minted SAS URL).
-    # Pushed from the dashboard via desired-config; inert until flipped to "blob".
-    # NOTE: kept "sftp" so the staging gate holds — _active_transport() treats a
-    # "blob" value as "uploads ON" (it takes precedence over sftp_enabled), so
-    # defaulting to blob would make an un-installed box upload immediately. The
-    # dashboard's enable-uploads flow is what turns a box on (see #6 fix).
+    # Bundle delivery transport: "blob" (HTTPS PUT with a dashboard-minted SAS
+    # URL) is the only transport that ships bundles; any other value (default
+    # "sftp") leaves the box in the pre-install staging state with uploads OFF.
+    # Pushed from the dashboard via desired-config.
+    # NOTE: the default stays "sftp" (i.e. NOT "blob") so the staging gate holds —
+    # _active_transport() only returns a transport when this is "blob", so an
+    # un-installed box never uploads until the dashboard's enable-uploads flow
+    # flips it to "blob" (see #6 fix).
     bundle_transport: str = Field(default="sftp", alias="NETMON_BUNDLE_TRANSPORT")
     device_name: str = Field(default="", alias="NETMON_DEVICE_NAME")
 
