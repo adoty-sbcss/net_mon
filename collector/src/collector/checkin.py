@@ -292,7 +292,6 @@ _CONFIG_INT_BOUNDS: dict[str, tuple[int, int]] = {
     "snmp_topology_fanout_cap": (1, 1000),
     "snmp_poll_max_candidates": (1, 1024),
     "snmp_poll_time_budget": (10, 3600),
-    "sftp_port": (1, 65535),
     "iperf_port": (1, 65535),
     "iperf_schedule_sec": (60, 30 * 24 * 3600),
     "iperf_duration": (1, 60),
@@ -372,21 +371,8 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_UPDATE_CHANNEL"] = ch if ch in ("stable", "canary", "hold") else "stable"
     if "update_ref" in data:
         mapping["NETMON_UPDATE_REF"] = str(data.get("update_ref") or "")
-    # SFTP upload destination (pushed from the dashboard).
-    if "sftp_enabled" in data:
-        mapping["NETMON_SFTP_ENABLED"] = "true" if data.get("sftp_enabled") else "false"
-    if "sftp_host" in data:
-        mapping["NETMON_SFTP_HOST"] = str(data.get("sftp_host") or "")
-    if "sftp_port" in data and data.get("sftp_port") is not None:
-        mapping["NETMON_SFTP_PORT"] = str(_bounded_config_int(
-            data, "sftp_port", minimum=1, maximum=65535))
-    if "sftp_user" in data:
-        mapping["NETMON_SFTP_USER"] = str(data.get("sftp_user") or "")
-    if data.get("sftp_password"):  # only overwrite when a value is provided
-        mapping["NETMON_SFTP_PASSWORD"] = str(data["sftp_password"])
-    if "sftp_remote_path" in data:
-        mapping["NETMON_SFTP_REMOTE_PATH"] = str(data.get("sftp_remote_path") or "/")
-    # Bundle delivery transport (SFTP->HTTPS migration): "sftp" | "blob".
+    # Bundle delivery transport: "blob" ships bundles (HTTPS/SAS); any other
+    # value ("sftp") keeps the box in the pre-install staging state (uploads OFF).
     if "bundle_transport" in data:
         bt = str(data.get("bundle_transport") or "sftp").lower()
         mapping["NETMON_BUNDLE_TRANSPORT"] = bt if bt in ("sftp", "blob") else "sftp"
@@ -469,7 +455,7 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_WIFI_JOIN_AUTH"] = _wauth if _wauth in ("open", "psk", "peap", "ttls") else "open"
     if "wifi_join_identity" in data:
         mapping["NETMON_WIFI_JOIN_IDENTITY"] = str(data.get("wifi_join_identity") or "")
-    if data.get("wifi_join_secret"):  # only overwrite when provided (like sftp_password)
+    if data.get("wifi_join_secret"):  # secret: only overwrite when a value is provided
         mapping["NETMON_WIFI_JOIN_SECRET"] = str(data["wifi_join_secret"])
     # Multi-profile join list (WIFI-6) rides a 0600 JSON file, NOT env — secrets +
     # quotes/braces don't belong in the EnvironmentFile. Full-replace like the iperf
@@ -615,9 +601,10 @@ _DIAG_COMMANDS: dict[str, list[str]] = {
         "ping -c 4 -W 2 1.1.1.1 2>&1 | tail -n 6; echo '---'; "
         "ping -c 4 -W 2 8.8.8.8 2>&1 | tail -n 6",
     ],
-    # "Test SFTP" — connect/auth/list the remote path. Read-only (uploads nothing)
-    # and, crucially, surfaces whether uploads are actually ENABLED, since a plain
-    # connection test passes even when NETMON_SFTP_ENABLED=false (the footgun).
+    # "Test uploads" — mint a SAS URL from the dashboard to prove the bundle-upload
+    # path works end to end (read-only; writes no probe blob). Surfaces whether
+    # uploads are actually ENABLED (bundle_transport=blob) vs the staging state.
+    # (id kept as diag-sftp-test: the dashboard sends this fixed id.)
     "diag-sftp-test": ["python", "-m", "collector", "upload-test"],
     # Sniff 802.1Q tags on the box's uplink (auto-detected) to discover which
     # VLANs a trunk carries — feeds the dashboard's VLAN picker. Read-only.
@@ -1562,7 +1549,7 @@ def run_checkin() -> int:
             # per-box health view + heartbeat. Best-effort: {} if collection fails.
             "hostMetrics": host_metrics_mod.collect(),
             # Actual config the box is running, so the dashboard can show ground
-            # truth (not just what it pushed). The SFTP password is NEVER reported.
+            # truth (not just what it pushed).
             "currentConfig": {
                 "snmp_enabled": settings.snmp_enabled,
                 "snmp_communities": settings.snmp_communities,
@@ -1571,10 +1558,6 @@ def run_checkin() -> int:
                 "snmp_topology_scope": settings.snmp_topology_scope,
                 "snmp_topology_max_depth": settings.snmp_topology_max_depth,
                 "snmp_topology_interval": settings.snmp_topology_interval,
-                "sftp_enabled": settings.sftp_enabled,
-                "sftp_host": settings.sftp_host,
-                "sftp_port": settings.sftp_port,
-                "sftp_user": settings.sftp_user,
                 "bundle_transport": settings.bundle_transport,
             },
         },

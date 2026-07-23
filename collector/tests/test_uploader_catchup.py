@@ -17,7 +17,7 @@ no backoff/cap/give-up. The tests pin each bound.
 
 Pure unit tests: no DB, no network, no clock. Every db.* call the uploader made a
 module-level import of is monkeypatched on `uploader`, `now` is injected, and the
-transport is a fake `upload_file`.
+transport is a fake `blob_upload.upload_file_blob` (the only transport).
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from collector import uploader
+from collector import blob_upload, uploader
 
 
 def _local(year: int, month: int, day: int, hour: int, minute: int = 0, second: int = 0) -> datetime:
@@ -45,7 +45,7 @@ def _settings(tmp_path, **over):
     base = dict(
         district_slug="dist", school_slug="school", device_slug="sensor",
         device_name="sensor", bundle_dir=tmp_path,
-        bundle_transport="sftp", sftp_enabled=True,
+        bundle_transport="blob",
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -284,14 +284,16 @@ def _flush(monkeypatch, tmp_path, pending, *, upload=None, sweep=(), **settings_
             return upload(path)
         return f"/remote/{path.name}"
 
-    monkeypatch.setattr(uploader, "upload_file", _fake_upload)
+    # _flush_pending's only transport is blob_upload.upload_file_blob (imported
+    # inside the function via `from . import blob_upload`), so patch it there.
+    monkeypatch.setattr(blob_upload, "upload_file_blob", _fake_upload)
     return calls
 
 
 def test_flush_uploads_everything_pending_when_healthy(monkeypatch, tmp_path):
     pending = [_pending_row(tmp_path, f"sensor_{i}.zip") for i in range(4)]
     calls = _flush(monkeypatch, tmp_path, pending)
-    counters = uploader._flush_pending("sftp", now=_local(2026, 7, 16, 14))
+    counters = uploader._flush_pending("blob", now=_local(2026, 7, 16, 14))
     assert counters.succeeded == 4
     assert counters.failed == 0
     assert counters.breaker_tripped is False
@@ -300,14 +302,14 @@ def test_flush_uploads_everything_pending_when_healthy(monkeypatch, tmp_path):
 
 def test_flush_breaker_trips_after_three_consecutive_failures(monkeypatch, tmp_path):
     # A dead depot is not 200 individually-broken bundles. Stop after 3 and let
-    # the next tick retry, instead of burning ~30s of SFTP timeout apiece.
+    # the next tick retry, instead of burning a full upload timeout apiece.
     pending = [_pending_row(tmp_path, f"sensor_{i}.zip") for i in range(8)]
 
     def _boom(path):
         raise RuntimeError("depot unreachable")
 
     calls = _flush(monkeypatch, tmp_path, pending, upload=_boom)
-    counters = uploader._flush_pending("sftp", now=_local(2026, 7, 16, 14))
+    counters = uploader._flush_pending("blob", now=_local(2026, 7, 16, 14))
     assert counters.attempted == uploader.UPLOAD_BREAKER_CONSECUTIVE_FAILURES == 3
     assert counters.failed == 3
     assert counters.breaker_tripped is True
@@ -326,7 +328,7 @@ def test_flush_breaker_resets_on_success(monkeypatch, tmp_path):
         return f"/remote/{path.name}"
 
     _flush(monkeypatch, tmp_path, pending, upload=_flaky)
-    counters = uploader._flush_pending("sftp", now=_local(2026, 7, 16, 14))
+    counters = uploader._flush_pending("blob", now=_local(2026, 7, 16, 14))
     assert counters.breaker_tripped is False
     assert counters.attempted == 6
     assert counters.succeeded == 2
@@ -349,7 +351,7 @@ def test_flush_skips_bundles_inside_retry_backoff(monkeypatch, tmp_path):
                      last_attempt_at=now - timedelta(seconds=1)),
     ]
     calls = _flush(monkeypatch, tmp_path, pending)
-    counters = uploader._flush_pending("sftp", now=now)
+    counters = uploader._flush_pending("blob", now=now)
     assert calls["attempts"] == ["due.zip", "fresh.zip"]
     assert counters.skipped == 1
     assert counters.succeeded == 2
@@ -364,7 +366,7 @@ def test_flush_gives_up_on_missing_file_without_burning_an_attempt(monkeypatch, 
         _pending_row(tmp_path, "here.zip"),
     ]
     calls = _flush(monkeypatch, tmp_path, pending)
-    counters = uploader._flush_pending("sftp", now=_local(2026, 7, 16, 14))
+    counters = uploader._flush_pending("blob", now=_local(2026, 7, 16, 14))
     assert calls["gave_up"] == [("gone.zip", "local file missing")]
     assert counters.gave_up == 1
     assert calls["attempts"] == ["here.zip"]
@@ -378,7 +380,7 @@ def test_flush_does_not_give_up_when_the_bundle_dir_is_gone(monkeypatch, tmp_pat
     # queue because of a sick mount would be exactly the data loss we're fixing.
     pending = [_pending_row(tmp_path, "x.zip", create=False)]
     calls = _flush(monkeypatch, tmp_path, pending, bundle_dir=tmp_path / "unmounted")
-    counters = uploader._flush_pending("sftp", now=_local(2026, 7, 16, 14))
+    counters = uploader._flush_pending("blob", now=_local(2026, 7, 16, 14))
     assert calls["gave_up"] == []
     assert counters.gave_up == 0
     assert counters.skipped == 1
@@ -389,7 +391,7 @@ def test_flush_stops_at_the_attempt_cap(monkeypatch, tmp_path):
     over = uploader.UPLOAD_MAX_ATTEMPTS_PER_TICK + 5
     pending = [_pending_row(tmp_path, f"sensor_{i:03d}.zip") for i in range(over)]
     calls = _flush(monkeypatch, tmp_path, pending)
-    counters = uploader._flush_pending("sftp", now=_local(2026, 7, 16, 14))
+    counters = uploader._flush_pending("blob", now=_local(2026, 7, 16, 14))
     assert counters.attempted == uploader.UPLOAD_MAX_ATTEMPTS_PER_TICK
     assert counters.succeeded == uploader.UPLOAD_MAX_ATTEMPTS_PER_TICK
     assert len(calls["attempts"]) == uploader.UPLOAD_MAX_ATTEMPTS_PER_TICK
@@ -405,7 +407,7 @@ def test_flush_sweep_gives_up_and_unlinks_hopeless_bundles(monkeypatch, tmp_path
         "last_error": "depot unreachable",
     }]
     _flush(monkeypatch, tmp_path, [], sweep=sweep)
-    counters = uploader._flush_pending("sftp", now=_local(2026, 7, 16, 14))
+    counters = uploader._flush_pending("blob", now=_local(2026, 7, 16, 14))
     assert counters.gave_up == 1
     assert not doomed.exists()
 
@@ -418,7 +420,7 @@ def test_flush_sweep_failure_does_not_block_uploads(monkeypatch, tmp_path):
         raise RuntimeError("db hiccup")
 
     monkeypatch.setattr(uploader, "mark_bundles_gave_up", _boom)
-    counters = uploader._flush_pending("sftp", now=_local(2026, 7, 16, 14))
+    counters = uploader._flush_pending("blob", now=_local(2026, 7, 16, 14))
     assert counters.succeeded == 1
     assert calls["attempts"] == ["sensor_0.zip"]
 
@@ -427,7 +429,7 @@ def test_flush_reports_remote_path_for_the_current_bundle(monkeypatch, tmp_path)
     # build_and_upload_hour's `remote_path` result key rides on this.
     pending = [_pending_row(tmp_path, "old.zip"), _pending_row(tmp_path, "current.zip")]
     _flush(monkeypatch, tmp_path, pending)
-    counters = uploader._flush_pending("sftp", now=_local(2026, 7, 16, 14),
+    counters = uploader._flush_pending("blob", now=_local(2026, 7, 16, 14),
                                        current_filename="current.zip")
     assert counters.current_remote_path == "/remote/current.zip"
 
@@ -437,14 +439,14 @@ def test_flush_stops_when_stop_requested(monkeypatch, tmp_path):
     pending = [_pending_row(tmp_path, f"sensor_{i}.zip") for i in range(3)]
     calls = _flush(monkeypatch, tmp_path, pending)
     uploader._stop_event.set()
-    counters = uploader._flush_pending("sftp", now=_local(2026, 7, 16, 14))
+    counters = uploader._flush_pending("blob", now=_local(2026, 7, 16, 14))
     assert counters.attempted == 0
     assert calls["attempts"] == []
 
 
 def test_flush_noop_when_nothing_pending(monkeypatch, tmp_path):
     calls = _flush(monkeypatch, tmp_path, [])
-    counters = uploader._flush_pending("sftp", now=_local(2026, 7, 16, 14))
+    counters = uploader._flush_pending("blob", now=_local(2026, 7, 16, 14))
     assert counters.attempted == 0
     assert counters.succeeded == 0
     assert calls["attempts"] == []
@@ -461,7 +463,7 @@ def test_flush_noop_when_nothing_pending(monkeypatch, tmp_path):
 _SUCCESS_STATUSES = {"uploaded", "saved_only", "skipped"}
 
 
-def _build_and_upload(monkeypatch, tmp_path, *, built, counters=None, transport="sftp"):
+def _build_and_upload(monkeypatch, tmp_path, *, built, counters=None, transport="blob"):
     monkeypatch.setattr(uploader, "get_settings", lambda: _settings(tmp_path))
     monkeypatch.setattr(uploader, "_active_transport", lambda s: transport)
     monkeypatch.setattr(uploader, "_build_hour", lambda window_end: built)
@@ -575,5 +577,5 @@ def test_build_and_upload_hour_flushes_current_bundle_and_prunes(monkeypatch, tm
                              counters=uploader._FlushCounters(attempted=1, succeeded=1))
     uploader.build_and_upload_hour(_local(2026, 7, 16, 14))
     assert seen["current_filename"] == "cur.zip"     # so remote_path can be reported
-    assert seen["transport"] == "sftp"
+    assert seen["transport"] == "blob"
     assert seen["pruned"] is True

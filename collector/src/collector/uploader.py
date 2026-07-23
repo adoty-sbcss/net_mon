@@ -30,12 +30,6 @@ from .logging_setup import audit
 # Adjust by editing here; not surfaced as env to keep config simple for v1.
 LOCAL_BUNDLE_RETENTION_DAYS = 30
 
-# Bound for the SFTP TCP connect, SSH banner wait, and every subsequent socket op
-# (the socket timeout from create_connection persists into the data phase). The
-# uploader is a single daemon thread, so an unbounded handshake to a blackholed or
-# filtered host would silently stall ALL hourly uploads while the box looks healthy.
-_SFTP_TIMEOUT_SEC = 30
-
 # --- Catch-up (F-COL-19) ----------------------------------------------------
 # How far back a startup/hourly catch-up pass looks for hours that have scans but
 # no complete bundle. The collector purges local scans at local_retention_days
@@ -100,14 +94,12 @@ def _identity_slugs() -> tuple[str, str, str] | None:
 def _active_transport(s) -> str | None:
     """Which upload verb this box uses this hour, or None (keep bundles local).
 
-    'blob' (HTTPS to the depot via a dashboard-minted SAS) takes precedence when
-    selected; else 'sftp' when SFTP is enabled; else None. blob_upload raises
-    cleanly if enrollment / dashboard URL is missing, so the bundle just stays
-    queued and retries — same failure handling as an SFTP error.
+    'blob' (HTTPS to the depot via a dashboard-minted SAS) is the only transport;
+    any other bundle_transport value leaves the box in the pre-install staging
+    state with uploads OFF. blob_upload raises cleanly if enrollment / dashboard
+    URL is missing, so the bundle just stays queued and retries.
     """
-    if s.bundle_transport == "blob":
-        return "blob"
-    return "sftp" if s.sftp_enabled else None
+    return "blob" if s.bundle_transport == "blob" else None
 
 
 def _filename_for(window_end: datetime) -> str:
@@ -117,7 +109,7 @@ def _filename_for(window_end: datetime) -> str:
     Legacy fallback:    <device_name>_YYYY_MM_DD_HH.zip
 
     The slug variant avoids spaces in filenames and stays consistent with the
-    hierarchical SFTP path that contains the same slug.
+    hierarchical depot path that contains the same slug.
     """
     completed_hour = window_end - timedelta(hours=1)
     stamp = completed_hour.strftime('%Y_%m_%d_%H')
@@ -126,23 +118,6 @@ def _filename_for(window_end: datetime) -> str:
         _, _, device_slug = slugs
         return f"{device_slug}_{stamp}.zip"
     return f"{device_name()}_{stamp}.zip"
-
-
-def _remote_dir() -> str:
-    """Where to put uploads on the SFTP server.
-
-    With identity set:  <sftp_remote_path>/<district>/<school>/<device>
-    Legacy fallback:    <sftp_remote_path>
-
-    Trailing slashes stripped; the upload step adds the filename.
-    """
-    s = get_settings()
-    base = (s.sftp_remote_path or "/").rstrip("/")
-    slugs = _identity_slugs()
-    if slugs is None:
-        return base or "/"
-    district, school, device = slugs
-    return f"{base}/{district}/{school}/{device}"
 
 
 # ---------------------------------------------------------------------------
@@ -326,8 +301,7 @@ def _flush_pending(
     This is the F-COL-20 fix. The old flush re-tried EVERY pending bundle on
     EVERY tick, serially, with no backoff, no cap, and no give-up: a persistent
     upload outage grew the pending set without bound, and each tick took longer
-    than the last re-failing the whole queue (at a 30s SFTP timeout apiece), all
-    while ignoring request_stop().
+    than the last re-failing the whole queue, all while ignoring request_stop().
 
     Bounds, in order: give up on hopeless bundles (frees disk), skip anything in
     backoff, stop after UPLOAD_MAX_ATTEMPTS_PER_TICK attempts, and trip a breaker
@@ -415,11 +389,8 @@ def _flush_pending(
 
         counters.attempted += 1
         try:
-            if transport == "blob":
-                from . import blob_upload
-                remote = blob_upload.upload_file_blob(path)
-            else:
-                remote = upload_file(path)
+            from . import blob_upload
+            remote = blob_upload.upload_file_blob(path)
         except Exception as exc:
             err = str(exc)
             log.exception("bundle upload failed", transport=transport,
@@ -480,7 +451,7 @@ def build_and_upload_hour(window_end: datetime) -> dict[str, str | None]:
     if transport is None:
         result["status"] = "saved_only"
         result["message"] = (
-            "no upload transport active (SFTP disabled, bundle_transport != blob); "
+            "no upload transport active (bundle_transport != blob); "
             "bundles kept locally"
         )
         return result
@@ -543,118 +514,6 @@ def _prune_old_uploaded_bundles() -> None:
         audit("bundles_pruned", count=n, retention_days=LOCAL_BUNDLE_RETENTION_DAYS)
 
 
-def upload_file(local_path: Path) -> str:
-    """Upload a single file to the configured SFTP server. Returns remote path.
-
-    Path on the server is hierarchical when identity is set:
-        <sftp_remote_path>/<district>/<school>/<device>/<filename>
-    Otherwise (pre-wizard boxes) the file lands flat at:
-        <sftp_remote_path>/<filename>
-
-    _ensure_remote_dir does mkdir -p for the full hierarchy on each upload,
-    so a brand-new district/school/device combo creates its subtree
-    automatically on first upload.
-    """
-    settings = get_settings()
-    if not settings.sftp_host:
-        raise RuntimeError("NETMON_SFTP_HOST not set")
-
-    # Paramiko import deferred so module loads without it during tests.
-    import paramiko
-
-    target_dir = _remote_dir()
-    log.info("sftp connecting", host=settings.sftp_host, port=settings.sftp_port,
-             user=settings.sftp_user, remote_dir=target_dir)
-
-    sock = socket.create_connection(
-        (settings.sftp_host, settings.sftp_port), timeout=_SFTP_TIMEOUT_SEC
-    )
-    transport = paramiko.Transport(sock)
-    transport.banner_timeout = _SFTP_TIMEOUT_SEC
-    try:
-        transport.connect(username=settings.sftp_user, password=settings.sftp_password)
-        sftp = paramiko.SFTPClient.from_transport(transport)
-        if sftp is None:
-            raise RuntimeError("could not open SFTP channel")
-        try:
-            _ensure_remote_dir(sftp, target_dir)
-            remote = f"{target_dir.rstrip('/') or ''}/{local_path.name}"
-            sftp.put(str(local_path), remote)
-            log.info("sftp upload complete", local=str(local_path), remote=remote,
-                     size=local_path.stat().st_size)
-            return remote
-        finally:
-            sftp.close()
-    finally:
-        transport.close()
-
-
-def _ensure_remote_dir(sftp, path: str) -> None:
-    """mkdir -p the remote path, ignoring 'already exists'."""
-    if not path or path == "/":
-        return
-    parts = [p for p in path.strip("/").split("/") if p]
-    current = ""
-    for p in parts:
-        current = current + "/" + p
-        try:
-            sftp.stat(current)
-        except OSError:
-            try:
-                sftp.mkdir(current)
-            except OSError as exc:
-                # Race or read-only — try to stat again before giving up.
-                try:
-                    sftp.stat(current)
-                except OSError:
-                    raise exc from None
-
-
-def test_connection() -> tuple[bool, str]:
-    """Quick connectivity + auth + remote-path-exists check.
-
-    Tests against the hierarchical target directory (district/school/device)
-    when identity is set, so the operator sees the actual upload destination,
-    not just the SFTP root.
-    """
-    settings = get_settings()
-    if not settings.sftp_host:
-        return False, "NETMON_SFTP_HOST is not set — run: sudo netmon-wizard sftp"
-    try:
-        import paramiko
-    except ImportError as exc:
-        return False, f"paramiko not installed: {exc}"
-
-    target_dir = _remote_dir()
-    try:
-        sock = socket.create_connection(
-            (settings.sftp_host, settings.sftp_port), timeout=_SFTP_TIMEOUT_SEC
-        )
-        transport = paramiko.Transport(sock)
-        transport.banner_timeout = _SFTP_TIMEOUT_SEC
-        transport.connect(username=settings.sftp_user, password=settings.sftp_password)
-        sftp = paramiko.SFTPClient.from_transport(transport)
-        if sftp is None:
-            transport.close()
-            return False, "could not open SFTP channel"
-        try:
-            try:
-                entries = sftp.listdir(target_dir)
-                msg = (f"connected to {settings.sftp_host}:{settings.sftp_port} as "
-                       f"{settings.sftp_user}; target {target_dir!r} "
-                       f"has {len(entries)} entries")
-            except OSError:
-                msg = (f"connected to {settings.sftp_host}:{settings.sftp_port} as "
-                       f"{settings.sftp_user}; target {target_dir!r} "
-                       f"does not exist yet (will be created on first upload)")
-            return True, msg
-        finally:
-            sftp.close()
-            transport.close()
-    except Exception as exc:
-        return False, f"connection failed: {exc}"
-
-
 # ---------------------------------------------------------------------------
 # Hourly scheduler thread
 # ---------------------------------------------------------------------------
@@ -695,8 +554,7 @@ def _run_scheduler_loop() -> None:
         log.info("uploader disabled (no active transport), scheduler not running")
         return
     log.info("uploader scheduler started",
-             transport=transport, host=s.sftp_host, port=s.sftp_port,
-             remote_dir=_remote_dir(), device=device_name(),
+             transport=transport, device=device_name(),
              identity_set=_identity_slugs() is not None)
 
     # Startup catch-up BEFORE arming the forward loop. This is the whole point of
