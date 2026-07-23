@@ -252,7 +252,7 @@ def cmd_selftest() -> None:
 
 @cli.command("config-backup")
 def cmd_config_backup() -> None:
-    """Build + upload a ZIP of /etc/netmon/* to the SFTP _config/ tree."""
+    """Build + upload a ZIP of /etc/netmon/* to the depot _config/ tree (HTTPS/blob)."""
     try:
         remote = config_backup_mod.upload_backup()
         click.echo(f"OK   uploaded to {remote}")
@@ -395,7 +395,7 @@ def cmd_console_session(broker: str, sid: str, mode: str) -> None:
 
 @cli.command("config-list")
 def cmd_config_list() -> None:
-    """List available config backups on the SFTP server for this box."""
+    """List available config backups in the depot for this box."""
     try:
         backups = config_backup_mod.list_available_backups()
     except Exception as exc:
