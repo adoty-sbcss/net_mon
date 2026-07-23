@@ -1,8 +1,16 @@
 """Daily configuration backup + restore download.
 
-Uploads /etc/netmon/netmon.env + /etc/netmon/snmp.yaml (if present) as a
-small ZIP to <sftp_remote_path>/_config/<district>/<school>/<device>/ so the
-box's config survives a factory reset.
+Uploads /etc/netmon/netmon.env + /etc/netmon/snmp.yaml (if present) as a small
+ZIP to the depot's blob container at
+  _config/<district>/<school>/<device>/config_YYYY-MM-DD.zip
+so the box's config survives a factory reset.
+
+Transport is HTTPS/blob (SFTP->HTTPS migration): the depot's SFTP protocol
+feature is disabled, so the box asks the dashboard to mint a short-lived,
+blob-scoped SAS URL (Bearer enrollment token) and streams the ZIP straight to
+Azure Blob over HTTPS — mirroring blob_upload.py (the hourly-bundle path) and
+reusing its _token/_post_json helpers. The dashboard derives the blob path from
+the sensor's OWN DB identity, so the box never supplies a path.
 
 Restore is two steps:
   1. python -m collector config-download [--date YYYY-MM-DD]
@@ -15,9 +23,14 @@ container — the container can prepare the zip but only the host can apply it.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import io
 import json
+import shutil
 import socket
+import urllib.error
+import urllib.request
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,10 +38,14 @@ from typing import Any
 
 import structlog
 
-from . import __version__
+from . import __version__, blob_upload
 from .config import get_settings
 
 log = structlog.get_logger(__name__)
+
+# Same socket bound as blob_upload's PUT: a small config ZIP on a slow school
+# uplink can still take a moment, but nowhere near the hourly-bundle ceiling.
+_BLOB_TIMEOUT_SEC = 300
 
 
 # Items we back up. Each entry is (in-container path, archive name).
@@ -39,21 +56,24 @@ _BACKUP_ITEMS: list[tuple[Path, str]] = [
 ]
 
 
-def _config_dir() -> str:
-    """Subdirectory under sftp_remote_path where config backups land.
-
-    Returns "_config/<district>/<school>/<device>" when identity is set,
-    falling back to "_config/<hostname>" otherwise.
-    """
-    s = get_settings()
-    base = (s.sftp_remote_path or "/").rstrip("/")
-    if s.district_slug and s.school_slug and s.device_slug:
-        return f"{base}/_config/{s.district_slug}/{s.school_slug}/{s.device_slug}"
-    return f"{base}/_config/{socket.gethostname()}"
-
-
 def _today_filename() -> str:
     return f"config_{datetime.now(UTC).strftime('%Y-%m-%d')}.zip"
+
+
+def _require_dashboard() -> tuple[str, str]:
+    """Return (dashboard_base_url, token) or raise if the blob path is unusable.
+
+    New gate (replaces the old sftp_enabled/sftp_host check): config backup rides
+    the same dashboard + enrollment-token path as the hourly bundle, so all it
+    needs is a dashboard URL and a non-empty token.
+    """
+    s = get_settings()
+    if not s.dashboard_url:
+        raise RuntimeError("NETMON_DASHBOARD_URL not set; cannot back up config over blob")
+    token = blob_upload._token(s)
+    if not token:
+        raise RuntimeError("no enrollment token; cannot back up config over blob")
+    return s.dashboard_url.rstrip("/"), token
 
 
 def build_backup_zip() -> bytes:
@@ -80,84 +100,102 @@ def build_backup_zip() -> bytes:
     return buf.getvalue()
 
 
-def upload_backup() -> str:
-    """Build + upload today's backup. Returns the remote path."""
-    from . import uploader as uploader_mod  # avoid circular at import time
+def _mint_config_upload(base_url: str, token: str, filename: str) -> dict:
+    """Ask the dashboard to mint a create+write SAS for one config backup.
 
-    s = get_settings()
-    if not s.sftp_enabled or not s.sftp_host:
-        raise RuntimeError("SFTP not configured; cannot upload config backup")
+    Returns {"url": <sas put url>, "blobPath": <durable url, no sas>,
+    "expiresAt": <iso>} — same shape as blob_upload.get_upload_target.
+    """
+    url = f"{base_url}/api/sensor/config-upload-url"
+    try:
+        out = blob_upload._post_json(url, token, {"filename": filename})
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"config-upload mint failed HTTP {exc.code}: {exc.reason}") from exc
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        raise RuntimeError(f"config-upload mint request failed: {exc}") from exc
+    if not out.get("url") or not out.get("blobPath"):
+        raise RuntimeError("config-upload mint response missing url/blobPath")
+    return out
+
+
+def upload_backup() -> str:
+    """Build + upload today's backup to the depot over HTTPS. Returns the blob path.
+
+    Mints a fresh SAS then PUTs the ZIP bytes to Azure Blob, mirroring
+    blob_upload.upload_file_blob (incl. the single in-place 403 re-mint for an
+    expired/skewed SAS). Content-MD5 gives server-side integrity.
+    """
+    base_url, token = _require_dashboard()
 
     payload = build_backup_zip()
-    remote_dir = _config_dir()
     filename = _today_filename()
-    remote_path = f"{remote_dir.rstrip('/')}/{filename}"
+    size = len(payload)
+    md5_b64 = base64.b64encode(hashlib.md5(payload).digest()).decode("ascii")
 
-    # Use paramiko directly — slightly different shape than file uploader.
-    import paramiko
-    log.info("config-backup uploading", host=s.sftp_host, remote=remote_path,
-             size_bytes=len(payload))
-    transport = paramiko.Transport((s.sftp_host, s.sftp_port))
-    try:
-        transport.connect(username=s.sftp_user, password=s.sftp_password)
-        sftp = paramiko.SFTPClient.from_transport(transport)
-        if sftp is None:
-            raise RuntimeError("could not open SFTP channel")
+    target = _mint_config_upload(base_url, token, filename)
+    log.info("config-backup uploading", blob=target["blobPath"], size_bytes=size)
+
+    for attempt in (1, 2):
         try:
-            uploader_mod._ensure_remote_dir(sftp, remote_dir)
-            with sftp.file(remote_path, "wb") as f:
-                f.write(payload)
-            log.info("config-backup uploaded", remote=remote_path, size_bytes=len(payload))
-            return remote_path
-        finally:
-            sftp.close()
-    finally:
-        transport.close()
+            req = urllib.request.Request(
+                target["url"],
+                data=payload,
+                method="PUT",
+                headers={
+                    "x-ms-blob-type": "BlockBlob",
+                    "Content-Type": "application/zip",
+                    "Content-Length": str(size),
+                    "Content-MD5": md5_b64,
+                },
+            )
+            with urllib.request.urlopen(req, timeout=_BLOB_TIMEOUT_SEC) as resp:
+                if resp.status in (200, 201):
+                    log.info("config-backup uploaded", blob=target["blobPath"],
+                             size_bytes=size)
+                    return str(target["blobPath"])
+                raise RuntimeError(f"config PUT unexpected status {resp.status}")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 403 and attempt == 1:
+                log.info("config SAS rejected (403); re-minting once")
+                target = _mint_config_upload(base_url, token, filename)
+                continue
+            raise RuntimeError(f"config PUT HTTP {exc.code}: {exc.reason}") from exc
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            raise RuntimeError(f"config PUT failed: {exc}") from exc
+
+    raise RuntimeError("config backup upload failed after re-mint")
 
 
 def list_available_backups() -> list[str]:
-    """Return filenames of backups on the SFTP server for this box, newest first."""
-    s = get_settings()
-    if not s.sftp_host:
-        raise RuntimeError("SFTP not configured")
-    import paramiko
-    remote_dir = _config_dir()
-    transport = paramiko.Transport((s.sftp_host, s.sftp_port))
+    """Return filenames of this box's config backups in the depot, newest first."""
+    base_url, token = _require_dashboard()
+    url = f"{base_url}/api/sensor/config-backups"
     try:
-        transport.connect(username=s.sftp_user, password=s.sftp_password)
-        sftp = paramiko.SFTPClient.from_transport(transport)
-        if sftp is None:
-            raise RuntimeError("could not open SFTP channel")
-        try:
-            try:
-                entries = sftp.listdir(remote_dir)
-            except OSError:
-                return []
-            backups = sorted(
-                (e for e in entries if e.startswith("config_") and e.endswith(".zip")),
-                reverse=True,
-            )
-            return backups
-        finally:
-            sftp.close()
-    finally:
-        transport.close()
+        out = blob_upload._post_json(url, token, {})
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"config-list failed HTTP {exc.code}: {exc.reason}") from exc
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        raise RuntimeError(f"config-list request failed: {exc}") from exc
+    backups = out.get("backups")
+    if not isinstance(backups, list):
+        return []
+    return [str(b) for b in backups]
 
 
 def download_backup(date: str | None = None, out_path: Path | None = None) -> Path:
-    """Download a backup ZIP to local disk. Returns the local path.
+    """Download a config backup ZIP to local disk. Returns the local path.
 
     date: YYYY-MM-DD string. Defaults to the most recent available.
     out_path: defaults to /var/lib/netmon/config-restore.zip
+
+    Asks the dashboard to mint a short-lived read-only SAS for the chosen file,
+    then GETs it over HTTPS and streams it to disk (constant memory).
     """
-    s = get_settings()
-    if not s.sftp_host:
-        raise RuntimeError("SFTP not configured")
-    import paramiko
+    base_url, token = _require_dashboard()
 
     backups = list_available_backups()
     if not backups:
-        raise RuntimeError(f"no config backups found at {_config_dir()!r}")
+        raise RuntimeError("no config backups found for this box")
 
     if date is None:
         chosen = backups[0]
@@ -167,22 +205,28 @@ def download_backup(date: str | None = None, out_path: Path | None = None) -> Pa
             raise RuntimeError(f"no backup for {date}; available: {backups[:5]}")
         chosen = wanted
 
-    remote_dir = _config_dir()
-    remote_path = f"{remote_dir.rstrip('/')}/{chosen}"
+    url = f"{base_url}/api/sensor/config-download-url"
+    try:
+        minted = blob_upload._post_json(url, token, {"filename": chosen})
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"config-download mint failed HTTP {exc.code}: {exc.reason}") from exc
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        raise RuntimeError(f"config-download mint request failed: {exc}") from exc
+    sas_url = minted.get("url")
+    if not sas_url:
+        raise RuntimeError("config-download response missing url")
+
     out = out_path or Path("/var/lib/netmon/config-restore.zip")
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    transport = paramiko.Transport((s.sftp_host, s.sftp_port))
     try:
-        transport.connect(username=s.sftp_user, password=s.sftp_password)
-        sftp = paramiko.SFTPClient.from_transport(transport)
-        if sftp is None:
-            raise RuntimeError("could not open SFTP channel")
-        try:
-            sftp.get(remote_path, str(out))
-            log.info("config-backup downloaded", remote=remote_path, local=str(out))
-            return out
-        finally:
-            sftp.close()
-    finally:
-        transport.close()
+        with urllib.request.urlopen(sas_url, timeout=_BLOB_TIMEOUT_SEC) as resp, \
+                out.open("wb") as fh:
+            shutil.copyfileobj(resp, fh)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"config GET HTTP {exc.code}: {exc.reason}") from exc
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        raise RuntimeError(f"config GET failed: {exc}") from exc
+
+    log.info("config-backup downloaded", blob=chosen, local=str(out))
+    return out
