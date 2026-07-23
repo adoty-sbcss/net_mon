@@ -312,12 +312,14 @@ class Settings(BaseSettings):
     sftp_user: str = Field(default="", alias="NETMON_SFTP_USER")
     sftp_password: str = Field(default="", alias="NETMON_SFTP_PASSWORD")
     sftp_remote_path: str = Field(default="/", alias="NETMON_SFTP_REMOTE_PATH")
-    # Bundle delivery transport (SFTP->HTTPS migration): "blob" (HTTPS PUT with a
-    # dashboard-minted SAS URL) | "sftp" (legacy paramiko upload to the depot).
-    # Default "blob": the fleet is blob-only post-cutover and the depot has SFTP
-    # disabled, so a fresh box uploads from first boot without waiting on a
-    # desired-config push. An explicit dashboard push still overrides this.
-    bundle_transport: str = Field(default="blob", alias="NETMON_BUNDLE_TRANSPORT")
+    # Bundle delivery transport (SFTP->HTTPS migration): "sftp" (paramiko upload
+    # to the depot, today) | "blob" (HTTPS PUT with a dashboard-minted SAS URL).
+    # Pushed from the dashboard via desired-config; inert until flipped to "blob".
+    # NOTE: kept "sftp" so the staging gate holds — _active_transport() treats a
+    # "blob" value as "uploads ON" (it takes precedence over sftp_enabled), so
+    # defaulting to blob would make an un-installed box upload immediately. The
+    # dashboard's enable-uploads flow is what turns a box on (see #6 fix).
+    bundle_transport: str = Field(default="sftp", alias="NETMON_BUNDLE_TRANSPORT")
     device_name: str = Field(default="", alias="NETMON_DEVICE_NAME")
 
     # iperf3 throughput testing (#10). Pushed from the dashboard via desired_config.
