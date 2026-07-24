@@ -5,7 +5,7 @@ with its enrollment token, reports its agent + applied-config version + self-hea
 metrics (CPU/RAM/disk/OS/uptime), then:
   - applies any newer desired config (SNMP strings, scan interval) by rewriting
     /etc/netmon/netmon.env — which takes effect on the next collector restart;
-  - runs any queued commands (run-scan / upload-now / config-backup / update)
+  - runs any queued commands (run-scan / upload-now / update)
     and reports each result back.
 
 Exit codes the host wrapper (netmon-checkin.sh) acts on:
@@ -36,7 +36,6 @@ from pathlib import Path
 import structlog
 
 from . import __version__
-from . import config_backup as config_backup_mod
 from . import host_metrics as host_metrics_mod
 from . import uploader as uploader_mod
 from .config import get_settings
@@ -531,7 +530,7 @@ _BEARER_RE = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._\-]+")
 # Azure blob SAS: in a `?sv=..&se=..&sp=..&sig=<hmac>` query it's the `sig` value that
 # is the actual credential (the HMAC that makes the token valid) — mask ONLY it, keep
 # the param name + the rest of the SAS (sv/se/sp/sr are non-secret metadata:
-# version/expiry/permissions/resource) so a `config-backup`/`upload-now` blob error is
+# version/expiry/permissions/resource) so an `upload-now` blob error is
 # still diagnosable. The value runs to the next query/punct delimiter; a base64-or-
 # percent-encoded signature never contains any of the excluded stop chars.
 _SAS_SIG_RE = re.compile(r"(?i)([?&]sig=)[^\s\"';}),&#]+")
@@ -662,7 +661,6 @@ _CONTROL_COMMANDS: dict[str, list[str]] = {
 _LIVE_OPS: set[str] = {
     "run-scan",       # force an immediate discovery scan
     "upload-now",     # build + ship the latest hour's bundle now
-    "config-backup",  # snapshot + upload the collector config now
     "collect-logs",   # gather recent logs and return them inline
 }
 
@@ -803,13 +801,8 @@ def _run_command(command: str) -> tuple[str, dict]:
             ok = res.get("status") in ("uploaded", "saved_only", "skipped")
             return ("done" if ok else "failed", {"status": res.get("status")})
 
-        if command == "config-backup":
-            remote = config_backup_mod.upload_backup()
-            return "done", {"remote": str(remote)}
-
-        # NOTE: `config-backup` above is the sensor's OWN config. The two below act
-        # on NETWORK DEVICES (switches/routers) over SSH — different subsystem,
-        # hence the distinct names.
+        # NOTE: the two below are NCM — they act on NETWORK DEVICES (switches /
+        # routers) over SSH, NOT on this box. Hence the `device-` prefix.
         if command.startswith("device-ssh-test"):
             from .discovery import device_config as devcfg
 

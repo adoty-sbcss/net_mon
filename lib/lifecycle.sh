@@ -92,8 +92,8 @@ lifecycle_factory_reset() {
     echo ""
     echo "After this, the first-boot wizard runs again from scratch."
     echo ""
-    printf '%sIf you have a config backup on SFTP, you can restore it after%s\n' "$C_INFO" "$C_OFF"
-    printf '%sthe wizard with:  sudo netmon-config-restore%s\n' "$C_INFO" "$C_OFF"
+    printf '%sThere is no config restore: /etc/netmon is a materialization of the%s\n' "$C_INFO" "$C_OFF"
+    printf '%sdashboard'"'"'s desired config, which is re-pushed on the next check-in.%s\n' "$C_INFO" "$C_OFF"
     echo ""
     read -r -p "Type RESET to confirm: " confirm || confirm=""
     if [[ "$confirm" != "RESET" ]]; then
@@ -116,5 +116,5 @@ lifecycle_factory_reset() {
     echo "Next steps:"
     echo "  1. Run: sudo netmon-wizard         # configure identity + SFTP"
     echo "  2. Run: ./setup.sh                 # rebuilds containers + starts them"
-    echo "  3. (optional) sudo netmon-config-restore   # to pull settings from SFTP backup"
+    echo "  3. Re-enroll against the dashboard # it re-pushes this box's desired config"
 }

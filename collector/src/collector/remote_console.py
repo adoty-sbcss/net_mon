@@ -8,8 +8,8 @@ sends, streaming output back. Restricted-command posture: only ids the sensor
 re-validates run —
   - `_DIAG_COMMANDS` (read-only) + `_CONTROL_COMMANDS` (state-changing, CON-5):
     FIXED argv, no shell, no operator input; run inline, bounded to ~20s.
-  - `_LIVE_OPS` (in-container operational: run-scan / upload-now / config-backup /
-    collect-logs): reuse the SAME handlers the queued path uses (`_run_command`),
+  - `_LIVE_OPS` (in-container operational: run-scan / upload-now / collect-logs):
+    reuse the SAME handlers the queued path uses (`_run_command`),
     run in a worker THREAD so a slow op (e.g. a full scan) doesn't block the recv
     loop's keepalive and trip the broker's idle timer. Bounded by an in-flight
     guard (per cmd_id) + a total concurrency cap, so a flood of frames can't stack
@@ -151,8 +151,6 @@ def _op_result_text(cmd_id: str, status: str, result: dict) -> str:
         return f"scan started — scan_id {result.get('scan_id', '?')}"
     if cmd_id == "upload-now":
         return f"upload: {result.get('status', status)}"
-    if cmd_id == "config-backup":
-        return f"config backup uploaded → {result.get('remote', '?')}"
     if cmd_id == "collect-logs":
         # result is {filename: contents, ...}
         return "\n".join(f"=== {k} ===\n{v}" for k, v in result.items()) or "(no logs)"
@@ -191,7 +189,7 @@ def _run_op_async(ws, cmd_id: str) -> None:
                 status, result = _run_command(cmd_id)
                 # Scrub secrets before streaming to the operator + the broker's
                 # PERSISTENT transcript — an op's error/success value can echo
-                # credential-shaped text back at us (e.g. a `config-backup`/`upload-now`
+                # credential-shaped text back at us (e.g. an `upload-now`
                 # error echoing a blob SAS URL or an sftp connection string). Redact the
                 # full text first, THEN cap: the same guard the diag path applies.
                 # _redact_secrets masks KEY=secret / Bearer <token>, a blob SAS `?sig=`

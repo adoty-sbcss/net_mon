@@ -114,7 +114,7 @@ def test_total_concurrency_is_capped_across_different_ops(blocked_op):
     release, started = blocked_op
     ws = _FakeWS()
 
-    ops = ["run-scan", "upload-now", "config-backup", "collect-logs"]
+    ops = ["run-scan", "upload-now", "collect-logs"]
     assert len(ops) > rc.MAX_CONCURRENT_OPS, "need a spare op left over to be refused"
 
     # The cap's worth of DISTINCT ops may run together (the per-id guard alone
