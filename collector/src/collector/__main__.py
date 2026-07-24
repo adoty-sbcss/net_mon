@@ -6,7 +6,6 @@ import click
 import structlog
 
 from . import __version__
-from . import config_backup as config_backup_mod
 from . import migrations as migrations_mod
 from . import selftest as selftest_mod
 from . import uploader as uploader_mod
@@ -240,17 +239,6 @@ def cmd_selftest() -> None:
         click.echo(f"{prefix} {r.name}: {r.detail}")
 
 
-@cli.command("config-backup")
-def cmd_config_backup() -> None:
-    """Build + upload a ZIP of /etc/netmon/* to the depot _config/ tree (HTTPS/blob)."""
-    try:
-        remote = config_backup_mod.upload_backup()
-        click.echo(f"OK   uploaded to {remote}")
-    except Exception as exc:
-        click.echo(f"FAIL config-backup: {exc}", err=True)
-        sys.exit(2)
-
-
 @cli.command("checkin")
 def cmd_checkin() -> None:
     """Check in with the dashboard: fetch desired config + run queued commands.
@@ -381,37 +369,6 @@ def cmd_console_session(broker: str, sid: str, mode: str) -> None:
     from . import remote_console
 
     sys.exit(remote_console.run_from_env(broker, sid, mode=mode))
-
-
-@cli.command("config-list")
-def cmd_config_list() -> None:
-    """List available config backups in the depot for this box."""
-    try:
-        backups = config_backup_mod.list_available_backups()
-    except Exception as exc:
-        click.echo(f"FAIL config-list: {exc}", err=True)
-        sys.exit(2)
-    if not backups:
-        click.echo("(no backups found)")
-        return
-    for b in backups:
-        click.echo(b)
-
-
-@cli.command("config-download")
-@click.option("--date", default=None,
-              help="YYYY-MM-DD. Defaults to most recent available.")
-@click.option("--out", default="/var/lib/netmon/config-restore.zip",
-              show_default=True, help="Where to write the downloaded ZIP.")
-def cmd_config_download(date: str | None, out: str) -> None:
-    """Download a config backup ZIP to disk (host script then unzips it)."""
-    from pathlib import Path
-    try:
-        path = config_backup_mod.download_backup(date=date, out_path=Path(out))
-        click.echo(f"OK   {path}")
-    except Exception as exc:
-        click.echo(f"FAIL config-download: {exc}", err=True)
-        sys.exit(2)
 
 
 if __name__ == "__main__":

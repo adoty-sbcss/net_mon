@@ -23,7 +23,6 @@
   },
   "live_broker_commands": [
     "collect-logs",
-    "config-backup",
     "ctl-flush-arp",
     "diag-arp",
     "diag-disk",

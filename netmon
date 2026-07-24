@@ -389,8 +389,6 @@ System:
   rollback       Revert to previous version (code + image + DB)
   quick-rebuild  Rebuild containers, keep data + config
   factory-reset  Wipe everything, re-run wizard
-  config-backup  Force an immediate config backup to SFTP
-  config-restore Restore /etc/netmon from SFTP backup
 
 Diagnostics:
   interfaces     List monitored interfaces (primary uplink vs secondary)
@@ -465,7 +463,6 @@ submenu_system() {
             menu_item 6 "Rollback to previous version"
             menu_item 7 "Quick rebuild (keeps data + config)"
             menu_item 8 "Factory reset (wipes everything)"
-            menu_item 9 "Restore config from SFTP backup"
             menu_footer "b" "Back to main menu" "q" "Quit"
             local choice
             choice="$(menu_read)"
@@ -473,7 +470,7 @@ submenu_system() {
             echo ""
             echo "System"
             echo "  1) Bundles  2) Timers  3) Update now  4) Version  5) Reboot"
-            echo "  6) Rollback  7) Quick rebuild  8) Factory reset  9) Restore from backup"
+            echo "  6) Rollback  7) Quick rebuild  8) Factory reset"
             echo "  b) Back     q) Quit"
             read -r -p "Choice: " choice || choice="q"
         fi
@@ -486,7 +483,6 @@ submenu_system() {
             6) if declare -f lifecycle_rollback >/dev/null; then lifecycle_rollback; else echo "(lib/lifecycle.sh not loaded — run setup.sh)"; fi ;;
             7) if declare -f lifecycle_quick_rebuild >/dev/null; then lifecycle_quick_rebuild; else echo "(lib/lifecycle.sh not loaded — run setup.sh)"; fi ;;
             8) if declare -f lifecycle_factory_reset >/dev/null; then lifecycle_factory_reset; else echo "(lib/lifecycle.sh not loaded — run setup.sh)"; fi ;;
-            9) sudo netmon-config-restore ;;
             b|B) return 0 ;;
             q|Q|exit|quit) return 99 ;;
             *) printf '%s(unknown choice: %s)%s\n' "$C_WARN" "$choice" "$C_OFF" ;;
@@ -610,8 +606,6 @@ else
         rollback)      if declare -f lifecycle_rollback >/dev/null; then lifecycle_rollback; else echo "lib/lifecycle.sh not present"; exit 1; fi ;;
         quick-rebuild) if declare -f lifecycle_quick_rebuild >/dev/null; then lifecycle_quick_rebuild; else echo "lib/lifecycle.sh not present"; exit 1; fi ;;
         factory-reset) if declare -f lifecycle_factory_reset >/dev/null; then lifecycle_factory_reset; else echo "lib/lifecycle.sh not present"; exit 1; fi ;;
-        config-backup) sudo docker compose exec -T collector python -m collector config-backup ;;
-        config-restore) shift; sudo netmon-config-restore "$@" ;;
         help|-h|--help) cmd_help ;;
         *) cmd_help; exit 1 ;;
     esac

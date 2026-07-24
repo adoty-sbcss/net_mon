@@ -20,19 +20,22 @@ UNITS=(
     "netmon-update"
     "netmon-deep-refresh"
     "netmon-watchdog"
-    "netmon-config-backup"
     "netmon-checkin"
     "netmon-console-poll"
     "netmon-wifi-survey"
     "netmon-wifi-experience"
 )
 
-# Legacy unit names from before the App_Mon → NetMon rename. We disable
-# and remove them on every install so boxes that ran the old installer
-# don't keep firing the old timers alongside the new ones.
+# Units that no longer ship: the App_Mon → NetMon rename, plus retired
+# features. We disable and remove them on every install so boxes that ran an
+# older installer don't keep firing dead timers alongside the current ones.
 LEGACY_UNITS=(
     "appmon-update"
     "appmon-deep-refresh"
+    # Retired: the sensor's own /etc/netmon config backup. netmon.env + snmp.yaml
+    # are a materialization of the dashboard's desired_config, so a dead box is
+    # redeployed rather than restored — and the ZIPs held unredacted secrets.
+    "netmon-config-backup"
 )
 
 SUDO=""
@@ -78,7 +81,6 @@ for unit in "${UNITS[@]}"; do
         netmon-update)         script="$REPO_DIR/scripts/auto-update.sh" ;;
         netmon-deep-refresh)   script="$REPO_DIR/scripts/weekly-deep-refresh.sh" ;;
         netmon-watchdog)       script="$REPO_DIR/scripts/netmon-watchdog.sh" ;;
-        netmon-config-backup)  script="$REPO_DIR/scripts/netmon-config-backup.sh" ;;
         netmon-checkin)        script="$REPO_DIR/scripts/netmon-checkin.sh" ;;
         netmon-console-poll)   script="$REPO_DIR/scripts/netmon-console-poll.sh" ;;
         netmon-wifi-survey)    script="$REPO_DIR/scripts/netmon-wifi-survey.sh" ;;
@@ -183,10 +185,8 @@ echo "  systemctl list-timers 'netmon-*.timer'           # next scheduled runs"
 echo "  journalctl -u netmon-update.service -n 50        # last nightly auto-update"
 echo "  journalctl -u netmon-deep-refresh.service -n 50  # last weekly deep refresh"
 echo "  journalctl -u netmon-watchdog.service -n 20      # last watchdog tick"
-echo "  journalctl -u netmon-config-backup.service -n 20 # last config backup"
 echo "  $REPO_DIR/scripts/auto-update.sh                 # run nightly now"
 echo "  $REPO_DIR/scripts/netmon-watchdog.sh             # run watchdog now"
-echo "  $REPO_DIR/scripts/netmon-config-backup.sh        # back up config now"
 echo "  $0 --uninstall                                   # remove all timers"
 echo ""
 

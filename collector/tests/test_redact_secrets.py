@@ -20,7 +20,7 @@ import pytest
 
 from collector.checkin import _redact_secrets
 
-# A realistic Azure blob SAS URL as it appears in a `config-backup` / `upload-now`
+# A realistic Azure blob SAS URL as it appears in an `upload-now`
 # blob error: metadata params (sv/se/sr/sp) precede the `sig` HMAC. The sig value uses
 # percent-encoded base64 (%2B %2F %3D) exactly as Azure emits it.
 _BLOB_SAS = (
@@ -36,7 +36,7 @@ _SAS_SECRET = "aBcD3f%2Bgh4Ij%2FkLmN5oPq%3D"
 # --------------------------------------------------------------------------------------
 
 def test_blob_sas_sig_value_is_masked() -> None:
-    out = _redact_secrets(f"config-backup failed: PUT {_BLOB_SAS} -> 403")
+    out = _redact_secrets(f"upload-now failed: PUT {_BLOB_SAS} -> 403")
     assert _SAS_SECRET not in out, "SAS signature (the credential) leaked"
     assert "sig=***" in out, "param name should be kept, value masked"
 

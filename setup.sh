@@ -57,13 +57,15 @@ ensure_docker_membership
 
 # --- 3. Install netmon-wizard + first-boot profile snippet ---------------
 
-log "Linking netmon-wizard + netmon-config-restore into /usr/local/sbin..."
-# Symlinks (not copies) so any git pull that updates these is picked up
-# automatically. Each script discovers its lib/ relative to its own
-# location, so symlink targets resolve the right lib/.
+log "Linking netmon-wizard into /usr/local/sbin..."
+# Symlink (not a copy) so any git pull that updates it is picked up
+# automatically. The script discovers its lib/ relative to its own
+# location, so the symlink target resolves the right lib/.
 $SUDO ln -sf "$REPO_DIR/bin/netmon-wizard" /usr/local/sbin/netmon-wizard
-$SUDO ln -sf "$REPO_DIR/bin/netmon-config-restore" /usr/local/sbin/netmon-config-restore
-ok "wizard + config-restore linked"
+# Retired: netmon-config-restore. Clean up the stale symlink on boxes that
+# were set up before the sensor-self config backup was removed.
+$SUDO rm -f /usr/local/sbin/netmon-config-restore
+ok "wizard linked"
 
 log "Installing first-boot login prompt to /etc/profile.d/..."
 $SUDO install -m 644 -o root -g root "$REPO_DIR/scripts/netmon-firstboot.sh" \

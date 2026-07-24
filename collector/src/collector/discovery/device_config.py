@@ -5,9 +5,10 @@ Fetch running + startup configuration from a district's managed network devices
 before anything leaves it, and ship the redacted configs box-global in the hourly
 bundle as `device_configs.json`.
 
-DISTINCT from the sensor-self `config_backup` module (which backs up THIS box's
-/etc/netmon files for restore) — this backs up the configs of the NETWORK GEAR the
-sensor monitors.
+Scope: the configs of the NETWORK GEAR the sensor monitors — NOT this box's own
+/etc/netmon files. (The sensor-self config backup was retired: netmon.env +
+snmp.yaml are a materialization of the dashboard's desired_config, so a dead box
+is redeployed rather than restored.)
 
 Security / robustness posture (mirrors dhcp_server.py):
   * OFF by default; targets + per-device SSH credentials ride a 0600 JSON file
