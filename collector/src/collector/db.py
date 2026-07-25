@@ -864,6 +864,27 @@ def inventory_counts() -> dict[str, int]:
             }
 
 
+def _strip_nul(value: Any) -> Any:
+    """Recursively strip NUL (0x00) characters from string values.
+
+    PostgreSQL text/jsonb columns cannot store a NUL, so a single malformed
+    discovery record -- e.g. an Android TV whose mDNS/SSDP data carries an
+    embedded NUL -- would otherwise fail the WHOLE batch insert (and thus the
+    entire scan's persist) with `UntranslatableCharacter`, silently taking a
+    sensor's monitoring offline. Sanitize at this one batch-insert chokepoint;
+    recurse into dict/list so jsonb payloads are cleaned too.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "") if "\x00" in value else value
+    if isinstance(value, dict):
+        return {k: _strip_nul(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_strip_nul(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_nul(v) for v in value)
+    return value
+
+
 def insert_many(
     table: str,
     rows: list[dict[str, Any]],
@@ -887,5 +908,5 @@ def insert_many(
         with conn.cursor() as cur:
             cur.executemany(
                 f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})",
-                [tuple(r.get(c) for c in cols) for r in rows],
+                [tuple(_strip_nul(r.get(c)) for c in cols) for r in rows],
             )
