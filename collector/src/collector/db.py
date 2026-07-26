@@ -885,6 +885,22 @@ def _strip_nul(value: Any) -> Any:
     return value
 
 
+def dumps_jsonb(value: Any, **kwargs: Any) -> str:
+    """``json.dumps`` for a JSONB column, stripping NUL (0x00) from the payload
+    FIRST.
+
+    A raw NUL anywhere in ``value`` gets serialized by ``json.dumps`` into a
+    ``\\u0000`` escape; PostgreSQL's jsonb parser then rejects it with
+    ``UntranslatableCharacter`` ("\\u0000 cannot be converted to text") and the
+    whole INSERT fails. ``insert_many``'s ``_strip_nul`` only reaches values
+    passed as raw Python objects -- a value that is pre-serialized with
+    ``json.dumps`` before it reaches the insert bypasses that guard, which is
+    exactly how one Android TV's mDNS record took a sensor offline. Serialize
+    JSONB payloads through here instead.
+    """
+    return json.dumps(_strip_nul(value), **kwargs)
+
+
 def insert_many(
     table: str,
     rows: list[dict[str, Any]],

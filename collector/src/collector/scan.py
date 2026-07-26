@@ -13,6 +13,7 @@ from .db import (
     DbConnection,
     complete_scan_run,
     connect,
+    dumps_jsonb,
     get_snmp_credentials,
     insert_many,
     insert_scan_run,
@@ -383,7 +384,7 @@ def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
     finally:
         duration = int(time.monotonic() - ctx.started_monotonic)
         notes = (
-            json.dumps({"section_errors": section_errors}, sort_keys=True)
+            dumps_jsonb({"section_errors": section_errors}, sort_keys=True)
             if section_errors
             else None
         )
@@ -784,7 +785,7 @@ def _persist(
                 "snmp_responded": r.get("snmp_responded"),
                 "snmp_version": r.get("snmp_version"),
                 "traceroute_hops": r.get("traceroute_hops"),
-                "traceroute_path": json.dumps(r.get("traceroute_path") or []),
+                "traceroute_path": dumps_jsonb(r.get("traceroute_path") or []),
             }
             for r in reachability
         ], connection=connection)
@@ -799,7 +800,7 @@ def _persist(
                 "hostname": s.get("hostname"),
                 "service_types": s.get("services") or None,
                 "device_hint": s.get("device_hint"),
-                "details": json.dumps(s.get("details") or {}),
+                "details": dumps_jsonb(s.get("details") or {}),
             }
             for s in services
             if s.get("ip")
@@ -822,7 +823,7 @@ def _merge_extra(extra: Any, add: dict[str, Any]) -> str:
     for k, v in add.items():
         if v not in (None, [], {}, ""):
             base[k] = v
-    return json.dumps(base)
+    return dumps_jsonb(base)
 
 
 def _inventory_rows(

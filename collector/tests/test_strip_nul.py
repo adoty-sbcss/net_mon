@@ -8,7 +8,9 @@ ENTIRE scan and leaving the sensor with zero data on the dashboard. db._strip_nu
 sanitizes at the one batch-insert chokepoint (insert_many).
 """
 
-from collector.db import _strip_nul
+import json
+
+from collector.db import _strip_nul, dumps_jsonb
 
 
 def test_strips_nul_from_plain_string():
@@ -33,3 +35,29 @@ def test_non_string_scalars_pass_through():
     assert _strip_nul(42) == 42
     assert _strip_nul(None) is None
     assert _strip_nul(True) is True
+
+
+def test_dumps_jsonb_never_emits_a_nul_escape():
+    """The ACTUAL Cucamonga Middle failure: a NUL inside a JSONB payload that is
+    pre-serialized with json.dumps becomes a ``\\u0000`` escape, which Postgres'
+    jsonb parser rejects (UntranslatableCharacter). Stripping only at insert_many
+    was too late -- json.dumps had already run. dumps_jsonb must strip first so
+    the escape never appears in the serialized string.
+    """
+    raw = {"am": "AndroidTV3,1\x00", "services": ["_airplay._tcp\x00", "ok"]}
+    out = dumps_jsonb(raw)
+    assert "\\u0000" not in out  # the escape Postgres jsonb chokes on
+    assert json.loads(out) == {
+        "am": "AndroidTV3,1",
+        "services": ["_airplay._tcp", "ok"],
+    }
+
+
+def test_plain_json_dumps_WOULD_have_failed():
+    """Guards the regression: the old code path (json.dumps without stripping)
+    emits exactly the escape that killed the insert."""
+    assert "\\u0000" in json.dumps({"am": "AndroidTV3,1\x00"})
+
+
+def test_dumps_jsonb_forwards_kwargs():
+    assert dumps_jsonb({"b": 1, "a": 2}, sort_keys=True) == '{"a": 2, "b": 1}'
