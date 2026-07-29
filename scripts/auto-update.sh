@@ -219,11 +219,30 @@ selfheal_reclone() {
     exec "$REPO_DIR/scripts/auto-update.sh"
 }
 
-# Refuse to run on a dirty working tree — we'd lose local changes.
+# A dirty working tree used to be an unconditional refusal ("we'd lose local
+# changes"). On a sensor APPLIANCE that default is wrong and strands the box on
+# old code forever: there are no legitimate local edits (all config lives in
+# /etc/netmon + /var/lib/netmon — the checkout is pure code), yet a repo cloned
+# by a different user than the one running this script leaves permanent exec-bit
+# / filemode drift that git reports as modified. That "dirt" is never real, but
+# the guard refused every nightly run (Cucamonga elem-mdf + datacenter sat 16h+
+# stuck on 2026-07-29, "No version reported"). Self-heal instead of refusing —
+# this is exactly what docs/help/recover-stuck-sensor tells an admin to do by
+# hand, done automatically:
+#   1. stop counting exec-bit/filemode drift as a change (core.fileMode false)
+#   2. if the tree is STILL dirty, hard-reset to HEAD — safe here: pure code,
+#      nothing to preserve. `git reset --hard` also re-normalizes file modes.
+# Only a tree that survives BOTH steps (e.g. reset failed on a read-only repo)
+# still blocks, so a genuinely unwritable repo is surfaced, not silently ignored.
+git config core.fileMode false 2>/dev/null || true
 if [[ -n "$(git status --porcelain)" ]]; then
-    log "FATAL: working tree has uncommitted changes; refusing to auto-update"
+    log "working tree dirty after normalizing filemode; hard-resetting to HEAD (appliance checkout is pure code — see docs/help/recover-stuck-sensor)"
+    git reset --hard 2>/dev/null || true
+fi
+if [[ -n "$(git status --porcelain)" ]]; then
+    log "FATAL: working tree still dirty after self-heal (core.fileMode false + git reset --hard); refusing to auto-update"
     log "Resolve manually:  cd $REPO_DIR && git status"
-    RESULT_STATUS="failed"; RESULT_REASON="working tree has uncommitted changes; refusing to auto-update"
+    RESULT_STATUS="failed"; RESULT_REASON="working tree still dirty after self-heal (fileMode+reset); refusing to auto-update"
     exit 2
 fi
 
