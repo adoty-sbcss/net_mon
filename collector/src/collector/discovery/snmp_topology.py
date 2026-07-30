@@ -640,10 +640,7 @@ def _strip_quotes(value: str | None) -> str | None:
     """net-snmp wraps strings in double quotes; strip them."""
     if value is None:
         return None
-    v = value.strip()
-    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
-        v = v[1:-1]
-    return v or None
+    return _snmp._strip_wrapping_quotes(value.strip()) or None
 
 
 def _normalize_chassis(raw: str | None) -> str | None:
@@ -658,7 +655,9 @@ def _normalize_chassis(raw: str | None) -> str | None:
     #   "00 11 22 33 44 55"  (space-separated hex)
     #   "0x001122334455"     (0x prefix)
     #   "00:11:22:33:44:55"  (already colons)
-    cleaned = v.replace(" ", "").replace(":", "").replace("-", "")
+    # split() (not replace(" ")) because quick-print hex WRAPS at 16 bytes/line, so
+    # anything longer than a MAC arrives with embedded newlines.
+    cleaned = "".join(v.split()).replace(":", "").replace("-", "")
     if cleaned.lower().startswith("0x"):
         cleaned = cleaned[2:]
     if len(cleaned) == 12 and all(c in "0123456789abcdefABCDEF" for c in cleaned):
@@ -672,7 +671,8 @@ def _normalize_cdp_address(raw: str | None) -> str | None:
     if raw is None:
         return None
     v = _strip_quotes(raw) or ""
-    cleaned = v.replace(" ", "").replace(":", "").lower()
+    # split() over replace(" ") — quick-print hex wraps at 16 bytes/line.
+    cleaned = "".join(v.split()).replace(":", "").lower()
     if cleaned.startswith("0x"):
         cleaned = cleaned[2:]
     if len(cleaned) == 8 and all(c in "0123456789abcdef" for c in cleaned):
@@ -697,7 +697,8 @@ def _decode_lldp_caps(raw: str | None) -> list[str] | None:
     if raw is None:
         return None
     v = _strip_quotes(raw) or ""
-    cleaned = v.replace(" ", "").replace(":", "").lower()
+    # split() over replace(" ") — quick-print hex wraps at 16 bytes/line.
+    cleaned = "".join(v.split()).replace(":", "").lower()
     if cleaned.startswith("0x"):
         cleaned = cleaned[2:]
     if not cleaned or any(c not in "0123456789abcdef" for c in cleaned):
@@ -727,7 +728,8 @@ def _decode_cdp_caps(raw: str | None) -> list[str] | None:
     if raw is None:
         return None
     v = _strip_quotes(raw) or ""
-    cleaned = v.replace(" ", "").replace(":", "").lower()
+    # split() over replace(" ") — quick-print hex wraps at 16 bytes/line.
+    cleaned = "".join(v.split()).replace(":", "").lower()
     if cleaned.startswith("0x"):
         cleaned = cleaned[2:]
     if not cleaned or any(c not in "0123456789abcdef" for c in cleaned):
@@ -749,37 +751,31 @@ def _decode_cdp_caps(raw: str | None) -> list[str] | None:
 
 
 def _snmp_get(ip: str, community: str, oid: str) -> str | None:
-    rc, out = _snmp._run_snmp([
+    rc, out, err = _snmp._run_snmp([
         "snmpget", "-v2c", "-c", community,
         "-t", "2", "-r", "1",
         "-Oqv", ip, oid,
     ])
     if rc != 0:
         return None
-    text = out.strip()
+    # Single -Oqv value: read both streams so a diagnostic trips the marker check.
+    text = (out + err).strip()
     if not text or any(m in text for m in _snmp._SKIP_MARKERS):
         return None
     return text
 
 
 def _snmp_walk(ip: str, community: str, base_oid: str) -> list[tuple[str, str]]:
-    rc, out = _snmp._run_snmp([
+    rc, out, _err = _snmp._run_snmp([
         "snmpbulkwalk", "-v2c", "-c", community,
         "-t", "3", "-r", "1",
         "-Oqn", ip, base_oid,
     ])
     if rc != 0:
         return []
-    rows: list[tuple[str, str]] = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line or any(m in line for m in _snmp._SKIP_MARKERS):
-            continue
-        parts = line.split(" ", 1)
-        if len(parts) != 2:
-            continue
-        rows.append((parts[0], parts[1]))
-    return rows
+    # Shared with snmp._poll_oids so both paths fold multi-line values the same
+    # way — lldpRemSysDesc and cdpCacheVersion are multi-line on Cisco/Junos.
+    return _snmp.parse_oqn_output(out)
 
 
 def _walk_col(ip: str, community: str, base_oid: str) -> dict[str, str]:
