@@ -640,10 +640,7 @@ def _strip_quotes(value: str | None) -> str | None:
     """net-snmp wraps strings in double quotes; strip them."""
     if value is None:
         return None
-    v = value.strip()
-    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
-        v = v[1:-1]
-    return v or None
+    return _snmp._strip_wrapping_quotes(value.strip()) or None
 
 
 def _normalize_chassis(raw: str | None) -> str | None:
@@ -770,16 +767,9 @@ def _snmp_walk(ip: str, community: str, base_oid: str) -> list[tuple[str, str]]:
     ])
     if rc != 0:
         return []
-    rows: list[tuple[str, str]] = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line or any(m in line for m in _snmp._SKIP_MARKERS):
-            continue
-        parts = line.split(" ", 1)
-        if len(parts) != 2:
-            continue
-        rows.append((parts[0], parts[1]))
-    return rows
+    # Shared with snmp._poll_oids so both paths fold multi-line values the same
+    # way — lldpRemSysDesc and cdpCacheVersion are multi-line on Cisco/Junos.
+    return _snmp.parse_oqn_output(out)
 
 
 def _walk_col(ip: str, community: str, base_oid: str) -> dict[str, str]:

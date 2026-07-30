@@ -20,6 +20,7 @@ OUIs — see scan.py::_snmp_candidates) so the trial stays fast.
 """
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import time
@@ -121,6 +122,60 @@ _SKIP_MARKERS = (
     "Timeout",
     "No Response",
 )
+
+# A varbind line under -Oqn starts with a dotted-NUMERIC OID (n = numeric), e.g.
+#   .1.3.6.1.2.1.1.1.0 Cisco IOS Software, ...
+# Anything else is a CONTINUATION of the previous value: Cisco IOS/IOS-XE, Junos
+# and ArubaOS all return a MULTI-LINE sysDescr, and lldpRemSysDesc /
+# cdpCacheVersion carry the same text out of a walk. Treating every line as a new
+# varbind truncated those values at line 1 AND minted bogus rows for any
+# continuation that happened to contain a space ("Technical Support: ..." became
+# an oid of "Technical").
+_OID_LINE_RE = re.compile(r"^\.\d[\d.]*(?=\s|$)")
+
+
+def _strip_wrapping_quotes(value: str) -> str:
+    """net-snmp wraps multi-line string values in double quotes; strip them.
+
+    Same rule as snmp_topology._strip_quotes (both ends must be quotes, so a
+    value that merely starts with one is left alone)."""
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return value[1:-1]
+    return value
+
+
+def parse_oqn_output(text: str) -> list[tuple[str, str]]:
+    """Parse `-Oqn` output into (numeric_oid, value) pairs.
+
+    Handles multi-line values by folding continuation lines into the current
+    varbind. A line carrying a _SKIP_MARKERS marker ends the current varbind and
+    is dropped — that covers both "No Such Object" varbinds and the trailing
+    "Timeout: No Response from <ip>" that _run_snmp merges in from stderr, which
+    would otherwise be glued onto the last real value.
+    """
+    collected: list[tuple[str, list[str]]] = []
+    current: list[str] | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if any(marker in line for marker in _SKIP_MARKERS):
+            current = None
+            continue
+        match = _OID_LINE_RE.match(line)
+        if match is None:
+            if current is not None:
+                current.append(line)
+            continue
+        current = [line[match.end():].strip()]
+        collected.append((match.group(0), current))
+    rows: list[tuple[str, str]] = []
+    for oid_str, parts in collected:
+        value = _strip_wrapping_quotes("\n".join(parts).strip())
+        if not value:
+            continue  # valueless varbind — nothing worth storing
+        rows.append((oid_str, value))
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -288,15 +343,9 @@ def _poll_oids(
         ])
         if rc != 0:
             continue
-        for line in out.splitlines():
-            line = line.strip()
-            if not line or any(marker in line for marker in _SKIP_MARKERS):
-                continue
-            # -Oqn output is "<numeric-oid> <value>"; value may contain spaces.
-            parts = line.split(" ", 1)
-            if len(parts) != 2:
-                continue
-            oid_str, value = parts[0], parts[1]
+        # -Oqn output is "<numeric-oid> <value>"; the value may contain spaces
+        # AND newlines (sysDescr on Cisco/Junos), so fold continuation lines in.
+        for oid_str, value in parse_oqn_output(out):
             rows.append({
                 "device_ip": ip,
                 "oid": oid_str,
