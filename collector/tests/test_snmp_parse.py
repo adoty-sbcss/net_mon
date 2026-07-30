@@ -91,14 +91,68 @@ def test_absent_object_varbinds_are_skipped() -> None:
     assert snmp.parse_oqn_output(out) == [(".1.3.6.1.2.1.1.5.0", "core-sw1")]
 
 
-def test_trailing_timeout_is_not_glued_onto_the_last_value() -> None:
-    """_run_snmp concatenates stderr after stdout; that text has no leading OID
-    and must not be folded into the preceding varbind as a continuation."""
+def test_end_of_walk_trailer_is_not_glued_onto_the_last_value() -> None:
+    """A walk prints "No more variables left in this MIB View" on stdout after the
+    last varbind; it has no leading OID and must not fold in as a continuation."""
     out = (
         ".1.3.6.1.2.1.1.5.0 core-sw1\n"
-        "Timeout: No Response from 10.8.2.100\n"
+        "No more variables left in this MIB View (It is past the end of the MIB tree)\n"
     )
     assert snmp.parse_oqn_output(out) == [(".1.3.6.1.2.1.1.5.0", "core-sw1")]
+
+
+def test_stderr_never_reaches_the_parser() -> None:
+    """The structural guard behind the case above: _run_snmp keeps stdout and
+    stderr SEPARATE, so a diagnostic line can't be folded into a real value.
+
+    This is the one that bites — "Cannot find module (SNMPv2-MIB)" carries no skip
+    marker, so if the streams were concatenated it would silently become part of
+    the preceding sysName rather than a droppable junk row."""
+    assert snmp._run_snmp(["definitely-not-a-real-binary"]) == (
+        1, "", "definitely-not-a-real-binary not found")
+
+
+def test_generic_timeout_wording_inside_a_value_is_not_truncated() -> None:
+    """"Timeout"/"No Response" are stderr-only and deliberately NOT line-level
+    filters: a free-form vendor descr may legitimately contain the word, and
+    dropping the line would truncate the value AND strand the opening quote."""
+    out = (
+        '.1.3.6.1.2.1.1.1.0 "ACME OS v4\n'
+        "Session Timeout Manager included\n"
+        'Compiled 2020"\n'
+    )
+    rows = snmp.parse_oqn_output(out)
+    assert len(rows) == 1
+    assert rows[0][1] == "ACME OS v4\nSession Timeout Manager included\nCompiled 2020"
+    assert not rows[0][1].startswith('"')
+    # ...but the whole-output health checks still treat it as a failure signal.
+    assert "Timeout" in snmp._SKIP_MARKERS
+    assert "Timeout" not in snmp._STDOUT_SKIP_MARKERS
+
+
+def test_continuation_starting_with_a_dotted_number_is_not_a_new_varbind() -> None:
+    """A value wrapping as ".5 build 1234" must not mint a varbind with oid ".5"
+    (which would also split the value and strand both quotes)."""
+    out = '.1.3.6.1.2.1.1.1.0 "Firmware v2\n.5 build 1234"\n'
+    rows = snmp.parse_oqn_output(out)
+    assert rows == [(".1.3.6.1.2.1.1.1.0", "Firmware v2\n.5 build 1234")]
+
+
+def test_every_polled_oid_is_matched_by_the_varbind_discriminator() -> None:
+    """The regex requires >=6 arcs; assert no OID this module polls falls below it,
+    for the DEFAULT_OIDS set and the topology bases alike."""
+    bases = [oid for _n, oid, _w in snmp.DEFAULT_OIDS] + [
+        snmp_topology.LLDP_REM_TABLE,
+        snmp_topology.LLDP_REM_MAN_TBL,
+        snmp_topology.CDP_CACHE_TABLE,
+        snmp_topology.DOT1D_TPFDB_PORT,
+        snmp_topology.DOT1D_BASEPORT_IFINDEX,
+        snmp_topology.DOT1D_STP_ROOT_PORT,
+        snmp_topology.SYS_DESCR,
+    ]
+    for base in bases:
+        line = f".{base.lstrip('.')}.1 somevalue"
+        assert snmp._OID_LINE_RE.match(line), f"{base} not recognized as a varbind"
 
 
 def test_valueless_and_empty_lines_produce_no_rows() -> None:
@@ -119,11 +173,11 @@ def test_quotes_only_stripped_when_they_wrap_the_whole_value() -> None:
 
 def test_poll_oids_stores_the_whole_multiline_sysdescr(monkeypatch) -> None:
     """End-to-end through _poll_oids: one sysDescr row, Compiled date intact."""
-    def fake_run(cmd: list[str]) -> tuple[int, str]:
+    def fake_run(cmd: list[str]) -> tuple[int, str, str]:
         oid = cmd[-1]
         if oid == snmp.SYSDESCR_OID:
-            return 0, CISCO_SYSDESCR
-        return 0, ""
+            return 0, CISCO_SYSDESCR, ""
+        return 0, "", ""
 
     monkeypatch.setattr(snmp, "_run_snmp", fake_run)
     rows = snmp._poll_oids("10.8.2.1", "public", include_bulk=False)
@@ -143,7 +197,7 @@ def test_get_and_walk_paths_agree_on_the_same_value(monkeypatch) -> None:
     value_only = CISCO_SYSDESCR.split(" ", 1)[1]  # what -Oqv prints (no OID)
 
     monkeypatch.setattr(snmp_topology._snmp, "_run_snmp",
-                        lambda cmd: (0, value_only))
+                        lambda cmd: (0, value_only, ""))
     via_get = snmp_topology._strip_quotes(
         snmp_topology._snmp_get("10.8.2.1", "public", snmp_topology.SYS_DESCR))
 

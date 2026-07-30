@@ -113,12 +113,22 @@ BULK_OID_NAMES = frozenset({
     "dot1qTpFdbPort",
 })
 
-# Lines net-snmp emits for absent objects — we skip these when parsing walks.
-_SKIP_MARKERS = (
+# Markers net-snmp emits on STDOUT in place of / after a varbind. These are the
+# only ones the -Oqn parser may act on, because acting on a marker THROWS AWAY the
+# rest of a multi-line value: they have to be specific enough that they cannot
+# occur inside real vendor text.
+_STDOUT_SKIP_MARKERS = (
     "No Such Object",
     "No Such Instance",
     "No more variables",
     "End of MIB",
+)
+
+# Everything above plus the stderr-only timeout text. "Timeout" / "No Response" are
+# generic enough to appear inside a free-form entPhysicalDescr or hrDeviceDescr, so
+# they are used ONLY for the whole-output health checks (_probe / _snmp_get), never
+# for line-level filtering inside a value.
+_SKIP_MARKERS = _STDOUT_SKIP_MARKERS + (
     "Timeout",
     "No Response",
 )
@@ -131,7 +141,12 @@ _SKIP_MARKERS = (
 # varbind truncated those values at line 1 AND minted bogus rows for any
 # continuation that happened to contain a space ("Technical Support: ..." became
 # an oid of "Technical").
-_OID_LINE_RE = re.compile(r"^\.\d[\d.]*(?=\s|$)")
+#
+# The {5,} floor (≥6 arcs) is what keeps a continuation line that merely STARTS with
+# a dotted number from minting a varbind — a sysDescr wrapping mid-version as
+# ".5 build 1234" would otherwise split the value in two. Every OID this module
+# polls has at least 8 arcs, and the LLDP base (.1.0.8802.1.1.2.1.4.1.1) has 11.
+_OID_LINE_RE = re.compile(r"^\.\d+(?:\.\d+){5,}(?=\s|$)")
 
 
 def _strip_wrapping_quotes(value: str) -> str:
@@ -147,11 +162,14 @@ def _strip_wrapping_quotes(value: str) -> str:
 def parse_oqn_output(text: str) -> list[tuple[str, str]]:
     """Parse `-Oqn` output into (numeric_oid, value) pairs.
 
+    `text` must be STDOUT ONLY — a stderr line folded in as a continuation would
+    corrupt the preceding value.
+
     Handles multi-line values by folding continuation lines into the current
-    varbind. A line carrying a _SKIP_MARKERS marker ends the current varbind and
-    is dropped — that covers both "No Such Object" varbinds and the trailing
-    "Timeout: No Response from <ip>" that _run_snmp merges in from stderr, which
-    would otherwise be glued onto the last real value.
+    varbind. A line carrying a _STDOUT_SKIP_MARKERS marker ends the current
+    varbind and is dropped: that covers both "No Such Object" varbinds and the
+    "No more variables left in this MIB View" trailer a walk prints on stdout,
+    which would otherwise be glued onto the last real value.
     """
     collected: list[tuple[str, list[str]]] = []
     current: list[str] | None = None
@@ -159,7 +177,7 @@ def parse_oqn_output(text: str) -> list[tuple[str, str]]:
         line = raw.strip()
         if not line:
             continue
-        if any(marker in line for marker in _SKIP_MARKERS):
+        if any(marker in line for marker in _STDOUT_SKIP_MARKERS):
             current = None
             continue
         match = _OID_LINE_RE.match(line)
@@ -305,14 +323,15 @@ def _select_community(
 
 def _probe(ip: str, community: str) -> bool:
     """Quick sysDescr GET. True if the agent answers with a real value."""
-    rc, out = _run_snmp([
+    rc, out, err = _run_snmp([
         "snmpget", "-v2c", "-c", community,
         "-t", PROBE_TIMEOUT, "-r", PROBE_RETRIES,
         "-Oqv", ip, SYSDESCR_OID,
     ])
     if rc != 0:
         return False
-    text = out.strip()
+    # Health check, not a value — read both streams so a diagnostic still counts.
+    text = (out + err).strip()
     if not text:
         return False
     return not any(marker in text for marker in _SKIP_MARKERS)
@@ -336,7 +355,7 @@ def _poll_oids(
         if not include_bulk and name in BULK_OID_NAMES:
             continue  # heavy bulk walk not due this scan
         tool = "snmpbulkwalk" if is_walk else "snmpget"
-        rc, out = _run_snmp([
+        rc, out, _err = _run_snmp([
             tool, "-v2c", "-c", community,
             "-t", POLL_TIMEOUT, "-r", POLL_RETRIES,
             "-Oqn", ip, oid,   # -O q (no type/'=') n (numeric OIDs) => "<oid> <value>"
@@ -355,8 +374,15 @@ def _poll_oids(
     return rows
 
 
-def _run_snmp(cmd: list[str]) -> tuple[int, str]:
-    """Run a net-snmp command. Returns (returncode, stdout+stderr).
+def _run_snmp(cmd: list[str]) -> tuple[int, str, str]:
+    """Run a net-snmp command. Returns (returncode, stdout, stderr).
+
+    stdout and stderr are kept SEPARATE on purpose. Varbinds only ever appear on
+    stdout, and the -Oqn parser folds any line without a leading OID into the
+    preceding value — so concatenating the two streams would let a stray stderr
+    line ("Cannot find module (SNMPv2-MIB): ...") corrupt a real value. Callers
+    that want the diagnostic text (the probe, which reads it for skip markers)
+    join them explicitly.
 
     Wrong community on SNMPv2c usually yields no response (the agent silently
     drops it), so a bad community surfaces as a non-zero exit / timeout rather
@@ -367,7 +393,7 @@ def _run_snmp(cmd: list[str]) -> tuple[int, str]:
             cmd, capture_output=True, text=True, timeout=30, check=False,
         )
     except FileNotFoundError:
-        return 1, f"{cmd[0]} not found"
+        return 1, "", f"{cmd[0]} not found"
     except subprocess.TimeoutExpired:
-        return 1, "timeout"
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        return 1, "", "timeout"
+    return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
