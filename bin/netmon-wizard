@@ -4,7 +4,6 @@
 # Usage:
 #   netmon-wizard               # full wizard (essentials -> ask advanced -> advanced)
 #   netmon-wizard identity      # just the district/school/device prompts
-#   netmon-wizard sftp          # just the SFTP destination
 #   netmon-wizard snmp          # just SNMP communities
 #   netmon-wizard advanced      # just scan mode/cadence/log-level
 #
@@ -39,7 +38,6 @@ cd "$REPO_DIR"
 . "$LIB_DIR/provisioning.sh"
 . "$LIB_DIR/validate.sh"
 . "$LIB_DIR/identity.sh"
-. "$LIB_DIR/sftp.sh"
 . "$LIB_DIR/snmp.sh"
 . "$LIB_DIR/dashboard.sh"
 . "$LIB_DIR/advanced.sh"
@@ -54,8 +52,8 @@ ensure_paths
 # show sensible defaults instead of blank lines.
 seed_env_from_example "$REPO_DIR/.env.example"
 
-# Overlay any site provisioning defaults (dashboard URL, bootstrap key, and
-# optionally shared SFTP fields) so they appear pre-filled at the prompts.
+# Overlay any site provisioning defaults (dashboard URL, bootstrap key) so they
+# appear pre-filled at the prompts.
 # Only fills keys that are still empty — never clobbers an operator's value.
 seed_env_from_provisioning
 
@@ -68,7 +66,7 @@ ${C_HEAD}╔══════════════════════�
 
 This walks you through the settings the box needs to start collecting
 and uploading. You can re-run any time with:  sudo netmon-wizard
-Per-section runs:  sudo netmon-wizard identity | sftp | snmp | dashboard | trunk | advanced
+Per-section runs:  sudo netmon-wizard identity | snmp | dashboard | trunk | advanced
 
 Press Enter at any prompt to keep the current value (shown in brackets).
 
@@ -88,18 +86,20 @@ run_essentials() {
         log "Generated random POSTGRES_PASSWORD"
     fi
 
-    # SFTP: if the upload destination is fully provisioned (host + user +
-    # password already seeded from config/provisioning.env), don't ask — just use
-    # it. The tech only types the per-site identity. Not provisioned -> prompt.
-    if _sftp_provisioned; then
-        echo ""
-        ok "SFTP upload destination is pre-configured: $(current_value NETMON_SFTP_USER)@$(current_value NETMON_SFTP_HOST)"
-        echo "  (change it any time with: sudo netmon-wizard sftp)"
-        set_value NETMON_SFTP_ENABLED "true"
-        [[ -z "$(current_value NETMON_DEVICE_NAME)" ]] && \
-            set_value NETMON_DEVICE_NAME "$(current_value NETMON_DEVICE)"
-    else
-        prompt_sftp_config "$(current_value NETMON_DEVICE)"
+    # Bundle uploads need no prompts at all. The box ships over HTTPS to the
+    # dashboard (bundle_transport=blob), which the dashboard arms remotely when
+    # an admin marks the sensor installed — that's the staging guardrail, so a
+    # box prepped at one site never uploads as if it were at its destination.
+    # There is nothing here for a tech to type. (This used to walk them through
+    # an SFTP host/user/password; the depot stopped accepting SFTP at the blob
+    # cutover and the collector has no SFTP code left.)
+    #
+    # Keep the device-name default the upload path still tags bundles with. NOTE
+    # the explicit `if` rather than `[[ ... ]] && set_value` — this is the last
+    # statement in the function, so under `set -e` a false test would make
+    # run_essentials return 1 and abort the wizard.
+    if [[ -z "$(current_value NETMON_DEVICE_NAME)" ]]; then
+        set_value NETMON_DEVICE_NAME "$(current_value NETMON_DEVICE)"
     fi
 }
 
@@ -142,7 +142,7 @@ run_full() {
     echo ""
     echo "Useful next steps:"
     echo "  ./netmon status         # check container state"
-    echo "  ./netmon upload-test    # verify SFTP creds"
+    echo "  ./netmon upload-test    # verify the upload path"
     echo "  ./netmon                # interactive menu"
     echo ""
 }
@@ -152,7 +152,6 @@ run_full() {
 case "${1:-}" in
     ""|all|full)   run_full ;;
     identity)      prompt_identity_config ;;
-    sftp)          prompt_sftp_config "$(current_value NETMON_DEVICE)" ;;
     snmp)          prompt_snmp_config ;;
     dashboard)     prompt_dashboard_config ;;
     advanced)      prompt_advanced_config ;;
@@ -164,7 +163,7 @@ case "${1:-}" in
         ;;
     *)
         echo "ERROR: unknown section: $1" >&2
-        echo "Try: identity | sftp | snmp | dashboard | advanced | cadence | loglevel | trunk" >&2
+        echo "Try: identity | snmp | dashboard | advanced | cadence | loglevel | trunk" >&2
         exit 1
         ;;
 esac

@@ -14,14 +14,10 @@
 # Format is a plain KEY=VALUE list using the SAME names as netmon.env, e.g.:
 #   NETMON_DASHBOARD_URL=https://netmon.example.org
 #   NETMON_BOOTSTRAP_KEY=nmk_xxxxxxxxxxxxxxxxxxxxxxxx
-#   # optional, if your SFTP drop is shared across the fleet:
-#   NETMON_SFTP_HOST=acct.blob.core.windows.net
-#   NETMON_SFTP_USER=acct.sensor
-#   NETMON_SFTP_REMOTE_PATH=/
 #
 # SECURITY: the bootstrap key is a shared secret and this repo is PUBLIC, so
 # config/provisioning.env is git-ignored and must NEVER be committed. Generate
-# its contents from the dashboard (Settings -> SFTP ingestion -> Sensor
+# its contents from the dashboard (Settings -> Ingestion -> Sensor
 # auto-enrollment) and place it on each box out-of-band.
 #
 # Source AFTER common.sh, paths.sh, envfile.sh.
