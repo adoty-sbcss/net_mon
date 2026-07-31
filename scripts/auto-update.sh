@@ -236,13 +236,20 @@ selfheal_reclone() {
 # still blocks, so a genuinely unwritable repo is surfaced, not silently ignored.
 git config core.fileMode false 2>/dev/null || true
 if [[ -n "$(git status --porcelain)" ]]; then
-    log "working tree dirty after normalizing filemode; hard-resetting to HEAD (appliance checkout is pure code — see docs/help/recover-stuck-sensor)"
+    log "working tree dirty after normalizing filemode; restoring to HEAD (appliance checkout is pure code — see docs/help/recover-stuck-sensor)"
     git reset --hard 2>/dev/null || true
+    # `reset --hard` does NOT remove UNTRACKED files, so one stray file (nohup.out,
+    # a .orig from a failed merge, an operator's scratch copy) would leave the tree
+    # permanently dirty and re-wedge the box exactly the way the Cucamonga exec-bit
+    # did. -d also clears untracked directories.
+    # Deliberately NOT -x: gitignored state must survive — above all the repo-root
+    # .env that pins NETMON_IMAGE_TAG, which every later compose call reads.
+    git clean -fd 2>/dev/null || true
 fi
 if [[ -n "$(git status --porcelain)" ]]; then
-    log "FATAL: working tree still dirty after self-heal (core.fileMode false + git reset --hard); refusing to auto-update"
+    log "FATAL: working tree still dirty after self-heal (fileMode + reset + clean); refusing to auto-update"
     log "Resolve manually:  cd $REPO_DIR && git status"
-    RESULT_STATUS="failed"; RESULT_REASON="working tree still dirty after self-heal (fileMode+reset); refusing to auto-update"
+    RESULT_STATUS="failed"; RESULT_REASON="working tree still dirty after self-heal (fileMode+reset+clean); refusing to auto-update"
     exit 2
 fi
 
