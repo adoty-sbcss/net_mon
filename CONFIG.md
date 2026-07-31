@@ -35,17 +35,17 @@ in. **Never commit `config/provisioning.env`** (it's git-ignored).
 
 | Variable | What it is |
 |----------|-----------|
-| `NETMON_DASHBOARD_URL` | Your NetMon dashboard's base URL (e.g. `https://netmon.yourcoe.org`). Blank = SFTP-only, no control plane. |
+| `NETMON_DASHBOARD_URL` | Your NetMon dashboard's base URL (e.g. `https://netmon.yourcoe.org`). Blank = no control plane, and nowhere to ship bundles. |
 | `NETMON_BOOTSTRAP_KEY` | Shared self-enrollment key from the dashboard (or use a per-spot token from the deploy page). Secret — never committed. |
 | `NETMON_DISTRICT` / `NETMON_SCHOOL` / `NETMON_DEVICE` | Human names; auto-slugged. They tag every scan and organize uploads into `<district>/<school>/<device>/`. |
-| `NETMON_SFTP_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_REMOTE_PATH` | Where bundles are uploaded. For tenants, the deploy page issues a per-district SFTP user scoped to your folder. |
+| `NETMON_BUNDLE_TRANSPORT` | `blob` = ship bundles over HTTPS to the dashboard. Anything else = the pre-install staging state, uploads OFF. Set remotely by the dashboard when a sensor is marked installed; you shouldn't need to touch it. |
 | `NETMON_DNS_TEST_NAMES` | Public names probed for DNS health. Append your own domain to verify internal resolution. |
 
 See `.env.example` for the full set of optional knobs (scan cadence, SNMP
 communities, crawl scope, etc.). All have safe defaults.
 
 ## What stays out of the repo
-- The dashboard URL, bootstrap key, and SFTP credentials (injected per deploy).
+- The dashboard URL and bootstrap key (injected per deploy).
 - Any org/internal domain names.
 - The dashboard application + Azure infrastructure (a separate, privately-hosted
   app — sensors only need its URL).

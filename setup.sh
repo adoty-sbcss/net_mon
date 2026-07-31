@@ -137,11 +137,12 @@ else
 fi
 
 echo ""
-if prompt_yesno "Test the SFTP connection now?" "Y"; then
+if prompt_yesno "Test the upload path now?" "Y"; then
     if dc exec -T collector python -m collector upload-test; then
-        ok "SFTP test passed"
+        ok "upload test passed"
     else
-        warn "SFTP test failed. Re-run 'sudo netmon-wizard sftp' to update credentials."
+        warn "upload test failed. A box that hasn't been marked installed on the"
+        warn "dashboard has uploads OFF on purpose (staging) — that's expected here."
     fi
 fi
 
@@ -202,7 +203,6 @@ echo ""
 echo "  3. Reconfigure any time:"
 echo "       sudo netmon-wizard               # full re-run"
 echo "       sudo netmon-wizard identity      # just district/school/device"
-echo "       sudo netmon-wizard sftp          # just SFTP destination"
 echo "       sudo netmon-wizard snmp          # just SNMP communities"
 echo "       sudo netmon-wizard trunk         # VLAN trunk monitoring (many VLANs / box)"
 echo "       sudo netmon-wizard advanced      # scan mode / cadence / log level"

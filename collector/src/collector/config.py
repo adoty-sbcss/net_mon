@@ -66,7 +66,10 @@ class Settings(BaseSettings):
     # explicit and ignores this.
     exclude_vlans: str = Field(default="", alias="NETMON_EXCLUDE_VLANS")
 
-    snmp_enabled: bool = Field(default=False, alias="NETMON_SNMP_ENABLED")
+    # On by default. With no community configured this is a no-op (nothing to
+    # authenticate with), so arming it costs nothing and the box starts polling
+    # the moment a community is pushed for its district.
+    snmp_enabled: bool = Field(default=True, alias="NETMON_SNMP_ENABLED")
     snmp_config: Path = Field(default=Path("/etc/netmon/snmp.yaml"), alias="NETMON_SNMP_CONFIG")
     # Comma-separated list of v2c communities to try, in order. The first one
     # to get a response for a given device gets cached in snmp_credentials.
@@ -97,9 +100,11 @@ class Settings(BaseSettings):
     # Comma-separated.
     snmp_exclude: str = Field(default="", alias="NETMON_SNMP_EXCLUDE")
 
-    # SNMP topology crawl (Path B). Off by default — turn on once SNMP is
-    # working against your switches and you want fabric topology in bundles.
-    snmp_topology_enabled: bool = Field(default=False, alias="NETMON_SNMP_TOPOLOGY_ENABLED")
+    # SNMP topology crawl (Path B). On by default, but it can't run away: it
+    # needs snmp_enabled AND a working community AND candidate seeds, and it is
+    # interval-gated (see snmp_topology_interval below), so at most ~weekly. The
+    # scope defaults to 'spine' (path-to-internet), not a full-fabric crawl.
+    snmp_topology_enabled: bool = Field(default=True, alias="NETMON_SNMP_TOPOLOGY_ENABLED")
     # Max hops from a seed device. 5 covers most school-district fabrics
     # without going wild on internet-facing gear.
     snmp_topology_max_depth: int = Field(

@@ -49,13 +49,3 @@ is_valid_port() {
     [[ "$p" =~ ^[0-9]+$ ]] || return 1
     (( p >= 1 && p <= 65535 ))
 }
-
-# detect_userhost_in_host — if the SFTP host field contains '@',
-# echo "user host" so the caller can offer to split. Returns 0 if split needed,
-# 1 if not.
-detect_userhost_in_host() {
-    local value="$1"
-    [[ "$value" == *"@"* ]] || return 1
-    printf '%s %s' "${value%@*}" "${value#*@}"
-    return 0
-}

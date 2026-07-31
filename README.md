@@ -1,8 +1,8 @@
 # NetMon — quick start
 
-Plug an Ubuntu box into a network, collect everything about it, ship the data to your SFTP server every hour. Upload the ZIPs to Claude for analysis.
+Plug an Ubuntu box into a network, collect everything about it, ship the data to your NetMon dashboard every hour.
 
-> **Want the whole-system picture?** The architecture diagrams — sensor → SFTP → dashboard ingest/analysis, provisioning, and the remote-console broker — live in the dashboard repo: [netmon-dashboard/docs/ARCHITECTURE.md](https://github.com/adoty-sbcss/netmon-dashboard/blob/main/docs/ARCHITECTURE.md).
+> **Want the whole-system picture?** The architecture diagrams — sensor → dashboard ingest/analysis, provisioning, and the remote-console broker — live in the dashboard repo: [netmon-dashboard/docs/ARCHITECTURE.md](https://github.com/adoty-sbcss/netmon-dashboard/blob/main/docs/ARCHITECTURE.md).
 
 ---
 
@@ -12,7 +12,7 @@ After `./setup.sh` runs, the canonical paths on the box are:
 
 | Path | Contents |
 |---|---|
-| `/etc/netmon/netmon.env` | All configuration (SFTP creds, SNMP, identity). `chmod 600`. |
+| `/etc/netmon/netmon.env` | All configuration (identity, SNMP, dashboard enrollment). `chmod 600`. |
 | `/etc/netmon/snmp.yaml` | Optional per-device SNMP overrides. |
 | `/var/lib/netmon/bundles/` | Hourly ZIPs awaiting upload + recent uploads. |
 | `/var/log/netmon/` | `collector.log` + `audit.log`, rotated nightly. |
@@ -42,7 +42,7 @@ The dashboard URL and the shared enrollment **bootstrap key** are identical on e
 ```bash
 cp config/provisioning.env.example config/provisioning.env
 # paste the URL + key the dashboard shows under
-#   Settings → SFTP ingestion → Sensor auto-enrollment
+#   Settings → Ingestion → Sensor auto-enrollment
 $EDITOR config/provisioning.env
 ```
 
@@ -55,25 +55,25 @@ On first run the wizard pre-fills the dashboard URL and bootstrap key from this 
 `setup.sh` invokes `netmon-wizard` which walks you through:
 
 **Essentials**:
-- **Identity** (always asked) — district, school, and device/location label (e.g. "Library IDF"). These tag every scan and organize uploads on the SFTP server into `<district>/<school>/<device>/` folders.
-- **SFTP destination** — host, port, user, password (silent), remote path. **Skipped automatically when it's already provisioned** (host + user + password from `config/provisioning.env`); only prompted on a box without provisioned SFTP creds.
+- **Identity** (always asked) — district, school, and device/location label (e.g. "Library IDF"). These tag every scan and organize uploads into `<district>/<school>/<device>/` folders.
+
+There is no upload destination to configure. Bundles ship over HTTPS to the dashboard, and the dashboard arms uploads remotely when an admin marks the sensor installed — until then the box scans and bundles locally but pushes nothing, so a box prepped at one site can't pollute its destination school.
 
 **Dashboard enrollment**:
-- **Dashboard URL** and **bootstrap key** — **skipped automatically when provisioned** (URL + key from `config/provisioning.env`); the box auto-enrolls on its first check-in. Only prompted on a box without provisioned enrollment values (leave the URL blank there to run an SFTP-only box with no dashboard).
+- **Dashboard URL** and **bootstrap key** — **skipped automatically when provisioned** (URL + key from `config/provisioning.env`); the box auto-enrolls on its first check-in. Only prompted on a box without provisioned enrollment values (a box with no dashboard URL collects locally but has nowhere to ship bundles).
 
 **Then** the wizard asks "Set up advanced options now?" — say yes only if you want to override defaults for:
 - SNMP communities (if you have read strings for switches/routers)
 - Scan mode (`field` vs `monitor`)
 - Capture cadence / log level
 
-After the wizard, `setup.sh` builds the containers, starts them, and offers to test the SFTP connection.
+After the wizard, `setup.sh` builds the containers, starts them, and offers to test the upload path.
 
 ### Re-running the wizard later
 
 ```bash
 sudo netmon-wizard               # full re-run (current values shown as defaults)
 sudo netmon-wizard identity      # just district / school / device
-sudo netmon-wizard sftp          # just SFTP destination
 sudo netmon-wizard snmp          # just SNMP communities
 sudo netmon-wizard dashboard     # just dashboard URL + enrollment bootstrap key
 sudo netmon-wizard advanced      # mode / cadence / log level
@@ -94,7 +94,7 @@ A `/etc/profile.d/` snippet posts a reminder on the first interactive login that
 | Trigger | What it does |
 |---|---|
 | Plug in a network cable | Detects new IP within 30s, runs a ~1-minute scan |
-| Top of every hour | Bundles all scans from the past hour into one ZIP, uploads to your SFTP server |
+| Top of every hour | Bundles all scans from the past hour into one ZIP, uploads to the dashboard |
 
 Upload filename format: `<deviceName>_YYYY_MM_DD_HH.zip` (hour is the just-completed hour in local time). If no scans happened in the hour, no file is uploaded.
 
@@ -139,13 +139,13 @@ The menu is **main + 3 submenus**:
 NetMon — Operations
   1) Status overview            5) Manual scan
   2) Tail live logs             6) Force upload now
-  3) Audit log                  7) Test SFTP connection
+  3) Audit log                  7) Test upload path
   4) Recent scans               8) Restart containers
 
   c) Configure ▶   s) System ▶   d) Diagnostics ▶   q) Quit
 ```
 
-- **Configure ▶** — Identity / SFTP / SNMP / scan mode / cadence / log level / show config / re-run full wizard. (All delegate to `netmon-wizard`.)
+- **Configure ▶** — Identity / SNMP / scan mode / cadence / log level / show config / re-run full wizard. (All delegate to `netmon-wizard`.)
 - **System ▶** — Bundle history / update timer schedule / run update now / version info / reboot.
 - **Diagnostics ▶** — Ping / DNS lookup / collector self-test (from inside the collector container).
 
@@ -157,9 +157,8 @@ Frequently-used one-shots:
 ./netmon audit          # high-signal event log
 ./netmon scan eth0      # manual scan
 ./netmon upload-now     # force-build + ship the current bundle
-./netmon upload-test    # SFTP connection check
+./netmon upload-test    # upload path check
 ./netmon wizard         # alias for sudo netmon-wizard
-./netmon sftp           # alias for sudo netmon-wizard sftp
 ./netmon version        # git SHA + image + wizard status
 ./netmon help           # full list
 ```
@@ -232,7 +231,7 @@ The switch port must already be a trunk that allows those VLANs — the sensor c
 
 **Field notes:** trunk monitoring needs **systemd-networkd** (the Ubuntu Server default) — on a NetworkManager box the wizard warns and the VLANs may not attach. The apply uses `netplan try` (auto-reverts in 120s if it can't reach the network), so a bad VLAN change can't strand the box. If **detection sees no VLANs on a known-good trunk**, the NIC may be stripping 802.1Q tags in hardware before capture — turn that off with `sudo ethtool -K <parent> rxvlan off` and re-run, or just enter the VLANs manually (detection is only a convenience; the sub-interfaces work regardless).
 
-To disable hourly uploads without removing the SFTP creds, set `NETMON_SFTP_ENABLED=false` in `/etc/netmon/netmon.env` and `./netmon restart`.
+To pause hourly uploads for a box, use **start / pause uploads** on its dashboard sensor page. That sets `NETMON_BUNDLE_TRANSPORT` back to the staging value, and the box keeps scanning and bundling locally — nothing is lost, the bundles just wait. Editing `/etc/netmon/netmon.env` by hand works too, but the dashboard will re-push its desired value on the next check-in.
 
 ---
 
@@ -275,7 +274,8 @@ All three recovery levels are also in the operator menu: `./netmon` → **System
 Re-run `./setup.sh` — it's idempotent and will detect what's already installed, skip those steps, and resolve common conflicts (e.g. removing a stray `docker-ce` if `docker.io` is also present).
 
 **`upload-test` says "connection failed"**
-Check the SFTP server is reachable from this box: `nc -zv <sftp-host> 22`. If that works, your credentials or remote path are wrong — re-run `./setup.sh`.
+First check whether uploads are even armed: a box that hasn't been marked installed on the dashboard has them OFF on purpose. `./netmon status` reports which. If they are armed, confirm the box can reach the dashboard over HTTPS: `curl -sS -o /dev/null -w '%{http_code}
+' "$NETMON_DASHBOARD_URL"`.
 
 **No scans appearing**
 ```bash
@@ -314,6 +314,5 @@ Drop the ZIP into a Claude chat, paste the prompt from inside, and Claude tells 
 ## Notes
 
 - Only run scans on networks you're authorized to assess. NetMon does light active probing (ARP scan, ping sweep), not port scans, but it still puts packets on the wire.
-- SFTP password lives in `.env` (chmod 600). No keys, no MFA — v1 demo simplicity.
-- All collected data stays on this box (and the configured SFTP server). Nothing reaches Claude until you manually upload a ZIP.
+- All collected data stays on this box and the NetMon dashboard you enroll it to.
 - Built from free, open-source tools: `lldpd`, `arp-scan`, `nmap`, `tshark`, `paramiko`, `postgres`.

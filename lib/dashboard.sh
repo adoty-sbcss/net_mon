@@ -67,7 +67,7 @@ prompt_dashboard_config() {
     echo ""
     if [[ -z "$key_default" ]]; then
         echo "Paste the shared BOOTSTRAP KEY from the dashboard:"
-        echo "  Settings → SFTP ingestion → Sensor auto-enrollment."
+        echo "  Settings → Ingestion → Sensor auto-enrollment."
         echo "The same key works for every deployment."
         echo ""
     fi
