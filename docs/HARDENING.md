@@ -23,7 +23,7 @@ sub-interfaces, and unrestricted outbound access to do its job. So we apply a
 
 | Control | What we do | Why it's safe |
 |---|---|---|
-| Host firewall (ufw) | `allow 22/tcp` **first**, then default **deny inbound / allow outbound**, enable | Sensor accepts no inbound except SSH; **outbound is never filtered**, so scanning + check-in (443) + SFTP (22) + SNMP (161) keep working |
+| Host firewall (ufw) | `allow 22/tcp` **first**, then default **deny inbound / allow outbound**, enable | Sensor accepts no inbound except SSH; **outbound is never filtered**, so scanning + check-in and bundle upload (443) + SNMP (161) keep working |
 | Automatic security updates | install `unattended-upgrades`, enable, **auto-reboot OFF** | Patches land; the box never reboots itself mid-day |
 | Time sync | enable `systemd-timesyncd` | Accurate scan/SNMP timestamps |
 | auditd | install + enable | Logging only |
@@ -38,7 +38,7 @@ sub-interfaces, and unrestricted outbound access to do its job. So we apply a
 | **SSH** — disable root login / password auth / lower MaxAuthTries | The **safe subset (`--apply`) never touches SSH**, so ticking "CIS hardened" can't break field access. Key-only SSH is now available as a **separate, opt-in, lockout-guarded** step — see "Opt-in" below. |
 | **Docker** — forbid `privileged` / `network_mode: host` / `NET_ADMIN`+`NET_RAW` | The collector **requires** all three for capture + ARP + interface work |
 | **Kernel modules** — disable "unused" modules, esp. **`8021q`** | `8021q` is mandatory for VLAN sub-interface monitoring (`lib/trunk.sh`); others are needed for capture/bridging |
-| **Egress firewall filtering** | Breaks active scanning and all outbound (check-in, SFTP, broker dial-out) |
+| **Egress firewall filtering** | Breaks active scanning and all outbound (check-in, bundle upload, broker dial-out) |
 | **Strict reverse-path filtering** (`rp_filter=1`) | Drops packets on VLAN sub-interfaces / asymmetric monitoring paths |
 | **Promiscuous-mode / raw-socket restrictions** | Breaks `tshark`/`arp-scan` capture entirely |
 | **Unattended auto-reboot** | A sensor silently rebooting takes monitoring offline |
