@@ -181,7 +181,7 @@ sudo netmon-wizard cadence    # rescan interval / capture seconds / poll tick
 
 ### Primary uplink vs secondary connections
 
-The interface that owns the **default route** is the box's **primary uplink** — it's how the box reaches the SFTP server. It's auto-detected (no config). Everything else is a **secondary monitored** connection. See them all:
+The interface that owns the **default route** is the box's **primary uplink** — it's how the box reaches the dashboard. It's auto-detected (no config). Everything else is a **secondary monitored** connection. See them all:
 
 ```bash
 ./netmon interfaces
