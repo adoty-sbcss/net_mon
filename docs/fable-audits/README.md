@@ -23,11 +23,30 @@ Audits run **sequentially, highest-value first**, so a partial run still banks t
 | # | Audit | Report | Status |
 |---|-------|--------|--------|
 | 1 | Silent data-loss hunt (collector → dashboard delivery seam) | [01-silent-data-loss.md](01-silent-data-loss.md) | ✅ done — 10 findings (1 Critical, 3 High) |
-| 2 | Deploy / infra safety (bicep drift, blind-apply blast radius, pipeline fragility) | [02-deploy-safety.md](02-deploy-safety.md) | ✅ done — 13 findings (2 Critical, 4 High) + blast-radius table |
+| 2 | Deploy / infra safety (bicep drift, blind-apply blast radius, pipeline fragility) | **moved — see note below** | ✅ done — 13 findings (2 Critical, 4 High) + blast-radius table |
 | 3 | Data-contract audit (fields collected → ingested → exposed to AI) | [03-data-contract.md](03-data-contract.md) | ✅ done — 29-row matrix, 8 AI-exposure gaps + config-knob coverage |
 | 4 | Test / failure-path gap map (test-bootstrap plan) | [04-test-gaps.md](04-test-gaps.md) | ✅ done — harness + 17 ranked tests + phase split |
 
 **Program complete (2026-07-02):** all four audits run on Fable, verified on Opus, committed.
+
+> ### Audit 2 moved to the dashboard repo (2026-08-03)
+>
+> Audit 2 analysed the **dashboard's Azure deployment**, not the sensor — and in doing so it
+> named the resource group, web app, Postgres server, depot storage account, managed
+> certificate and the Key Vault **secret names**. **This repository is public.** None of those
+> are credentials and all of them still require authentication, but together they map the
+> production estate, so the report now lives in the private `netmon-dashboard` repo at
+> `docs/fable-audits/02-deploy-safety.md`.
+>
+> Removing it here does **not** undo the disclosure — it was public from 2026-07-02 and this
+> repo's git history, forks and existing clones still contain it. Treat those names as known.
+>
+> Audits 1, 3 and 4 stay here: they are sensor-side, and were checked for the same class of
+> content and are clean.
+>
+> **Rule going forward:** anything naming production infrastructure — resource groups, account
+> names, hostnames, secret names, subscription or tenant ids — goes in the private dashboard
+> repo. This repo gets the sensor-side story only.
 
 ## Top priorities across the program (synthesis)
 
