@@ -1,0 +1,48 @@
+# Automated dependency updates.
+#
+# This repo had no update mechanism at all. That is invisible while someone is
+# working here daily, and stops being invisible the moment nobody is — advisories
+# accumulate silently until whoever inherits the project finds them all at once.
+#
+# Cadence is monthly, not weekly, because this is the SENSOR: a dependency change
+# ships to every box in the fleet via the nightly auto-update, so churn has a real
+# blast radius. Monthly keeps it a deliberate review rather than background noise.
+# Anything urgent still arrives immediately as a security update.
+#
+# The dependency surface here is small on purpose (paramiko, psycopg, pydantic,
+# structlog, click, pyyaml, manuf, websocket-client + dev tooling) — keep it that
+# way; a sensor is a long-lived appliance on someone else's network.
+version: 2
+updates:
+  # ---- collector python package ----
+  - package-ecosystem: pip
+    directory: "/collector"
+    schedule:
+      interval: monthly
+      time: "06:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 3
+    groups:
+      # Runtime deps land on the fleet — review them together, deliberately.
+      runtime:
+        dependency-type: production
+        update-types: ["minor", "patch"]
+      # Lint/type/test tooling only gates CI; it can move freely.
+      dev-tooling:
+        dependency-type: development
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "deps"
+
+  # ---- GitHub Actions ----
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 2
+    groups:
+      actions:
+        patterns: ["*"]
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "ci"
