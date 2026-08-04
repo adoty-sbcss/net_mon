@@ -27,6 +27,7 @@ HTTP uses the stdlib only — no new dependency.
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.error
 import urllib.request
@@ -233,6 +234,11 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_WIFI_JOIN_IDENTITY"] = str(data.get("wifi_join_identity") or "")
     if data.get("wifi_join_secret"):  # only overwrite when provided (like sftp_password)
         mapping["NETMON_WIFI_JOIN_SECRET"] = str(data["wifi_join_secret"])
+    # Multi-profile join list (WIFI-6) rides a 0600 JSON file, NOT env — secrets +
+    # quotes/braces don't belong in the EnvironmentFile. Full-replace like the iperf
+    # schedules; an empty list clears it (the feature stays gated by wifi_join_enabled).
+    if "wifi_join_profiles" in data:
+        _write_wifi_profiles(data.get("wifi_join_profiles") or [])
     if mapping:
         _update_env_file(ENV_FILE, mapping)
         log.info("applied desired config", keys=list(mapping))
@@ -565,6 +571,11 @@ def _auto_enroll(settings, url: str) -> str:
 # fired" ledger, both JSON files (not env — see _apply_config).
 IPERF_SCHEDULES_FILE = Path("/var/lib/netmon/iperf-schedules.json")
 IPERF_SLOTS_FILE = Path("/var/lib/netmon/iperf-slots.json")
+# Wi-Fi join profiles (WIFI-6): the list of networks the experience battery joins,
+# measures + leaves, pushed from the dashboard. Rides a JSON FILE (not env) for the
+# same reason as the iperf schedules — quotes/commas/braces don't survive systemd
+# EnvironmentFile parsing — AND it carries per-network secrets, so the file is 0600.
+WIFI_PROFILES_FILE = Path("/var/lib/netmon/wifi-profiles.json")
 # Fire a slot if we check in within this window after its scheduled time (covers
 # the ~10-min check-in gap + a missed beat) — but never run it hours late.
 IPERF_SLOT_GRACE_SEC = 45 * 60
@@ -577,6 +588,25 @@ def _write_iperf_schedules(schedules: list) -> None:
         IPERF_SCHEDULES_FILE.write_text(json.dumps(schedules))
     except Exception as exc:  # noqa: BLE001
         log.warning("could not persist iperf schedules", error=str(exc))
+
+
+def _write_wifi_profiles(profiles: list) -> None:
+    """Persist the pushed Wi-Fi join profiles to the 0600 JSON file the host
+    experience battery (scripts/netmon-wifi-experience.sh) reads. Full-replace, like
+    the iperf schedules; 0600 because each profile carries its resolved per-sensor
+    secret (PSK / 802.1X password). Written to a temp created 0600 from the start,
+    then atomically renamed, so the secret is never briefly world-readable nor a
+    partial write ever seen by the host script."""
+    try:
+        WIFI_PROFILES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(profiles if isinstance(profiles, list) else [])
+        tmp = WIFI_PROFILES_FILE.with_suffix(".json.tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(payload)
+        os.replace(str(tmp), str(WIFI_PROFILES_FILE))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not persist wifi profiles", error=str(exc))
 
 
 def _report_iperf(url: str, token: str | None, res: dict, trigger: str) -> None:
