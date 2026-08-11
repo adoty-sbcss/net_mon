@@ -321,6 +321,10 @@ def _apply_config(data: dict) -> None:
     mapping: dict[str, str] = {}
     if "snmp_communities" in data:
         mapping["NETMON_SNMP_COMMUNITIES"] = str(data.get("snmp_communities") or "")
+    if "snmp_credential_overrides" in data:
+        mapping["NETMON_SNMP_CREDENTIAL_OVERRIDES"] = str(
+            data.get("snmp_credential_overrides") or ""
+        )
     if "snmp_enabled" in data:
         mapping["NETMON_SNMP_ENABLED"] = "true" if data.get("snmp_enabled") else "false"
     if "snmp_targets" in data:
@@ -519,8 +523,11 @@ def _local_net() -> tuple[str | None, str | None, str | None]:
 # password / SNMP community / token / bootstrap key must never ride out in clear.
 _SECRET_KV_RE = re.compile(
     r"(?i)([A-Za-z0-9_.\-]*"
-    r"(?:passwd|password|secret|token|communit|psk|api[_-]?key|bootstrap[_-]?key|auth[_-]?key|access[_-]?key)"
+    r"(?:passwd|password|secret|token|communit|credential|psk|api[_-]?key|bootstrap[_-]?key|auth[_-]?key|access[_-]?key)"
     r"[A-Za-z0-9_.\-]*)"        # 1: the key, e.g. NETMON_SFTP_PASSWORD / community
+                                # `credential` covers NETMON_SNMP_CREDENTIAL_OVERRIDES,
+                                # whose value is `ip=community` pairs — community
+                                # strings that must not ride out in a log tail.
     r"[\"']?\s*[=:]\s*[\"']?"   # an = or : assignment (optionally quoted — env/JSON/CLI)
     r"([^\s\"';}]+)"            # 2: value, to next delimiter. Allows ',' so a
                                 # comma-joined list (NETMON_SNMP_COMMUNITIES=

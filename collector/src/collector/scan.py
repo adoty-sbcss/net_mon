@@ -292,6 +292,7 @@ def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
                 topology = topo_mod.crawl(
                     seed_ips=snmp_candidates_list,
                     communities=list(settings.snmp_community_list),
+                    overrides=settings.snmp_credential_override_map,
                     max_depth=settings.snmp_topology_max_depth,
                     time_budget_sec=settings.snmp_topology_time_budget,
                     exclude_ips=set(settings.snmp_exclude_list),
@@ -456,6 +457,13 @@ def _snmp_candidates(
     # Operator-registered SNMP targets pushed from the dashboard registry — always
     # polled even if the OUI/heuristic selection above would miss them.
     for ip in get_settings().snmp_extra_target_list:
+        add(ip)
+    # Same for any device with a per-device credential override: pinning a
+    # credential to an IP is an explicit "poll this", and without it an override
+    # on a switch the heuristics don't recognise (generic OUI, no LLDP, not in the
+    # registry) would be pushed to the box and then never tried, while the
+    # dashboard promised it would be tried FIRST.
+    for ip in get_settings().snmp_credential_override_map:
         add(ip)
     return ips
 

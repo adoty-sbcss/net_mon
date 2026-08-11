@@ -134,6 +134,7 @@ def test_snmp_candidate_cap_reports_truncation(monkeypatch) -> None:
     settings = SimpleNamespace(
         snmp_enabled=True,
         snmp_community_list=("public",),
+        snmp_credential_override_map={},
         snmp_poll_max_candidates=2,
         snmp_poll_time_budget=120,
     )
@@ -142,7 +143,7 @@ def test_snmp_candidate_cap_reports_truncation(monkeypatch) -> None:
     monkeypatch.setattr(
         snmp,
         "_select_community",
-        lambda ip, communities, deadline=float("inf"): "public",
+        lambda ip, communities, deadline=float("inf"), overrides=None: "public",
     )
     monkeypatch.setattr(
         snmp,

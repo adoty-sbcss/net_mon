@@ -276,6 +276,7 @@ def crawl(
     gateway_mac: str | None = None,
     max_nodes: int = 600,
     fanout_cap: int = 40,
+    overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Recursively SNMP-walk LLDP/CDP tables outward from `seed_ips`.
 
@@ -283,9 +284,16 @@ def crawl(
     follow only the uplink toward the internet (gateway-MAC FDB port → STP root →
     toward-gateway); stop at the L3 edge (gateway). Both scopes capability-gate
     recursion (don't crawl through phones/APs/hosts) and honor max_nodes / fanout_cap.
+
+    `overrides` are per-device community overrides (ip → community), passed
+    straight through to the shared selector so a switch on its own string is
+    crawled here exactly as it is polled — a topology crawl that couldn't
+    authenticate to an overridden switch would silently truncate the map at it.
     """
     spine = scope == "spine"
-    if not seed_ips or not communities:
+    # An override is a credential source on its own, so an empty shared list is
+    # only fatal when there are no overrides either.
+    if not seed_ips or (not communities and not overrides):
         return {"nodes": [], "edges": [], "stats": {
             "visited_ips": 0, "elapsed_sec": 0.0, "budget_exhausted": False,
         }}
@@ -337,7 +345,7 @@ def crawl(
 
         # Reuse the polling module's community selection so a winning
         # community gets cached + reused; failures hit the same backoff.
-        community = _snmp._select_community(ip, communities)
+        community = _snmp._select_community(ip, communities, overrides=overrides)
         if community is None:
             log.debug("topology crawl: no community for", ip=ip, depth=depth)
             continue
