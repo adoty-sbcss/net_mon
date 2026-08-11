@@ -74,6 +74,15 @@ class Settings(BaseSettings):
     # Comma-separated list of v2c communities to try, in order. The first one
     # to get a response for a given device gets cached in snmp_credentials.
     snmp_communities: str = Field(default="", alias="NETMON_SNMP_COMMUNITIES")
+    # Per-device community overrides: "ip=community,ip=community". A device
+    # listed here is tried with ITS community before the cache and before the
+    # shared list above, so one switch on a different string doesn't require
+    # widening the community list for every device at the site. Falls through to
+    # the normal ladder if the override doesn't answer — an override that goes
+    # stale should degrade to the district default, not black out the device.
+    snmp_credential_overrides: str = Field(
+        default="", alias="NETMON_SNMP_CREDENTIAL_OVERRIDES"
+    )
     # By default SNMP only polls likely network gear (gateway + LLDP mgmt IPs
     # + network-vendor OUIs) to keep scans fast. Turn this on to also poll
     # every discovered host so printers / PCs / IoT get classified via SNMP
@@ -447,6 +456,27 @@ class Settings(BaseSettings):
     @property
     def snmp_community_list(self) -> tuple[str, ...]:
         return tuple(s.strip() for s in self.snmp_communities.split(",") if s.strip())
+
+    @property
+    def snmp_credential_override_map(self) -> dict[str, str]:
+        """Per-device community overrides, parsed from "ip=community,..." pairs.
+
+        Split on the FIRST '=' only, so a community containing '=' survives. A
+        community containing a ',' cannot be expressed here — the same existing
+        limitation as snmp_communities — and the dashboard refuses to push one.
+        Malformed pairs are skipped rather than raising: one bad entry must not
+        take SNMP down for the whole box.
+        """
+        out: dict[str, str] = {}
+        for pair in self.snmp_credential_overrides.split(","):
+            ip, sep, community = pair.partition("=")
+            if not sep:
+                continue
+            ip = ip.strip()
+            community = community.strip()
+            if ip and community:
+                out[ip] = community
+        return out
 
     @property
     def snmp_extra_target_list(self) -> tuple[str, ...]:

@@ -225,7 +225,10 @@ def poll(
         return []
 
     communities = list(settings.snmp_community_list)
-    if not communities or not candidate_ips:
+    overrides = settings.snmp_credential_override_map
+    # Per-device overrides are a valid credential source on their own, so a box
+    # with an empty shared list still has work to do if any device has one.
+    if (not communities and not overrides) or not candidate_ips:
         return []
 
     if shutil.which("snmpget") is None or shutil.which("snmpbulkwalk") is None:
@@ -242,7 +245,9 @@ def poll(
         try:
             _check_budget(deadline)
             attempted += 1
-            community = _select_community(ip, communities, deadline=deadline)
+            community = _select_community(
+                ip, communities, deadline=deadline, overrides=overrides
+            )
             if community is not None:
                 out.extend(
                     _poll_oids(
@@ -282,13 +287,33 @@ def poll(
 
 
 def _select_community(
-    ip: str, communities: list[str], *, deadline: float = float("inf")
+    ip: str,
+    communities: list[str],
+    *,
+    deadline: float = float("inf"),
+    overrides: dict[str, str] | None = None,
 ) -> str | None:
-    """Return a community known to work for `ip`, or None if nothing works."""
+    """Return a community known to work for `ip`, or None if nothing works.
+
+    An operator-set per-device override wins over everything, INCLUDING the
+    cache: the cache only ever holds what happened to answer last time, so
+    checking it first would make a freshly-pushed override inert until the
+    cached community broke on its own (which, on success, is never).
+    """
     cached = get_snmp_credential(ip)
+    override = (overrides or {}).get(ip)
 
     # Backoff: skip devices that have failed too many times recently.
-    if (cached and cached.get("community") is None
+    #
+    # An operator override BYPASSES it. Backoff exists to stop us re-probing gear
+    # that has never answered, but a device stuck in backoff is EXACTLY the device
+    # someone sets an override for — and the 24h window is not reset by a config
+    # push (it lives in the box's own cache), so honouring backoff here made a
+    # freshly-pushed override do nothing for up to a day, indistinguishable from
+    # a wrong credential. The extra cost is bounded: one probe per scan, only for
+    # devices an operator has explicitly pinned.
+    if (not override
+            and cached and cached.get("community") is None
             and cached.get("failure_count", 0) >= MAX_FAILURES_BEFORE_BACKOFF):
         last = cached.get("last_attempt_at")
         if last is not None and (time.time() - last.timestamp()) < BACKOFF_SECONDS:
@@ -296,8 +321,19 @@ def _select_community(
                       failures=cached["failure_count"])
             return None
 
-    # 1. Cached community first.
-    if cached and cached.get("community"):
+    # 1. Operator override for THIS device, ahead of the cache and the list.
+    if override:
+        _check_budget(deadline)
+        if _probe(ip, override):
+            log.debug("snmp override matched", ip=ip)
+            record_snmp_success(ip, override, "2c")
+            return override
+        # Fall through rather than giving up: a stale override should degrade to
+        # the district ladder, not black the device out.
+        log.warning("snmp per-device override did not answer, falling back", ip=ip)
+
+    # 2. Cached community next.
+    if cached and cached.get("community") and cached.get("community") != override:
         _check_budget(deadline)
         if _probe(ip, cached["community"]):
             log.debug("snmp cache hit", ip=ip)
@@ -305,9 +341,11 @@ def _select_community(
             return str(cached["community"])
         log.info("snmp cached community no longer works, re-trialing", ip=ip)
 
-    # 2. Trial the configured list.
+    # 3. Trial the configured list.
     for community in communities:
         _check_budget(deadline)
+        if community == override:
+            continue  # already failed above
         if cached and community == cached.get("community"):
             continue  # already failed above
         if _probe(ip, community):
@@ -315,7 +353,7 @@ def _select_community(
             record_snmp_success(ip, community, "2c")
             return community
 
-    # 3. Nothing worked.
+    # 4. Nothing worked.
     log.info("snmp all communities failed", ip=ip, tried=len(communities))
     record_snmp_failure(ip)
     return None
