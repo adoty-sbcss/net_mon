@@ -436,10 +436,27 @@ def _snmp_candidates(
             seen.add(ip)
             ips.append(ip)
 
+    # ORDER IS COVERAGE, not preference. poll() walks this list SEQUENTIALLY under
+    # one time budget and stops dead when it expires, so anything near the end is
+    # not polled late — it is not polled AT ALL, and because the order is stable
+    # it is the same devices missing every scan.
+    #
+    # So the list runs strongest evidence first: the gateway, then devices that
+    # ANNOUNCED themselves as infrastructure over LLDP/CDP, then the ones an
+    # operator explicitly registered, and only then anything picked out by an OUI
+    # guess (which at a school is mostly access points and cameras).
     if gateway_ip:
         add(gateway_ip)
     for n in lldp_neighbors:
         add(n.get("mgmt_ip"))
+    # Operator-registered SNMP targets pushed from the dashboard registry. These
+    # sit AHEAD of the OUI heuristic because a human asserting "monitor this" is
+    # better evidence than a vendor-prefix match — and because appending them last
+    # made this comment's promise false: under budget pressure they were the first
+    # thing dropped, so a device someone deliberately registered was the one least
+    # likely to be polled.
+    for ip in get_settings().snmp_extra_target_list:
+        add(ip)
 
     def looks_like_network_gear(vendor: str | None) -> bool:
         if not vendor:
@@ -453,10 +470,6 @@ def _snmp_candidates(
     for r in nmap_results:
         if include_all_hosts or looks_like_network_gear(r.get("vendor")):
             add(r.get("ip"))
-    # Operator-registered SNMP targets pushed from the dashboard registry — always
-    # polled even if the OUI/heuristic selection above would miss them.
-    for ip in get_settings().snmp_extra_target_list:
-        add(ip)
     return ips
 
 

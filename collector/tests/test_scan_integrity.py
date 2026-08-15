@@ -252,3 +252,50 @@ def test_recent_scan_floor_can_include_failed_attempts(monkeypatch) -> None:
     db.recent_network_scan("net", 300, require_success=False)  # anti-flap floor
     assert "completed_at IS NOT NULL" not in captured["sql"]
     assert "error IS NULL" not in captured["sql"]
+
+
+def test_snmp_candidate_order_puts_registered_infra_before_oui_guesses(monkeypatch) -> None:
+    """ORDER IS COVERAGE, not preference.
+
+    poll() walks this list SEQUENTIALLY under one time budget and stops dead when
+    it expires, so a device near the end is not polled late — it is not polled at
+    all. The order is stable, so it is the SAME devices missing every scan.
+
+    Operator-registered targets used to be appended LAST, behind every OUI-matched
+    access point and camera, which made this module's own promise ("always polled
+    even if the OUI/heuristic selection would miss it") false under exactly the
+    budget pressure that promise exists for.
+    """
+    monkeypatch.setattr(
+        scan, "get_settings", lambda: SimpleNamespace(snmp_extra_target_list=("10.0.0.9",))
+    )
+    ips = scan._snmp_candidates(
+        "10.0.0.1",
+        [{"mgmt_ip": "10.0.0.2"}],
+        [{"ip": "10.0.0.50", "vendor": "Aruba Networks"}],
+        [{"ip": "10.0.0.51", "vendor": "Cisco Systems"}],
+    )
+
+    # gateway, then LLDP-ANNOUNCED infra, then operator-REGISTERED, then guesses.
+    assert ips[:4] == ["10.0.0.1", "10.0.0.2", "10.0.0.9", "10.0.0.50"]
+    assert ips.index("10.0.0.9") < ips.index("10.0.0.50")
+    assert ips.index("10.0.0.9") < ips.index("10.0.0.51")
+
+    # POSITIVE CONTROL. Every assertion above is also satisfied by a change that
+    # DROPS the OUI-guessed devices instead of merely demoting them, which would
+    # trade one silent coverage hole for a worse one.
+    assert set(ips) == {"10.0.0.1", "10.0.0.2", "10.0.0.9", "10.0.0.50", "10.0.0.51"}
+
+
+def test_snmp_candidates_dedupe_keeps_the_earliest_position(monkeypatch) -> None:
+    """A registered target that is ALSO an LLDP neighbour must keep the earlier
+    slot, not be demoted to the registered block — otherwise adding a device to
+    the registry could push it later in the list and reduce its chance of being
+    polled, which is the opposite of what registering it means."""
+    monkeypatch.setattr(
+        scan, "get_settings", lambda: SimpleNamespace(snmp_extra_target_list=("10.0.0.2",))
+    )
+    ips = scan._snmp_candidates(
+        "10.0.0.1", [{"mgmt_ip": "10.0.0.2"}], [], [],
+    )
+    assert ips == ["10.0.0.1", "10.0.0.2"]
