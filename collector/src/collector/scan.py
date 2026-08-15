@@ -437,10 +437,34 @@ def _snmp_candidates(
             seen.add(ip)
             ips.append(ip)
 
+    # ORDER IS COVERAGE, not preference. poll() walks this list SEQUENTIALLY under
+    # one time budget and stops dead when it expires, so anything near the end is
+    # not polled late — it is not polled AT ALL, and because the order is stable
+    # it is the same devices missing every scan.
+    #
+    # So the list runs strongest evidence first: the gateway, then devices that
+    # ANNOUNCED themselves as infrastructure over LLDP/CDP, then the ones an
+    # operator explicitly registered, and only then anything picked out by an OUI
+    # guess (which at a school is mostly access points and cameras).
     if gateway_ip:
         add(gateway_ip)
     for n in lldp_neighbors:
         add(n.get("mgmt_ip"))
+    # BOTH forms of "an operator said to poll this" sit AHEAD of the OUI
+    # heuristic, because a human asserting it is better evidence than a
+    # vendor-prefix match — and because appended last, each one's own promise was
+    # false under exactly the budget pressure the promise exists for.
+    #
+    # Registered SNMP targets pushed from the dashboard equipment registry:
+    # "always polled even if the OUI/heuristic selection would miss it".
+    for ip in get_settings().snmp_extra_target_list:
+        add(ip)
+    # Per-device credential overrides: pinning a credential to an IP is an
+    # explicit "poll this", and the dashboard promises it will be tried FIRST. An
+    # override on a switch the heuristics don't recognise (generic OUI, no LLDP,
+    # not in the registry) would otherwise be pushed to the box and never tried.
+    for ip in get_settings().snmp_credential_override_map:
+        add(ip)
 
     def looks_like_network_gear(vendor: str | None) -> bool:
         if not vendor:
@@ -454,17 +478,6 @@ def _snmp_candidates(
     for r in nmap_results:
         if include_all_hosts or looks_like_network_gear(r.get("vendor")):
             add(r.get("ip"))
-    # Operator-registered SNMP targets pushed from the dashboard registry — always
-    # polled even if the OUI/heuristic selection above would miss them.
-    for ip in get_settings().snmp_extra_target_list:
-        add(ip)
-    # Same for any device with a per-device credential override: pinning a
-    # credential to an IP is an explicit "poll this", and without it an override
-    # on a switch the heuristics don't recognise (generic OUI, no LLDP, not in the
-    # registry) would be pushed to the box and then never tried, while the
-    # dashboard promised it would be tried FIRST.
-    for ip in get_settings().snmp_credential_override_map:
-        add(ip)
     return ips
 
 
