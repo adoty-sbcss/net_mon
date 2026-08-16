@@ -665,6 +665,24 @@ _CONTROL_COMMANDS: dict[str, list[str]] = {
 # actions + code `update` are deliberately excluded: those need the host wrapper's
 # exit-code path, so they stay on the queued near-live path. Mirrored by the
 # broker allow-list + the dashboard's CONSOLE_OP_COMMANDS. Vet additions with security.
+#
+# ⚠️ CONTAINMENT INVARIANT — `_LIVE_OPS` handlers MUST take no arguments.
+# The restricted console's containment control is that NOTHING an operator (or a
+# hijacked browser/broker) supplies can reach execution. `_DIAG_COMMANDS` and
+# `_CONTROL_COMMANDS` enforce that STRUCTURALLY: the argv is a literal list, so
+# there is nowhere to inject. `_LIVE_OPS` does not — it re-enters `_run_command`,
+# and is contained only because `_run_command(command: str)` accepts the command
+# ID and nothing else. That is an invariant held by CONVENTION, so it can be
+# broken silently: the day a handler reads a field off the console frame (a
+# target IP, an interface, a path), the sensor gains an operator-controlled
+# argument and the allow-list stops being containment — with no fixed-argv
+# structure and no type error to catch it.
+# So: every `_LIVE_OPS` handler stays argument-free, and `_run_command` keeps its
+# single-parameter signature. tests/test_console_containment.py pins both, plus
+# the fact that remote_console.py only ever calls `_run_command(cmd_id)`.
+# Anything that genuinely NEEDS a parameter does not belong on the live console —
+# put it on the host-action path, where the host wrapper holds its own
+# authoritative fixed-argv allow-list. (CON-5 security review, 2026-08-16.)
 _LIVE_OPS: set[str] = {
     "run-scan",       # force an immediate discovery scan
     "upload-now",     # build + ship the latest hour's bundle now
