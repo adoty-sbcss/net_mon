@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 from pathlib import Path
 
 from collector import remote_console as rc
@@ -36,6 +37,7 @@ from collector.checkin import (
     _CONTROL_COMMANDS,
     _DIAG_COMMANDS,
     _LIVE_OPS,
+    _QUEUED_ONLY_COMMANDS,
     _run_command,
 )
 
@@ -130,6 +132,46 @@ def test_live_ops_and_fixed_argv_registries_do_not_overlap():
     assert not (set(_DIAG_COMMANDS) & set(_CONTROL_COMMANDS)), (
         "id is in both _DIAG_COMMANDS and _CONTROL_COMMANDS"
     )
+
+
+def test_queued_only_commands_are_refused_on_a_live_session():
+    """The SENSOR must refuse queued-only ids, not just the broker.
+
+    The broker omits these from its relay allow-list, but the broker is inside
+    the threat model — an invariant only it enforces is enforced only by a
+    component an attacker may own. The sensor has to be at least as strict.
+    """
+    assert _QUEUED_ONLY_COMMANDS, "expected at least one queued-only id"
+
+    class _WS:
+        """Collects frames; takes its sink explicitly so it binds no loop var."""
+
+        def __init__(self, sink: list[dict]) -> None:
+            self._sink = sink
+
+        def send(self, raw: str) -> None:
+            self._sink.append(json.loads(raw))
+
+    for cmd_id in _QUEUED_ONLY_COMMANDS:
+        sent: list[dict] = []
+        # If this ever actually executed, it would shell out; the refusal has to
+        # happen before the registry lookup, so nothing runs.
+        rc._run_diag_stream(_WS(sent), cmd_id)
+
+        assert len(sent) == 1, f"{cmd_id}: expected exactly one refusal frame, got {sent}"
+        assert sent[0]["type"] == "err"
+        assert sent[0]["id"] == cmd_id
+        assert "live session" in sent[0]["message"]
+        # Crucially: it must NOT have started running.
+        assert not [f for f in sent if f.get("type") in ("begin", "out", "exit")]
+
+
+def test_queued_only_ids_are_real_registry_ids():
+    """A stale entry would silently shrink the live allow-list without anyone
+    noticing — the id would look 'blocked' while simply not existing."""
+    union = set(_DIAG_COMMANDS) | set(_CONTROL_COMMANDS) | set(_LIVE_OPS)
+    unknown = _QUEUED_ONLY_COMMANDS - union
+    assert not unknown, f"_QUEUED_ONLY_COMMANDS has ids in no registry: {sorted(unknown)}"
 
 
 def test_console_dispatch_reads_only_the_id_off_a_cmd_frame():

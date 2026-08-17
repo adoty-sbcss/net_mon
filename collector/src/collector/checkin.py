@@ -624,6 +624,25 @@ _DIAG_COMMANDS: dict[str, list[str]] = {
     "diag-selftest": ["python", "-m", "collector", "selftest"],
 }
 
+# Ids that exist in the registries above but must NEVER run over the LIVE console —
+# they belong to the queued check-in path only.
+#
+# This set is the SENSOR's own enforcement of that split. The broker also omits
+# these from its relay allow-list, but the broker is inside the threat model (a
+# compromised dashboard -> broker -> sensor chain is the thing the allow-list
+# exists to contain), so an invariant enforced only there is enforced only by the
+# component an attacker may own. The sensor must be at least as strict as the
+# broker, never less. Checked in remote_console._run_diag_stream.
+#
+# `diag-detect-vlans` sniffs the uplink for ~8s and is read-only, so this is not
+# a hole being closed so much as an inaccurate mental model being corrected — but
+# "runs only via check-in" should be true because the sensor says so.
+# Mirrored into console_broker_allowlist.json by scripts/check_console_allowlist.py,
+# which reads THIS set (CI fails on drift).
+_QUEUED_ONLY_COMMANDS: set[str] = {
+    "diag-detect-vlans",
+}
+
 # HOST-LEVEL maintenance actions (restart / rebuild / reboot / rollback). Unlike
 # the diagnostics/controls above, these CANNOT run from inside the container — the
 # agent is a process in the very container some of them replace. So instead of

@@ -43,6 +43,7 @@ from collector.checkin import (  # noqa: E402  (import after sys.path tweak)
     _CONTROL_COMMANDS,
     _DIAG_COMMANDS,
     _LIVE_OPS,
+    _QUEUED_ONLY_COMMANDS,
 )
 
 
@@ -51,19 +52,32 @@ def _registry_union() -> set[str]:
     return set(_DIAG_COMMANDS) | set(_CONTROL_COMMANDS) | set(_LIVE_OPS)
 
 
+def _queued_only() -> set[str]:
+    """Ids that must never reach the live broker.
+
+    Read from checkin.py, NOT from the manifest. The sensor enforces this split
+    at runtime (remote_console._run_diag_stream), so checkin.py has to be the one
+    authority — a JSON-only list could say one thing while the sensor did another,
+    which is exactly the divergence this script exists to prevent. The manifest's
+    `queued_exceptions.ids` is regenerated from here and CI fails if it drifts.
+    """
+    return set(_QUEUED_ONLY_COMMANDS)
+
+
 def _load_manifest() -> dict:
     return json.loads(_MANIFEST.read_text(encoding="utf-8"))
 
 
 def _expected_live(manifest: dict) -> list[str]:
-    """The canonical live-broker list derived from the registries + manifest exceptions."""
-    exceptions = set(manifest["queued_exceptions"]["ids"])
-    return sorted(_registry_union() - exceptions)
+    """The canonical live-broker list: every registry id minus the queued-only ones."""
+    del manifest  # exceptions come from checkin.py now, not the manifest
+    return sorted(_registry_union() - _queued_only())
 
 
 def _render(manifest: dict) -> str:
-    """Serialize the manifest with `live_broker_commands` regenerated from the registries."""
+    """Serialize the manifest with both derived lists regenerated from the registries."""
     manifest = json.loads(json.dumps(manifest))  # deep copy, preserve key order
+    manifest["queued_exceptions"]["ids"] = sorted(_queued_only())
     manifest["live_broker_commands"] = _expected_live(manifest)
     return json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
 
@@ -73,17 +87,27 @@ def _check() -> int:
     union = _registry_union()
     errors: list[str] = []
 
-    # 1. Every declared queued-exception must be a real registry id (a stale
-    #    exception would silently shrink the expected live list).
-    exceptions = set(manifest["queued_exceptions"]["ids"])
+    # 1. Every queued-only id must be a real registry id (a stale one would
+    #    silently shrink the expected live list).
+    exceptions = _queued_only()
     unknown = sorted(exceptions - union)
     if unknown:
         errors.append(
-            "queued_exceptions lists id(s) that are not in any registry "
+            "_QUEUED_ONLY_COMMANDS lists id(s) that are not in any registry "
             f"(stale?): {unknown}"
         )
 
-    # 2. The committed live list must equal registries-minus-exceptions.
+    # 2. The manifest's mirror of the queued-only set must match checkin.py.
+    #    checkin.py is authoritative because the SENSOR enforces it at runtime.
+    manifest_exceptions = manifest["queued_exceptions"]["ids"]
+    if manifest_exceptions != sorted(exceptions):
+        errors.append(
+            "manifest queued_exceptions.ids does not match checkin.py "
+            f"_QUEUED_ONLY_COMMANDS: manifest {manifest_exceptions}, "
+            f"checkin.py {sorted(exceptions)}"
+        )
+
+    # 3. The committed live list must equal registries-minus-exceptions.
     expected = _expected_live(manifest)
     actual = manifest["live_broker_commands"]
     if actual != expected:
