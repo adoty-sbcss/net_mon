@@ -156,6 +156,32 @@ def test_mac_differing_by_one_digit_never_folds():
     assert _fold_synthetic_nodes(nodes, []) == 0
 
 
+def test_unset_and_junk_addresses_are_never_identity_evidence():
+    """`0.0.0.0` is not an address, it is "unset" — and prod really does advertise it.
+
+    Seen 2026-08-16 on `T34W44DBD28A3AC7`, which lists 0.0.0.0 alongside its real
+    management address. Folding on a placeholder every unconfigured box can present
+    would fuse unrelated devices.
+    """
+    for junk in ("0.0.0.0", "127.0.0.1", "169.254.10.5", "255.255.255.255", "224.0.0.1"):
+        nodes = {
+            "aa:bb:cc:00:00:01": node("aa:bb:cc:00:00:01", name="core", ips=["10.0.0.1", junk]),
+            "ip:198.51.100.7": node("ip:198.51.100.7", name="198.51.100.7", ips=[junk]),
+        }
+        assert _fold_synthetic_nodes(nodes, []) == 0, junk
+        assert "ip:198.51.100.7" in nodes, junk
+
+
+def test_a_real_address_still_folds_when_junk_is_also_present():
+    """Positive control for the guard above — it must reject junk, not all addresses."""
+    nodes = {
+        "aa:bb:cc:00:00:01": node("aa:bb:cc:00:00:01", name="core", ips=["192.168.130.32", "0.0.0.0"]),
+        "ip:192.168.130.32": node("ip:192.168.130.32", name="192.168.130.32", ips=["192.168.130.32"]),
+    }
+    assert _fold_synthetic_nodes(nodes, []) == 1
+    assert set(nodes) == {"aa:bb:cc:00:00:01"}
+
+
 def test_a_crawl_with_no_real_nodes_folds_nothing():
     nodes = {"cdp:a-switch": node("cdp:a-switch", name="a-switch", source="cdp")}
     assert _fold_synthetic_nodes(nodes, []) == 0

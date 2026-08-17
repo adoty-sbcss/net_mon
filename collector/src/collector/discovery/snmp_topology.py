@@ -666,6 +666,26 @@ _IDENTITY_MIN_LEN = 12
 _NAME_MIN_LEN = 3
 
 
+def _usable_mgmt_ip(ip: object) -> bool:
+    """Is this management address specific enough to prove two nodes are one device?
+
+    Real gear advertises junk here. Prod carries a switch listing `0.0.0.0` among its
+    management addresses (seen 2026-08-16 on `T34W44DBD28A3AC7`), and 0.0.0.0 is not an
+    address — it is "unset". Loopback, link-local (a DHCP failure), multicast and the
+    reserved 240/4 block are the same story: many unrelated boxes can present them, so
+    folding on one would fuse devices that merely share a placeholder.
+    """
+    if not isinstance(ip, str) or not ip.strip():
+        return False
+    try:
+        a = ipaddress.IPv4Address(ip.strip())
+    except ValueError:
+        return False
+    return not (
+        a.is_unspecified or a.is_loopback or a.is_link_local or a.is_multicast or a.is_reserved
+    )
+
+
 def _identity_key(s: str) -> str:
     """Collapse separators + case so two spellings of ONE identity compare equal.
 
@@ -717,7 +737,8 @@ def _fold_synthetic_nodes(
         if isinstance(name, str) and name.strip():
             by_name.setdefault(_identity_key(name), []).append(k)
         for ip in n.get("mgmt_ips") or []:
-            by_ip.setdefault(ip, []).append(k)
+            if _usable_mgmt_ip(ip):
+                by_ip.setdefault(ip, []).append(k)
 
     def _sole(bucket: dict[str, list[str]], key: str) -> str | None:
         hits = bucket.get(key) or []
@@ -746,7 +767,12 @@ def _fold_synthetic_nodes(
         #    claims. Two real claimants means a shared virtual address (HSRP/VRRP)
         #    and we must not guess which box is behind it.
         if target is None:
-            owners = {o for ip in node.get("mgmt_ips") or [] for o in by_ip.get(ip, [])}
+            owners = {
+                o
+                for ip in node.get("mgmt_ips") or []
+                if _usable_mgmt_ip(ip)
+                for o in by_ip.get(ip, [])
+            }
             if len(owners) == 1:
                 target = next(iter(owners))
 
