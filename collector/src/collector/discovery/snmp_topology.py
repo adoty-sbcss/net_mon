@@ -540,12 +540,17 @@ def crawl(
                     cdp_ifindex = None
             _consider(mgmt_ip, cdp_caps, cdp_ifindex)
 
+    # INV-8: collapse `cdp:`/`ip:` placeholders onto the real device BEFORE emitting,
+    # so a duplicate entity is never created downstream in the first place.
+    folded = _fold_synthetic_nodes(nodes, edges)
+
     elapsed = time.monotonic() - started
     log.info("topology crawl done",
              scope=scope, nodes=len(nodes), edges=len(edges),
              visited=len(visited_ips), elapsed_sec=round(elapsed, 1),
              budget_exhausted=budget_exhausted, truncated=stat_truncated,
-             uplink_resolved=stat_uplink_resolved, uplink_ambiguous=stat_uplink_ambiguous)
+             uplink_resolved=stat_uplink_resolved, uplink_ambiguous=stat_uplink_ambiguous,
+             synthetic_folded=folded)
     return {
         "nodes": list(nodes.values()),
         "edges": edges,
@@ -557,6 +562,7 @@ def crawl(
             "truncated_by_budget": stat_truncated,
             "uplink_resolved":   stat_uplink_resolved,
             "uplink_ambiguous":  stat_uplink_ambiguous,
+            "synthetic_folded":  folded,
         },
     }
 
@@ -649,6 +655,173 @@ def _strip_quotes(value: str | None) -> str | None:
     if value is None:
         return None
     return _snmp._strip_wrapping_quotes(value.strip()) or None
+
+
+_SYNTHETIC_KEY = re.compile(r"^(?:cdp|ip):", re.IGNORECASE)
+_ADDRESS_SHAPED = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+# An identity string we trust must be at least as long as a MAC (12 hex digits);
+# shorter normalized forms collide too easily to fold two nodes on.
+_IDENTITY_MIN_LEN = 12
+# A sysName is weaker evidence than a chassis id, but still has to be a real name.
+_NAME_MIN_LEN = 3
+
+
+def _usable_mgmt_ip(ip: object) -> bool:
+    """Is this management address specific enough to prove two nodes are one device?
+
+    Real gear advertises junk here. Prod carries a switch listing `0.0.0.0` among its
+    management addresses (seen 2026-08-16 on `T34W44DBD28A3AC7`), and 0.0.0.0 is not an
+    address — it is "unset". Loopback, link-local (a DHCP failure), multicast and the
+    reserved 240/4 block are the same story: many unrelated boxes can present them, so
+    folding on one would fuse devices that merely share a placeholder.
+    """
+    if not isinstance(ip, str) or not ip.strip():
+        return False
+    try:
+        a = ipaddress.IPv4Address(ip.strip())
+    except ValueError:
+        return False
+    return not (
+        a.is_unspecified or a.is_loopback or a.is_link_local or a.is_multicast or a.is_reserved
+    )
+
+
+def _identity_key(s: str) -> str:
+    """Collapse separators + case so two spellings of ONE identity compare equal.
+
+    `D0 3D 52 0D 28 BC` (a CDP device-id) and `d0:3d:52:0d:28:bc` (the same box's
+    LLDP chassis id) are the same MAC written two ways.
+    """
+    return re.sub(r"[\s:.\-_]", "", s).lower()
+
+
+def _fold_synthetic_nodes(
+    nodes: dict[str, dict[str, Any]],
+    edges: list[dict[str, Any]],
+) -> int:
+    """Fold NetMon-manufactured placeholder nodes into the real device (INV-8).
+
+    A device that only a neighbour saw gets keyed `cdp:<device-id>`, and one that
+    answered SNMP without an LLDP chassis id gets keyed `ip:<addr>`. When the SAME
+    crawl also identified that box by its real chassis id, we emitted two nodes for
+    one device — and because the dashboard upserts on (district, chassis_id), that
+    became two permanent `entities_switch` rows that a nightly job then had to
+    detect and merge back. Reconciling here means the duplicate is never created.
+
+    Measured on prod 2026-08-16, one district carried 356 such pairs: 135 where the
+    CDP device-id WAS the chassis id verbatim, 88 where it was the same MAC with
+    spaces instead of colons, and 133 where the placeholder was named for the
+    management address it already shared.
+
+    Same charter as the dashboard matcher: a WRONG fold is worse than a duplicate,
+    so every rule demands exactly ONE candidate and refuses on ambiguity. Only
+    placeholders are ever folded away — a real chassis node is never removed.
+
+    One thing this gets that the dashboard cannot: everything here happened inside a
+    single crawl, minutes apart, so a shared management address cannot be explained
+    by the address changing hands. That makes IP the strong signal it isn't later.
+
+    Returns the number of placeholder nodes folded away.
+    """
+    real_keys = [k for k in nodes if not _SYNTHETIC_KEY.match(k)]
+    if not real_keys:
+        return 0
+
+    by_identity: dict[str, list[str]] = {}
+    by_name: dict[str, list[str]] = {}
+    by_ip: dict[str, list[str]] = {}
+    for k in real_keys:
+        n = nodes[k]
+        by_identity.setdefault(_identity_key(k), []).append(k)
+        name = n.get("system_name")
+        if isinstance(name, str) and name.strip():
+            by_name.setdefault(_identity_key(name), []).append(k)
+        for ip in n.get("mgmt_ips") or []:
+            if _usable_mgmt_ip(ip):
+                by_ip.setdefault(ip, []).append(k)
+
+    def _sole(bucket: dict[str, list[str]], key: str) -> str | None:
+        hits = bucket.get(key) or []
+        return hits[0] if len(hits) == 1 else None
+
+    remap: dict[str, str] = {}
+    for key in list(nodes):
+        if not _SYNTHETIC_KEY.match(key):
+            continue
+        node = nodes[key]
+        raw_name = node.get("system_name") or key.split(":", 1)[1]
+        name = raw_name.strip() if isinstance(raw_name, str) else ""
+        # A name that is just an address says nothing about identity — it is the
+        # address we already know. Never let it stand in for one.
+        usable_name = name if name and not _ADDRESS_SHAPED.match(name) else ""
+
+        target: str | None = None
+
+        # 1. The placeholder is NAMED FOR a real node's chassis id (the 135 + 88).
+        if usable_name:
+            ident = _identity_key(usable_name)
+            if len(ident) >= _IDENTITY_MIN_LEN:
+                target = _sole(by_identity, ident)
+
+        # 2. Exactly one real node claims a management address this placeholder
+        #    claims. Two real claimants means a shared virtual address (HSRP/VRRP)
+        #    and we must not guess which box is behind it.
+        if target is None:
+            owners = {
+                o
+                for ip in node.get("mgmt_ips") or []
+                if _usable_mgmt_ip(ip)
+                for o in by_ip.get(ip, [])
+            }
+            if len(owners) == 1:
+                target = next(iter(owners))
+
+        # 3. The placeholder's name IS a real node's sysName. Weaker than a chassis
+        #    id, so it needs uniqueness among the real nodes in this crawl.
+        if target is None and usable_name:
+            ident = _identity_key(usable_name)
+            if len(ident) >= _NAME_MIN_LEN:
+                target = _sole(by_name, ident)
+
+        if target is not None and target != key:
+            remap[key] = target
+
+    if not remap:
+        return 0
+
+    for src, dst in remap.items():
+        placeholder = nodes.pop(src)
+        keeper = nodes[dst]
+        for ip in placeholder.get("mgmt_ips") or []:
+            if ip not in keeper["mgmt_ips"]:
+                keeper["mgmt_ips"].append(ip)
+        # FILL ONLY. The real node's own identity always wins — a placeholder's
+        # "system_name" is frequently just its IP, and letting that overwrite a
+        # real sysName would rename the device in inventory.
+        for field in ("system_name", "system_description", "capabilities",
+                      "interfaces", "uplink"):
+            if not keeper.get(field) and placeholder.get(field):
+                keeper[field] = placeholder[field]
+
+    # Re-point every edge at the surviving node, drop the self-loops that folding
+    # necessarily creates (the two keys were the same device facing itself), and
+    # collapse edges that are now identical.
+    seen: set[tuple[Any, ...]] = set()
+    kept: list[dict[str, Any]] = []
+    for e in edges:
+        e["local_chassis_id"] = remap.get(e["local_chassis_id"], e["local_chassis_id"])
+        e["remote_chassis_id"] = remap.get(e["remote_chassis_id"], e["remote_chassis_id"])
+        if e["local_chassis_id"] == e["remote_chassis_id"]:
+            continue
+        sig = (e["local_chassis_id"], e.get("local_port_id"),
+               e["remote_chassis_id"], e.get("remote_port_id"), e.get("via"))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        kept.append(e)
+    edges[:] = kept
+
+    return len(remap)
 
 
 def _normalize_chassis(raw: str | None) -> str | None:
