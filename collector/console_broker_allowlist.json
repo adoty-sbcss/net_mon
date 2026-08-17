@@ -16,7 +16,7 @@
     "CI (.github/workflows/ci.yml) runs the same script in --check mode and fails on drift."
   ],
   "queued_exceptions": {
-    "_note": "Registry ids that are INTENTIONALLY off the live broker because they run via the queued check-in path, not the live console. Each must be a real id in one of the registries.",
+    "_note": "MIRROR of checkin.py `_QUEUED_ONLY_COMMANDS` — do not hand-edit. These ids are INTENTIONALLY off the live broker because they run via the queued check-in path only, and the SENSOR enforces that itself in remote_console._run_diag_stream (the broker is inside the threat model, so an invariant only it enforces is enforced only by a component an attacker may own). Regenerate with --write; CI fails if this drifts from checkin.py.",
     "ids": [
       "diag-detect-vlans"
     ]

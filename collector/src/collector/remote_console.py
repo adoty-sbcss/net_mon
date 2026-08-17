@@ -52,6 +52,7 @@ from .checkin import (
     _CONTROL_COMMANDS,
     _DIAG_COMMANDS,
     _LIVE_OPS,
+    _QUEUED_ONLY_COMMANDS,
     _redact_secrets,
     _run_command,
 )
@@ -106,6 +107,17 @@ def _run_diag_stream(ws, cmd_id: str) -> None:
     actions (`_CONTROL_COMMANDS`, CON-5); both are re-validated here against the
     fixed-argv registries — the broker's allow-list is only defense in depth.
     """
+    # Queued-only ids are refused HERE, by the sensor. The broker already omits
+    # them from its relay allow-list, but the broker is inside the threat model —
+    # an invariant only it enforces is enforced only by a component an attacker
+    # may control. Checked before the registry lookup so the reason is accurate
+    # ("not permitted on a live session", not "unknown command").
+    if cmd_id in _QUEUED_ONLY_COMMANDS:
+        _send(ws, {
+            "type": "err", "id": cmd_id,
+            "message": f"not permitted on a live session: {cmd_id} (runs via check-in only)",
+        })
+        return
     argv = _DIAG_COMMANDS.get(cmd_id) or _CONTROL_COMMANDS.get(cmd_id)
     if argv is None:
         _send(ws, {"type": "err", "id": cmd_id, "message": f"not permitted: {cmd_id}"})
