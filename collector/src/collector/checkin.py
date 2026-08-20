@@ -847,20 +847,35 @@ def _run_command(command: str) -> tuple[str, dict]:
 
         # NOTE: the two below are NCM — they act on NETWORK DEVICES (switches /
         # routers) over SSH, NOT on this box. Hence the `device-` prefix.
+        # Both device- branches catch their OWN exceptions and report a CODE. The
+        # generic handler at the bottom of this function returns `str(exc)`, which is
+        # fine for host commands but not for these: an SSH library string routinely
+        # embeds the device username and connection detail, and this payload is
+        # rendered verbatim in a browser. device_config's own functions never raise,
+        # so this only fires for something around them (target-file IO, storage) —
+        # but that is exactly the case nobody would think to scrub later.
         if command.startswith("device-ssh-test"):
             from .discovery import device_config as devcfg
 
-            res = devcfg.test_targets()
+            try:
+                res = devcfg.test_targets()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("device ssh test failed", error=str(exc))
+                return "failed", {"error": "error.unclassified"}
             return "done", res
 
         if command.startswith("device-backup-now"):
             from .discovery import device_config as devcfg
 
-            targets = devcfg.load_targets()
-            if not targets:
-                return "failed", {"error": "no device targets configured"}
-            res = devcfg.fetch_all(targets)
-            devcfg._store(res)  # noqa: SLF001 — same module, mirrors collect_and_store
+            try:
+                targets = devcfg.load_targets()
+                if not targets:
+                    return "failed", {"error": "no device targets configured"}
+                res = devcfg.fetch_all(targets)
+                devcfg._store(res)  # noqa: SLF001 — same module, mirrors collect_and_store
+            except Exception as exc:  # noqa: BLE001
+                log.warning("device backup failed", error=str(exc))
+                return "failed", {"error": "error.unclassified"}
             return "done", {"stats": res.get("stats", {})}
 
         return "failed", {"error": f"unknown command {command!r}"}
