@@ -352,7 +352,10 @@ def _fetch_one(
     try:
         from netmiko import ConnectHandler  # lazy: only when a device is fetched
     except Exception as exc:  # pragma: no cover — dep-missing guard
-        return {**base, "status": "error", "error": f"netmiko unavailable: {exc}"}
+        # The detail goes to the log, not the payload: this result renders in a
+        # browser, and "only codes and numbers" has no useful exceptions.
+        log.warning("netmiko unavailable", error=str(exc))
+        return _fail("reach", "error.unclassified")
 
     conn = None
     running: str | None = None
@@ -444,6 +447,75 @@ def _fetch_one(
 # Whole-pass orchestration
 # ---------------------------------------------------------------------------
 
+#: Consecutive credential rejections that stop a run.
+AUTH_BREAKER_THRESHOLD = 3
+
+
+class _AuthBreaker:
+    """Stops a pass once the same credential set is rejected N times in a row.
+
+    A district-wide password typo must produce a handful of failed logins, not one
+    per switch. ~110 rejections in a single pass is how a shared read-only account
+    gets locked on every device at once — and how a district takes out its own
+    RADIUS/TACACS server while merely trying to back up configs.
+
+    Which outcomes count, and why:
+
+    * ``auth`` — the only stage that counts. The device affirmatively rejected the
+      credential, so the next device will almost certainly reject it too.
+    * ``authz`` — deliberately does NOT count. The password *worked*; the account
+      just isn't allowed to read the config. That's a role-provisioning gap, it
+      locks nothing out, and stopping the run over it would hide every other
+      device's real status behind a problem that isn't dangerous.
+    * ``reach`` / ``ssh`` — neutral: they neither trip nor reset. An unreachable
+      device says nothing about the credential either way. Resetting on one would
+      let a few dead hosts sprinkled between live ones defeat the breaker entirely.
+    * a success resets the counter — the credential demonstrably works here.
+
+    Shared by all three consumers (nightly pass, "Back up now", "Test SSH") so the
+    protection can't be present in one and missing in another.
+    """
+
+    __slots__ = ("consecutive", "threshold", "tripped")
+
+    def __init__(self, threshold: int = AUTH_BREAKER_THRESHOLD) -> None:
+        self.threshold = threshold
+        self.consecutive = 0
+        self.tripped = False
+
+    def record(self, entry: dict[str, Any]) -> None:
+        """Fold one device result into the counter."""
+        if entry.get("stage") == "auth":
+            self.consecutive += 1
+            if self.consecutive >= self.threshold:
+                self.tripped = True
+        elif entry.get("status") == "ok":
+            self.consecutive = 0
+
+    def headroom(self) -> int:
+        """How many more attempts may be in flight before the threshold is hit.
+
+        Used to shrink the last wave of a concurrent run: with a fixed wave size the
+        breaker can only be consulted *between* waves, so a wave of 4 launched at
+        two-strikes would land 4 rejections against a documented limit of 3.
+        """
+        return max(1, self.threshold - self.consecutive)
+
+
+def _skipped(target: dict[str, Any], code: str) -> dict[str, Any]:
+    """A device the pass never attempted. Carries a taxonomy code, not free text —
+    the dashboard renders `job.*` codes as muted 'didn't run' copy, and an
+    unrecognised string would fall through to a generic 'Failed' badge that reads
+    like the device is broken."""
+    return {
+        "target_id": target.get("target_id"),
+        "host": str(target.get("host") or ""),
+        "label": target.get("label"),
+        "status": "skipped",
+        "code": code,
+        "error": code,  # legacy field mirrors the code, as in _fetch_one._fail
+    }
+
 
 def fetch_all(
     targets: list[dict[str, Any]],
@@ -451,30 +523,42 @@ def fetch_all(
     ssh_timeout: int = 30,
     time_budget: int = 300,
 ) -> dict[str, Any]:
-    """Back up every target, bounded by a wall-clock budget. Never raises."""
+    """Back up every target, bounded by a wall-clock budget. Never raises.
+
+    Carries the SAME auth circuit breaker as the on-demand test. This is the path
+    that matters most for it: `fetch_all` runs unattended every night across the
+    whole fleet, so a credential that has just been rotated or mistyped would
+    otherwise retry on every device until the time budget ran out — dozens of
+    failed logins per night, with nobody watching, against AAA policies that
+    typically lock an account after three to five.
+    """
     start = time.monotonic()
     key = _redact_key()
     devices: list[dict[str, Any]] = []
     budget_exhausted = False
+    breaker = _AuthBreaker()
 
-    for target in targets:
+    for i, target in enumerate(targets):
+        if breaker.tripped:
+            devices.extend(_skipped(t, "job.stopped_auth_failures") for t in targets[i:])
+            break
         if time.monotonic() - start > time_budget:
             budget_exhausted = True
-            devices.append({
-                "target_id": target.get("target_id"),
-                "host": str(target.get("host") or ""),
-                "label": target.get("label"),
-                "status": "skipped",
-                "error": "time budget exhausted",
-            })
-            continue
+            devices.extend(_skipped(t, "job.budget_exhausted") for t in targets[i:])
+            break
         entry = _fetch_one(target, key=key, ssh_timeout=ssh_timeout)
+        breaker.record(entry)
         if entry.get("status") == "ok":
             log.info("device config backed up", host=entry["host"], platform=entry.get("platform"))
         else:
             log.warning("device config backup failed", host=entry.get("host"),
                         status=entry.get("status"), error=entry.get("error"))
         devices.append(entry)
+
+    skipped = sum(1 for d in devices if d.get("status") == "skipped")
+    if breaker.tripped:
+        log.warning("device config pass stopped: consecutive auth rejections",
+                    consecutive=breaker.consecutive, skipped=skipped)
 
     ok = sum(1 for d in devices if d.get("status") == "ok")
     return {
@@ -483,9 +567,11 @@ def fetch_all(
         "stats": {
             "targets": len(targets),
             "ok": ok,
-            "errors": len(devices) - ok,
+            "errors": sum(1 for d in devices if d.get("status") == "error"),
+            "skipped": skipped,
             "elapsed_sec": round(time.monotonic() - start, 2),
             "budget_exhausted": budget_exhausted,
+            "stopped_early": breaker.tripped,
         },
     }
 
@@ -508,6 +594,10 @@ def test_targets(
       consecutive devices, the run STOPS. A district-wide password typo must produce
       3 failed logins, not 110 — 110 is how you lock the shared read-only account on
       every switch at once, and take out your own AAA server while you're at it.
+      Because devices run concurrently the counter is read between waves, so the
+      exact worst case is `max_workers` rejections (one full opening wave) rather
+      than 3; every later wave narrows to the remaining headroom. The same breaker
+      guards `fetch_all`, where the walk is sequential and the bound is exactly 3.
     * **Bounded concurrency.** School control planes are often aging hardware; four
       parallel sessions is plenty and won't spike CPU across the fleet mid-lesson.
     """
@@ -521,8 +611,7 @@ def test_targets(
         targets = [t for t in targets if t.get("target_id") in wanted]
 
     results: list[dict[str, Any]] = []
-    consecutive_auth_failures = 0
-    stopped_early = False
+    breaker = _AuthBreaker()
 
     def _one(target: dict[str, Any]) -> dict[str, Any]:
         return _fetch_one(target, key=key, ssh_timeout=ssh_timeout, discard_output=True)
@@ -530,34 +619,34 @@ def test_targets(
     with ThreadPoolExecutor(max_workers=max(1, min(max_workers, 8))) as pool:
         # Submitted in small waves so the breaker can actually stop the run; a single
         # bulk submit would have every device in flight before the third rejection.
-        for i in range(0, len(targets), max_workers):
+        i = 0
+        while i < len(targets):
             if time.monotonic() - start > time_budget:
-                for t in targets[i:]:
-                    results.append({
-                        "target_id": t.get("target_id"),
-                        "host": str(t.get("host") or ""),
-                        "status": "skipped",
-                        "code": "job.budget_exhausted",
-                    })
+                results.extend(_skipped(t, "job.budget_exhausted") for t in targets[i:])
                 break
-            if consecutive_auth_failures >= 3:
-                stopped_early = True
-                for t in targets[i:]:
-                    results.append({
-                        "target_id": t.get("target_id"),
-                        "host": str(t.get("host") or ""),
-                        "status": "skipped",
-                        "code": "job.stopped_auth_failures",
-                    })
+            if breaker.tripped:
+                results.extend(_skipped(t, "job.stopped_auth_failures") for t in targets[i:])
                 break
 
-            wave = list(pool.map(_one, targets[i : i + max_workers]))
+            # Shrink the wave once the counter is armed. The breaker can only be
+            # consulted BETWEEN waves, so a fixed-width wave launched at two strikes
+            # would land `max_workers` rejections against a threshold of 3.
+            #
+            # Clamping only when consecutive > 0 keeps a healthy fleet at full
+            # concurrency (the common case, and the one worth being fast). The
+            # residual worst case is the FIRST wave rejecting all at once —
+            # `max_workers` rejections, not the fleet — after which the run stops.
+            width = max_workers if breaker.consecutive == 0 else min(max_workers, breaker.headroom())
+            wave = list(pool.map(_one, targets[i : i + width]))
             for entry in wave:
-                if entry.get("stage") == "auth":
-                    consecutive_auth_failures += 1
-                elif entry.get("status") == "ok":
-                    consecutive_auth_failures = 0
+                breaker.record(entry)
             results.extend(wave)
+            i += width
+
+    stopped_early = breaker.tripped
+    if stopped_early:
+        log.warning("device ssh test stopped: consecutive auth rejections",
+                    consecutive=breaker.consecutive)
 
     passed = sum(1 for r in results if r.get("status") == "ok")
     return {
