@@ -143,6 +143,11 @@ IF_HC_OUT_OCTETS     = "1.3.6.1.2.1.31.1.1.1.10"    # ifHCOutOctets (ifXTable)
 # (config) state, and negotiated duplex. All indexed by ifIndex like the above.
 IF_ALIAS             = "1.3.6.1.2.1.31.1.1.1.18"    # ifAlias (operator description)
 IF_ADMIN_STATUS      = "1.3.6.1.2.1.2.2.1.7"        # ifAdminStatus
+# ifType — same ifTable entry as ifOperStatus, so it rides the EXISTING
+# _walk_columns call for free (that walk already fetches every column of the
+# entry and discards the ones we didn't ask for). Used only to tell a real
+# Ethernet port from an SVI/LAG/loopback when placing PoE rows.
+IF_TYPE              = "1.3.6.1.2.1.2.2.1.3"        # ifType
 DOT3_DUPLEX          = "1.3.6.1.2.1.10.7.2.1.19"    # dot3StatsDuplexStatus (EtherLike-MIB)
 
 # INV: PoE — POWER-ETHERNET-MIB (RFC 3621), pethPsePortTable. Indexed by
@@ -176,6 +181,12 @@ _PETH_DETECT = {
 }
 # pethPsePortPowerClassifications (RFC 3621): class0(1)..class4(5)
 _PETH_CLASS = {"1": "class0", "2": "class1", "3": "class2", "4": "class3", "5": "class4"}
+# ifType values that can physically host a PSE. Only real Ethernet ports deliver
+# PoE — an SVI, LAG, loopback or OOBM port never can — so a PoE row that "matches"
+# one is a mis-join, not a reading. Observed in production 2026-08-20: on the
+# Cucamonga 2930M stacks a PSE row was landing on `VLAN100` because that SVI was
+# the only interface whose ifName ended in 100.
+_PHYSICAL_IFTYPES = {"6"}  # ethernetCsmacd
 # Cap interfaces recorded per switch so a big chassis can't bloat the bundle.
 _IFACE_CAP = 400
 
@@ -1091,12 +1102,14 @@ def _collect_interface_health(ip: str, community: str) -> dict[str, dict]:
     speeds = ifx[IF_HIGH_SPEED]
     alias = ifx[IF_ALIAS]
     iftab = _walk_columns(
-        ip, community, (IF_OPER_STATUS, IF_ADMIN_STATUS, IF_IN_ERRORS, IF_OUT_ERRORS)
+        ip, community,
+        (IF_OPER_STATUS, IF_ADMIN_STATUS, IF_IN_ERRORS, IF_OUT_ERRORS, IF_TYPE),
     )
     oper = iftab[IF_OPER_STATUS]
     admin = iftab[IF_ADMIN_STATUS]
     in_err = iftab[IF_IN_ERRORS]
     out_err = iftab[IF_OUT_ERRORS]
+    iftype = iftab[IF_TYPE]
     duplex = _walk_col(ip, community, DOT3_DUPLEX)  # lone dot3StatsTable column
 
     # STP state is keyed by bridge port; map bridge port -> ifIndex to align it.
@@ -1109,8 +1122,11 @@ def _collect_interface_health(ip: str, community: str) -> dict[str, dict]:
             stp_by_ifindex[ifidx] = _STP_STATE.get(state.strip(), state.strip())
 
     out: dict[str, dict] = {}
+    physical: set[str] = set()
     for ifidx, raw_name in list(names.items())[:_IFACE_CAP]:
         rec: dict = {"name": _strip_quotes(raw_name) or raw_name}
+        if (iftype.get(ifidx) or "").strip() in _PHYSICAL_IFTYPES:
+            physical.add(ifidx)
         al = _strip_quotes(alias.get(ifidx))
         if al:
             rec["alias"] = al
@@ -1130,13 +1146,18 @@ def _collect_interface_health(ip: str, community: str) -> dict[str, dict]:
             rec["stp_state"] = stp
         out[ifidx] = rec
 
-    # INV: PoE — best-effort join of the (group.port)-keyed PoE table onto ifIndex.
+    # INV: PoE — join the (group.port)-keyed PoE table onto ifIndex. Rows that
+    # can't be placed unambiguously are DROPPED, never guessed (see _attach_poe).
     poe = _collect_poe(ip, community)
     if poe:
-        unmatched = _attach_poe(out, poe)
+        unmatched = _attach_poe(out, poe, physical)
         if unmatched:
-            log.debug("poe ports unmatched to ifindex",
-                      ip=ip, unmatched=unmatched, poe_total=len(poe))
+            # INFO, not debug: a drop means this chassis has PoE we are NOT
+            # showing. That is the correct outcome, but it must be visible —
+            # the old debug-level call made silent loss indistinguishable from
+            # a switch that simply has no PoE.
+            log.info("poe ports dropped: no unambiguous ifindex",
+                     ip=ip, dropped=unmatched, poe_total=len(poe))
     return out
 
 
@@ -1176,49 +1197,75 @@ def _collect_poe(ip: str, community: str) -> dict[str, dict]:
     return out
 
 
-def _attach_poe(interfaces: dict[str, dict], poe: dict[str, dict]) -> int:
-    """Best-effort map PoE rows (keyed "group.port") onto interface records by
-    matching the numbers parsed from each ifName — there is no standard
-    PsePort->ifIndex OID. Mutates `interfaces`; returns the count of PoE rows
-    that couldn't be matched to an ifIndex (logged by the caller)."""
+def _attach_poe(
+    interfaces: dict[str, dict], poe: dict[str, dict], physical: set[str],
+) -> int:
+    """Map PoE rows (keyed "group.port") onto ifIndex. Returns rows DROPPED.
+
+    There is no standard PsePort->ifIndex OID, so the join is structural — and it
+    refuses to guess: a row that cannot be placed unambiguously is dropped rather
+    than attached to a plausible candidate, because PoE shown against the wrong
+    port is worse than no PoE at all (it looks measured).
+
+    Only interfaces in `physical` (ifType ethernetCsmacd) are eligible: an SVI or
+    LAG can never be a PSE port.
+
+    Hardware-validated 2026-08-20 against RCH-IDF-N-STK, a 4-member ArubaOS-CX
+    VSF stack (192 PSE rows, ifIndex = (member-1)*64 + port, PSE index space
+    1..48 / 65..112 / 129..176 / 193..240) and RCH-IDF-N, a single-member 6200M.
+    """
+    groups = {k.split(".", 1)[0] for k in poe}
     tokens: list[tuple[list[int], str]] = []
-    for ifidx, rec in interfaces.items():
-        nums = [int(n) for n in re.findall(r"\d+", rec.get("name") or "")]
+    for ifidx in interfaces:
+        if ifidx not in physical:
+            continue
+        nums = [int(n) for n in re.findall(r"\d+", interfaces[ifidx].get("name") or "")]
         if nums:
             tokens.append((nums, ifidx))
-    unmatched = 0
+    dropped = 0
     for key, prec in poe.items():
         parts = key.split(".")
         try:
             grp, port = int(parts[0]), int(parts[1])
         except (IndexError, ValueError):
-            unmatched += 1
+            dropped += 1
             continue
-        match: str | None = None
-        # 1) ifName ends with the PoE port AND contains the group earlier
-        #    (e.g. "GigabitEthernet1/0/12" -> tokens [1,0,12] matches group 1 port 12).
-        for nums, ifidx in tokens:
-            if nums[-1] == port and grp in nums[:-1]:
-                match = ifidx
-                break
-        # 2) single interface whose ifName ends with the port (single-group box).
-        if match is None:
-            cands = [ifidx for nums, ifidx in tokens if nums[-1] == port]
-            if len(cands) == 1:
-                match = cands[0]
-        # 3) Fallback: the pethPsePortIndex IS the ifIndex. True on ArubaOS-CX,
-        #    where the port index is stack-GLOBAL (member 2 port 1 = index 65 =
-        #    ifIndex 65, member 3 +128, member 4 +192), so the ifName-number
-        #    heuristics above match only member 1 and drop the rest. This only
-        #    fires when (1)+(2) found nothing, so it can't override a name match
-        #    on switches where the two indices differ (e.g. Cisco stacks).
-        if match is None and str(port) in interfaces:
-            match = str(port)
-        if match is not None:
-            interfaces[match]["poe"] = prec
-        else:
-            unmatched += 1
-    return unmatched
+        # 1) ifName ends with the PoE port AND names the group earlier
+        #    ("GigabitEthernet1/0/12" -> [1,0,12] for group 1 port 12).
+        #    Must be UNIQUE. On ArubaOS-CX the name is member/slot/port and the
+        #    SLOT digit is also 1, so group 1 satisfies this for EVERY member
+        #    ("2/1/12", "3/1/12", ...). The old first-match-wins silently picked
+        #    whichever the walk happened to emit first — correct only because
+        #    snmpwalk ascends by ifIndex. Reversing that order mis-attached 22
+        #    rows and silently lost 48 on the real RCH stack.
+        cands = [i for nums, i in tokens if nums[-1] == port and grp in nums[:-1]]
+        # 2) otherwise, a single physical port whose ifName ends with the port.
+        if len(cands) != 1:
+            cands = [i for nums, i in tokens if nums[-1] == port]
+        if len(cands) == 1:
+            interfaces[cands[0]]["poe"] = prec
+            continue
+        # 3) pethPsePortIndex IS the ifIndex — true on ArubaOS-CX, where the port
+        #    index is stack-global, so (1) can only ever match member 1. Accepted
+        #    only when the target is a physical port AND its own ifName agrees
+        #    with the PSE group, which makes this a check rather than an
+        #    assumption: on the real stack, PSE (group 3, port 129) lands on
+        #    ifIndex 129 named "3/1/1" — leading token 3 == group 3.
+        tgt = str(port)
+        if tgt in physical:
+            nums = [int(n) for n in re.findall(r"\d+", interfaces[tgt].get("name") or "")]
+            # When the chassis reports SEVERAL PSE groups the group tracks the
+            # stack member (measured on the 4-member CX stack: groups 1-4), so
+            # the target's own member token has to agree or we are guessing.
+            # When it reports ONE group the port index is necessarily unique
+            # across the whole chassis, so there is no member to disagree with
+            # and ifIndex == port is the vendor's own identity, not a guess.
+            member_ok = len(groups) == 1 or (len(nums) >= 2 and nums[0] == grp)
+            if nums and member_ok:
+                interfaces[tgt]["poe"] = prec
+                continue
+        dropped += 1
+    return dropped
 
 
 def _collect_uplink_counters(
