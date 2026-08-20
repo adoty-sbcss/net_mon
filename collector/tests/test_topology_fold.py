@@ -117,6 +117,67 @@ def test_ambiguous_sysname_never_folds():
     assert _fold_synthetic_nodes(nodes, []) == 0
 
 
+def test_sysname_match_never_folds_when_the_addresses_disagree():
+    """Rule 3's hole: two boxes share a hostname and only ONE of them is crawlable.
+
+    Uniqueness in `by_name` spans only the nodes this crawl identified, so an
+    un-crawlable twin is invisible to it — CDP still reports the twin, and without
+    an address check its placeholder folds onto the switch we DID reach. That is a
+    silent, unlogged, un-undoable merge of two different devices, which is exactly
+    what the charter forbids. CDP carries the neighbour's address, so we can see the
+    contradiction: the placeholder says 10.0.0.77, the candidate lives at 10.0.0.1.
+    """
+    nodes = {
+        "aa:bb:cc:00:00:01": node("aa:bb:cc:00:00:01", name="Switch", ips=["10.0.0.1"]),
+        "cdp:Switch": node("cdp:Switch", name="Switch", ips=["10.0.0.77"], source="cdp"),
+    }
+    assert _fold_synthetic_nodes(nodes, []) == 0
+    assert "cdp:Switch" in nodes
+
+
+def test_sysname_match_still_folds_when_the_placeholder_has_no_address():
+    """Positive control for the guard above — it must reject contradiction, not silence.
+
+    A CDP entry whose address is absent or unusable leaves the sysName as the only
+    evidence there is, and that case is the whole reason rule 3 exists.
+    """
+    for ips in ([], ["0.0.0.0"]):
+        nodes = {
+            "aa:bb:cc:00:00:01": node("aa:bb:cc:00:00:01", name="RCH-IDF-N", ips=["10.10.0.5"]),
+            "cdp:RCH-IDF-N": node("cdp:RCH-IDF-N", name="RCH-IDF-N", ips=ips, source="cdp"),
+        }
+        assert _fold_synthetic_nodes(nodes, []) == 1, ips
+        assert set(nodes) == {"aa:bb:cc:00:00:01"}, ips
+
+
+def test_sysname_match_folds_when_the_address_is_a_subset():
+    """Agreement, not equality: the real node may know addresses CDP never reported."""
+    nodes = {
+        "aa:bb:cc:00:00:01": node(
+            "aa:bb:cc:00:00:01", name="RCH-IDF-N", ips=["10.10.0.5", "10.10.99.5"]
+        ),
+        "cdp:RCH-IDF-N": node("cdp:RCH-IDF-N", name="RCH-IDF-N", ips=["10.10.0.5"], source="cdp"),
+    }
+    assert _fold_synthetic_nodes(nodes, []) == 1
+    assert set(nodes) == {"aa:bb:cc:00:00:01"}
+
+
+def test_address_check_does_not_gate_the_stronger_rules():
+    """Rules 1 and 2 carry their own address evidence and must be unaffected.
+
+    A chassis id is self-identification — a neighbour advertising this box's chassis
+    string IS this box, whatever address the CDP cache happened to record.
+    """
+    nodes = {
+        "T34W44DBD28A3B6A": node("T34W44DBD28A3B6A", name="T34W", ips=["192.168.130.45"]),
+        "cdp:T34W44DBD28A3B6A": node(
+            "cdp:T34W44DBD28A3B6A", name="T34W44DBD28A3B6A", ips=["192.168.130.99"], source="cdp"
+        ),
+    }
+    assert _fold_synthetic_nodes(nodes, []) == 1
+    assert set(nodes) == {"T34W44DBD28A3B6A"}
+
+
 def test_placeholder_with_no_match_is_kept():
     """A device only a neighbour ever saw is REAL inventory, not a duplicate."""
     nodes = {
