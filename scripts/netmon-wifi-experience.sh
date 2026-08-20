@@ -59,6 +59,20 @@ RT_RULE_PRIO=5100
 # is measured inside a command-substitution subshell.
 _TRAP_IFACE=""
 
+# Single cleanup path for BOTH normal exit and a signal. Bash does not run an EXIT
+# trap when an untrapped SIGTERM kills the shell — and systemd sends exactly that
+# when TimeoutStartSec expires — so an EXIT-only trap left the analysis radio
+# associated (to the guest SSID, say) until the next battery hours later, with the
+# policy rules still installed and no artifact written. Idempotent; clears the traps
+# first so the exit below can't re-enter it.
+_cleanup() {
+    local rc="${1:-0}"
+    trap - EXIT TERM INT HUP
+    _routing_teardown "$_TRAP_IFACE"
+    wifi_leave_all >/dev/null 2>&1 || true
+    exit "$rc"
+}
+
 # common.sh provides $SUDO; fall back if it wasn't sourced.
 if [ -z "${SUDO+x}" ]; then SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"; fi
 
@@ -85,12 +99,19 @@ _routing_setup() {
     $SUDO ip route replace default via "$gw" dev "$iface" table "$RT_TABLE" 2>/dev/null || return 1
     $SUDO ip rule add from "$ip" table "$RT_TABLE" prio "$RT_RULE_PRIO" 2>/dev/null || true
     $SUDO ip rule add oif "$iface" table "$RT_TABLE" prio "$((RT_RULE_PRIO + 1))" 2>/dev/null || true
+    # The `from <ip>` rule is the one EVERY source-bound probe depends on. If it did
+    # not land, probes fall through to the main table and silently measure the WIRED
+    # path while being recorded as this SSID's result — a wrong answer that looks like
+    # a healthy one. Verify rather than assume; the caller reports it as routing_ok.
+    $SUDO ip rule show 2>/dev/null \
+        | grep -qE "^${RT_RULE_PRIO}:[[:space:]]+from ${ip}([[:space:]]|$)" || return 1
     return 0
 }
 
 # Classify a captive portal from a curl probe of a known generate_204 endpoint.
-# Echoes "state<TAB>http_code<TAB>redirect_url". PURE-ish (only runs curl) — the
-# state logic is unit-tested via wifi_experience.py.
+# Echoes "state<TAB>http_code<TAB>redirect_url". PURE-ish (only runs curl). The
+# equivalent classification on the collector side is covered by
+# collector/tests/test_wifi_experience.py; this bash copy has no unit test of its own.
 #   open    : 204 (direct internet, no portal)
 #   portal  : 3xx or a 200 with a body (intercepted -> redirect_url is the portal)
 #   blocked : no response (timeout/refused)
@@ -398,9 +419,10 @@ _run_profile() {
     local cap_state="n/a" cap_code="" cap_redir="" cap_redir_b64="" cap_accepted="null" cap_vendor=""
     local ping_ok=false http_ok=false rtt="" loss="" dns_ok=false iso_tested="" iso_reachable=""
     local dl_mbps="" tgt_json="" wp_json="" st_json=""
+    local routing_ok=false dns_srv="" dns_via=""
     if [[ -n "$ip4" && -n "$gw" ]]; then
         local srcip="${ip4%/*}"
-        _routing_setup "$iface" "$srcip" "$gw" || true
+        _routing_setup "$iface" "$srcip" "$gw" && routing_ok=true
         # captive portal (probes bind by SOURCE IP so the `from <ip>` rule routes them
         # via the Wi-Fi gateway; SO_BINDTODEVICE would set oif but not the source IP).
         local cap; cap="$(_captive_probe "$srcip")"
@@ -428,8 +450,29 @@ _run_profile() {
         rtt="$(printf '%s' "$png" | awk -F'/' '/rtt|round-trip/{print $5; exit}')"
         loss="$(printf '%s' "$png" | grep -oE '[0-9]+% packet loss' | grep -oE '[0-9]+' | head -1)"
         [[ "$cap_state" == "open" ]] && http_ok=true
-        # DNS resolves through the Wi-Fi
-        $SUDO curl -s -m 6 --interface "$srcip" -o /dev/null https://dns.google/resolve?name=example.com 2>/dev/null && dns_ok=true
+        # DNS through the JOINED network's own resolver. `curl --interface` binds the
+        # socket AFTER getaddrinfo, so the previous probe resolved via the box's WIRED
+        # resolv.conf and happily reported dns_ok=true on a guest VLAN whose DNS was
+        # filtered or dead — precisely the "Wi-Fi is broken in Room 12" case this
+        # battery exists to catch. Ask the DHCP-supplied resolver directly, bound to
+        # the Wi-Fi source IP. `dns_via` records which method actually answered, so a
+        # fallback can never be mistaken for a real test of the joined resolver.
+        dns_srv="$($SUDO nmcli -g IP4.DNS dev show "$iface" 2>/dev/null | head -1)"
+        [[ -z "$dns_srv" ]] && dns_srv="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null \
+            | tr ',' '\n' | grep -E '(^|[[:space:]])domain_name_servers = ' \
+            | sed -n 's/.*domain_name_servers = \([0-9. ]*\).*/\1/p' | head -1 | awk '{print $1}')"
+        if [[ -n "$dns_srv" ]] && command -v dig >/dev/null 2>&1; then
+            dns_via="dig"
+            [[ -n "$($SUDO dig +short +time=3 +tries=1 -b "$srcip" @"$dns_srv" example.com A 2>/dev/null)" ]] && dns_ok=true
+        elif command -v resolvectl >/dev/null 2>&1; then
+            dns_via="resolvectl"
+            $SUDO resolvectl query -i "$iface" example.com >/dev/null 2>&1 && dns_ok=true
+        else
+            # Last resort. Reachability of a DoH endpoint over the Wi-Fi — it does NOT
+            # exercise the joined resolver; labelled so nobody reads it as if it did.
+            dns_via="doh-reachability"
+            $SUDO curl -s -m 6 --interface "$srcip" -o /dev/null https://dns.google/resolve?name=example.com 2>/dev/null && dns_ok=true
+        fi
         # throughput: a short source-bound download over the Wi-Fi (Cloudflare speed
         # endpoint, capped at 12s); the analysis radio only, never the uplink.
         local dl
@@ -501,7 +544,8 @@ _run_profile() {
     printf '"speedtest":%s,' "${st_json:-null}"
     printf '"targets":[%s],' "${tgt_json:-}"
     printf '"webperf":[%s],' "${wp_json:-}"
-    printf '"dns_ok":%s,' "$dns_ok"
+    printf '"dns_ok":%s,"dns_via":"%s","dns_server":"%s","routing_ok":%s,' \
+        "$dns_ok" "${dns_via:-}" "${dns_srv:-}" "$routing_ok"
     printf '"isolation":{"internal_target":"%s","internal_reachable":%s}}' \
         "${iso_tested:-}" "${iso_reachable:-null}"
 }
@@ -510,6 +554,20 @@ _run_profile() {
 
 main() {
     command -v ip >/dev/null 2>&1 || { echo "ip(8) missing"; exit 1; }
+
+    # One battery at a time. The scheduled tick (netmon-wifi-experience.timer) and the
+    # dashboard "Test now" host-action are separate entry points with no other
+    # interlock, and they share ONE radio plus the same routing table/rule priorities:
+    # concurrent runs tear down each other's association mid-probe, and the orphaned
+    # probes then egress the WIRED uplink while still being recorded as Wi-Fi results.
+    # Non-blocking — a second caller exits rather than queueing behind a long battery.
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"${NETMON_STATE_DIR:-/var/lib/netmon}/.wifi-experience.lock" 2>/dev/null || true
+        if ! flock -n 9; then
+            echo "another Wi-Fi battery is already running — skipping"
+            exit 0
+        fi
+    fi
 
     local enabled
     enabled="$(current_value NETMON_WIFI_JOIN_ENABLED 2>/dev/null || true)"
@@ -522,10 +580,15 @@ main() {
     [[ -z "$iface" ]] && iface="$(wifi_analysis_iface)"
     [[ -z "$iface" ]] && { echo "no spare Wi-Fi NIC — refusing"; exit 1; }
 
-    # The EXIT trap tears down routing + leaves EVERY netmon-owned Wi-Fi connection,
+    # The cleanup trap tears down routing + leaves EVERY netmon-owned Wi-Fi connection,
     # so a mid-run death (even inside a profile subshell) can't strand the radio.
+    # SIGTERM/INT/HUP are trapped alongside EXIT because the timeout kill is a SIGTERM
+    # and bash would otherwise skip cleanup entirely — see _cleanup.
     _TRAP_IFACE="$iface"
-    trap '_routing_teardown "$_TRAP_IFACE"; wifi_leave_all >/dev/null 2>&1 || true' EXIT
+    trap '_cleanup $?' EXIT
+    trap '_cleanup 143' TERM
+    trap '_cleanup 130' INT
+    trap '_cleanup 129' HUP
 
     # Run each profile serialized (one radio = one association at a time), appending a
     # result object. Empty results[] if there are no profiles / none associated.

@@ -10,6 +10,12 @@ Type=oneshot
 # radio — nmcli con up, ip rule/route in a dedicated table — which needs privilege.
 WorkingDirectory=${REPO_DIR}
 ExecStart=${REPO_DIR}/scripts/netmon-wifi-experience-tick.sh
-# join -> measure -> leave PER profile, serialized; cap generously.
-TimeoutStartSec=600
+# join -> measure -> leave PER profile, serialized; cap generously. Worst case is
+# ~4 min/profile (join 25s + DHCP 15s + captive accept incl. a 45s async poll +
+# 12s download + 15s upload/pings on the primary + webperf at 15s/URL), so 600s
+# could not fit a realistic multi-profile list and the run was being SIGTERM'd
+# mid-battery every time. The script now cleans up on SIGTERM regardless (see
+# _cleanup), but it still needs room to actually FINISH and write its artifact --
+# a killed run re-ships the previous one with no failure signal.
+TimeoutStartSec=1800
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
