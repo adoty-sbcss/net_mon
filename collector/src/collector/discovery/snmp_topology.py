@@ -663,7 +663,12 @@ _ADDRESS_SHAPED = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 # shorter normalized forms collide too easily to fold two nodes on.
 _IDENTITY_MIN_LEN = 12
 # A sysName is weaker evidence than a chassis id, but still has to be a real name.
+# Deliberately NOT raised to exclude default hostnames: legitimate school gear is
+# named `IDF1`/`MDF`, so a longer bar would refuse real folds while a determined
+# collision ("Switch") would still clear it. The address check is what guards rule 3.
 _NAME_MIN_LEN = 3
+# Folded pairs to name in the crawl log before truncating. One prod crawl folded 239.
+_FOLD_LOG_PAIRS = 50
 
 
 def _usable_mgmt_ip(ip: object) -> bool:
@@ -717,6 +722,13 @@ def _fold_synthetic_nodes(
     so every rule demands exactly ONE candidate and refuses on ambiguity. Only
     placeholders are ever folded away — a real chassis node is never removed.
 
+    The charter bites harder here than it does downstream, which is why rule 3 also
+    checks addresses: the dashboard's merge writes a ledger row with an evidence
+    snapshot and a one-click Undo, whereas a fold is silent, re-applied on every
+    crawl, and leaves nothing behind to notice or reverse. Uniqueness among the
+    real nodes only spans boxes THIS crawl identified, so it cannot see the
+    un-crawlable twin that makes a shared hostname dangerous.
+
     One thing this gets that the dashboard cannot: everything here happened inside a
     single crawl, minutes apart, so a shared management address cannot be explained
     by the address changing hands. That makes IP the strong signal it isn't later.
@@ -730,21 +742,47 @@ def _fold_synthetic_nodes(
     by_identity: dict[str, list[str]] = {}
     by_name: dict[str, list[str]] = {}
     by_ip: dict[str, list[str]] = {}
+    usable_ips: dict[str, set[str]] = {}
     for k in real_keys:
         n = nodes[k]
         by_identity.setdefault(_identity_key(k), []).append(k)
         name = n.get("system_name")
         if isinstance(name, str) and name.strip():
             by_name.setdefault(_identity_key(name), []).append(k)
-        for ip in n.get("mgmt_ips") or []:
-            if _usable_mgmt_ip(ip):
-                by_ip.setdefault(ip, []).append(k)
+        owned = {ip for ip in (n.get("mgmt_ips") or []) if _usable_mgmt_ip(ip)}
+        usable_ips[k] = owned
+        for ip in owned:
+            by_ip.setdefault(ip, []).append(k)
 
     def _sole(bucket: dict[str, list[str]], key: str) -> str | None:
         hits = bucket.get(key) or []
         return hits[0] if len(hits) == 1 else None
 
+    def _addresses_agree(placeholder: dict[str, Any], target: str) -> bool:
+        """Does the placeholder's own address CONTRADICT the node we'd fold it into?
+
+        Only rule 3 needs this. Rules 1 and 2 carry their own address evidence — a
+        chassis id is self-identification, and rule 2 *is* the address test — but a
+        bare sysName match does not, and two boxes sharing a default hostname
+        ("Switch", "ProCurve Switch") is an ordinary thing to find on a school
+        network. Uniqueness among the real nodes is not enough on its own, because
+        it only spans the boxes this crawl could identify: an un-crawlable twin is
+        invisible to that check and would fold onto the one twin we did reach.
+
+        A placeholder with NO usable address is still allowed through — a CDP entry
+        that carries no address leaves the name as the only evidence there is, which
+        is the case rule 3 exists to serve. What must not pass is a placeholder that
+        tells us where it lives and names somewhere else.
+        """
+        mine = {ip for ip in (placeholder.get("mgmt_ips") or []) if _usable_mgmt_ip(ip)}
+        return not mine or mine <= usable_ips.get(target, set())
+
     remap: dict[str, str] = {}
+    # Which rule claimed each placeholder. Folding is otherwise INVISIBLE — it
+    # leaves no ledger row, no evidence snapshot and nothing to undo (unlike the
+    # dashboard's merge path), and it re-runs every crawl, so the rule mix is the
+    # only handle anyone gets on whether it is behaving.
+    fired: dict[str, str] = {}
     for key in list(nodes):
         if not _SYNTHETIC_KEY.match(key):
             continue
@@ -756,12 +794,15 @@ def _fold_synthetic_nodes(
         usable_name = name if name and not _ADDRESS_SHAPED.match(name) else ""
 
         target: str | None = None
+        rule = ""
 
         # 1. The placeholder is NAMED FOR a real node's chassis id (the 135 + 88).
         if usable_name:
             ident = _identity_key(usable_name)
             if len(ident) >= _IDENTITY_MIN_LEN:
                 target = _sole(by_identity, ident)
+                if target is not None:
+                    rule = "chassis_id"
 
         # 2. Exactly one real node claims a management address this placeholder
         #    claims. Two real claimants means a shared virtual address (HSRP/VRRP)
@@ -775,19 +816,37 @@ def _fold_synthetic_nodes(
             }
             if len(owners) == 1:
                 target = next(iter(owners))
+                rule = "mgmt_ip"
 
         # 3. The placeholder's name IS a real node's sysName. Weaker than a chassis
-        #    id, so it needs uniqueness among the real nodes in this crawl.
+        #    id, so it needs uniqueness among the real nodes in this crawl AND an
+        #    address that does not point somewhere else — see `_addresses_agree`.
         if target is None and usable_name:
             ident = _identity_key(usable_name)
             if len(ident) >= _NAME_MIN_LEN:
-                target = _sole(by_name, ident)
+                candidate = _sole(by_name, ident)
+                if candidate is not None and _addresses_agree(node, candidate):
+                    target = candidate
+                    rule = "sys_name"
 
         if target is not None and target != key:
             remap[key] = target
+            fired[key] = rule
 
     if not remap:
         return 0
+
+    # A count alone cannot tell an over-fold from a good day's work. Emit the rule
+    # mix (a jump in `sys_name` is the shape to worry about — it is the weakest
+    # rule) plus the actual pairs, capped so one big crawl cannot flood the log.
+    by_rule: dict[str, int] = {}
+    for r in fired.values():
+        by_rule[r] = by_rule.get(r, 0) + 1
+    pairs = [{"from": s, "to": d, "rule": fired.get(s, "")} for s, d in remap.items()]
+    log.info("topology fold",
+             folded=len(remap), by_rule=by_rule,
+             pairs=pairs[:_FOLD_LOG_PAIRS],
+             pairs_omitted=max(0, len(pairs) - _FOLD_LOG_PAIRS))
 
     for src, dst in remap.items():
         placeholder = nodes.pop(src)
