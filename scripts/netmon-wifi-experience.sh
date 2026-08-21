@@ -65,6 +65,14 @@ _TRAP_IFACE=""
 # associated (to the guest SSID, say) until the next battery hours later, with the
 # policy rules still installed and no artifact written. Idempotent; clears the traps
 # first so the exit below can't re-enter it.
+#
+# Timing note (measured on Monitor1): bash defers a trap until the foreign command
+# running in the FOREGROUND returns, so a manual `kill -TERM` of just this PID does
+# not clean up until the in-flight curl/ping finishes -- bounded by the per-probe
+# timeouts (<=15s each), not unbounded. Under systemd it is prompt: the unit has no
+# KillMode override, so the default control-group kill takes the probe children out
+# at the same instant and bash reaches the trap immediately, well inside the default
+# 90s TimeoutStopSec.
 _cleanup() {
     local rc="${1:-0}"
     trap - EXIT TERM INT HUP
