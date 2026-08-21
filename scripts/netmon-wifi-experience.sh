@@ -457,7 +457,13 @@ _run_profile() {
         # battery exists to catch. Ask the DHCP-supplied resolver directly, bound to
         # the Wi-Fi source IP. `dns_via` records which method actually answered, so a
         # fallback can never be mistaken for a real test of the joined resolver.
-        dns_srv="$($SUDO nmcli -g IP4.DNS dev show "$iface" 2>/dev/null | head -1)"
+        # `nmcli -g` joins MULTIPLE values with " | " on one line, so a lease handing
+        # out two resolvers yields "10.0.0.1 | 10.0.0.2" — passing that whole string as
+        # dig's @server silently fails and reads as "this network's DNS is broken".
+        # Caught on Monitor1: the guest SSID has two resolvers and reported a false
+        # dns_ok=false. Take the FIRST server only.
+        dns_srv="$($SUDO nmcli -g IP4.DNS dev show "$iface" 2>/dev/null \
+            | head -1 | tr '|' '\n' | head -1 | tr -d '[:space:]')"
         [[ -z "$dns_srv" ]] && dns_srv="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null \
             | tr ',' '\n' | grep -E '(^|[[:space:]])domain_name_servers = ' \
             | sed -n 's/.*domain_name_servers = \([0-9. ]*\).*/\1/p' | head -1 | awk '{print $1}')"
