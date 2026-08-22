@@ -175,10 +175,27 @@ _REDACT_PATTERNS = [
         # -- Ubiquiti EdgeSwitch / Netgear ProSafe (FASTPATH) --
         r"^(\s*radius server key (?:auth|acct) \S+ (?:encrypted )?)(?P<sec>\"[^\"]*\"|\S+)",
         r"^(\s*snmp-server community (?:r[ow] )?)(?P<sec>\"[^\"]*\"|\S+)",
+        # FASTPATH's OTHER community forms put a SUBCOMMAND KEYWORD where Cisco puts
+        # the secret — `community ipaddr <ip> <name>` / `ipmask <mask> <name>` /
+        # `mode <name>` — so the community sits at the END of the line. Without these
+        # three the Cisco-shaped pattern above masks the KEYWORD and the real
+        # community shipped in cleartext. (NCM-4; the keyword also still gets a token
+        # of its own, exactly as `r[ow]` does — see the note in _redact_config.)
+        r"^(\s*snmp-server community (?:(?:ipaddr|ipmask) \S+|mode) )(?P<sec>\"[^\"]*\"|\S+)",
         r"(\b(?:auth|priv)-(?:md5|sha\d*|des|aes\d*) (?:key )?)(?P<sec>\"[^\"]*\"|\S+)",
         # -- Extreme EXOS --
         r"^(\s*(?:create|configure) account .*?\bencrypted )(?P<sec>\"[^\"]*\"|\S+)",
         r"^(\s*configure snmp add community (?:readonly|readwrite) (?:encrypted )?)(?P<sec>\"[^\"]*\"|\S+)",
+        # EXOS SNMPv3 users: `configure snmpv3 add user <u> authentication <md5|sha>
+        # <pass> privacy <des|aes> <pass>`. Spelled out, not the hyphenated `auth-md5`
+        # FASTPATH form above — and `_SECRET_KEYWORD_RE` knows neither `authentication `
+        # nor `privacy `, so the backstop never saw these either and BOTH passwords
+        # shipped in cleartext. Found while fixing the FASTPATH community leak; same
+        # class, independent gap. The lookahead keeps Cisco's
+        # `standby N authentication md5 key-string ...` from having its literal
+        # `key-string` keyword masked (that line's real secret has its own pattern).
+        r"(\bauthentication (?:md5|sha\d*) (?:encrypted )?(?:hex )?)(?P<sec>(?!key-string\b)(?:\"[^\"]*\"|\S+))",
+        r"(\bprivacy (?:(?:3?des|aes\d*) )?(?:encrypted )?(?:hex )?)(?P<sec>\"[^\"]*\"|\S+)",
         r"(\bshared-secret (?:encrypted )?)(?P<sec>\"[^\"]*\"|\S+)",
         r"(\bsimple-password )(?P<sec>\"[^\"]*\"|[^\s;]+)",
         # -- Juniper Junos (set-form) --
@@ -204,14 +221,103 @@ _REDACT_PATTERNS = [
 # IS the secret.
 _DOLLAR_RE = re.compile(r"(?P<sec>\$(?:9|1|2[aby]?|5|6|8|y|sha1|apr1)\$[^\s\"';]+)")
 
-# Fail-closed backstop: a line carrying a secret-family keyword that NO pattern
-# masked, and that has a credential-shaped tail, gets that tail masked + counted —
-# so a silent pattern gap becomes a visible signal instead of a leak.
+# Fail-closed backstop: a secret-family keyword followed by a credential-shaped tail
+# that NO pattern masked gets that tail masked + counted — so a silent pattern gap
+# becomes a visible signal instead of a leak.
 _SECRET_KEYWORD_RE = re.compile(
     r"(?i)\b(?:passwd|password|secret|passphrase|community|pre-shared|shared-secret|"
     r"auth-key|authentication-key|priv|psk|wep|cak|key-string)\b"
 )
 _SECRET_TAIL_RE = re.compile(r"\"[^\"]{6,}\"|\$\S+|[A-Za-z0-9+/=]{12,}|\S*\d\S{7,}")
+# Tokens this module has already inserted. The backstop blanks these out and scans
+# what is LEFT, instead of skipping any line that carries one — see _backstop_line.
+_TOKEN_RE = re.compile(r"<REDACTED:[^>\s]*>")
+# A bare dotted quad (optionally /len) — an ACL address or a netmask, never a
+# credential. See _next_credential_tail for why the backstop steps over one.
+_IPV4_LITERAL_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?")
+# Letters in ONE case, no digits — a grammar keyword (Junos `authorization`), not the
+# base64/hex blob _SECRET_TAIL_RE's {12,} alternative is hunting. See below.
+_PLAIN_WORD_RE = re.compile(r"[a-z]+|[A-Z]+")
+
+
+def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[str] | None:
+    """First credential-shaped tail at/after `start`, skipping known non-credentials.
+
+    Two candidates are stepped over — SKIPPED AND CONTINUED past, never abandoning
+    the line, so a real secret sitting further right is still caught:
+
+    * **A bare IPv4 literal.** A dotted quad trips `_SECRET_TAIL_RE`'s "random-ish
+      string containing a digit" alternative, but it is CONFIG — on FASTPATH's
+      `snmp-server community ipaddr <ip> <name>` it is the ACL address saying who may
+      poll SNMP. Masking it hides config the operator owns (an over-broad SNMP ACL is
+      itself a finding) and would fire `redaction_suspects` on every healthy FASTPATH
+      box, turning a review signal into background noise.
+
+    * **A single-case alphabetic word, but only at/after `run_on_from`** — the offset
+      of the first token already on the line. Before that offset nothing has been
+      masked, so the original full-strength heuristic applies unchanged. At/after it
+      we are scanning the REMAINDER of a partly-handled line, where the run of text
+      is far more likely to be a grammar keyword the pattern left behind than a
+      secret: `set snmp community <TOK> authorization read-only` otherwise masks
+      Junos's `authorization` on every device that has an SNMP community.
+
+    The trade in both cases — a secret that is literally a dotted quad, or literally
+    12+ same-case letters with no digit sitting after another masked value — is
+    deliberate and narrow. The ~60 named patterns still claim such a value on every
+    grammar we support; this is the catch-all behind them, not the only guard.
+    """
+    at = start
+    while True:
+        tm = _SECRET_TAIL_RE.search(scan, at)
+        if tm is None:
+            return None
+        cand = tm.group(0)
+        if _IPV4_LITERAL_RE.fullmatch(cand):
+            at = tm.end()
+        elif tm.start() >= run_on_from and _PLAIN_WORD_RE.fullmatch(cand):
+            at = tm.end()
+        else:
+            return tm
+
+
+def _backstop_line(line: str) -> tuple[str, int]:
+    """Fail-closed sweep of ONE line: mask credential-shaped tails no pattern claimed.
+
+    ⚠️ This scans the UN-REDACTED REMAINDER of the line. It deliberately does NOT
+    skip lines that already carry a token, because a PARTIALLY-handled line is
+    exactly where a pattern gap hides — "this line looks handled" is the wrong shape
+    for a fail-closed check.
+
+    That is not hypothetical: it is how three FASTPATH SNMP communities shipped in
+    cleartext. `snmp-server community ipaddr <ip> <secret>` matched the Cisco-shaped
+    pattern, which masked the SUBCOMMAND KEYWORD as if it were the secret; the token
+    that produced then switched this backstop off for the very line whose real
+    community was still in the clear, and `suspects` stayed 0. The one mechanism
+    built to catch a pattern gap was disarmed by the partial match that created it.
+
+    Existing tokens are blanked to spaces of the SAME LENGTH, so offsets found in
+    `scan` index straight back into `line`, and a space matches none of the
+    credential-shape alternatives (so a token can never be re-masked as its own
+    suspect). Spans are replaced right-to-left, mirroring _redact_config's one-pass
+    architecture. Returns (line, masks_applied).
+    """
+    scan = _TOKEN_RE.sub(lambda m: " " * (m.end() - m.start()), line)
+    first_token = _TOKEN_RE.search(line)
+    run_on_from = first_token.start() if first_token else len(line)
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    while True:
+        km = _SECRET_KEYWORD_RE.search(scan, pos)
+        if km is None:
+            break
+        tm = _next_credential_tail(scan, km.end(), run_on_from)
+        if tm is None:
+            break
+        spans.append((tm.start(), tm.end()))
+        pos = tm.end()  # strictly increases -> terminates
+    for s, e in reversed(spans):
+        line = line[:s] + "<REDACTED:suspect>" + line[e:]
+    return line, len(spans)
 
 
 def _redact_config(text: str | None, key: bytes) -> tuple[str | None, int]:
@@ -220,7 +326,22 @@ def _redact_config(text: str | None, key: bytes) -> tuple[str | None, int]:
     Architecture (per the Fable adversarial review): collect the (?P<sec>) spans of
     ALL patterns against the SAME text, union overlaps, and replace in ONE right-to
     -left pass — so no pattern mutates text another relies on. Over-masking is safe;
-    leaking is not."""
+    leaking is not.
+
+    ⚠️ On FASTPATH (`ubiquiti_edgeswitch` / `netgear_prosafe`) the access mode and
+    the subcommand keyword sit WHERE CISCO PUTS THE SECRET, so the Cisco-shaped
+    pattern masks them too and a line yields TWO tokens:
+
+        snmp-server community rw <secret>      -> community <REDACTED:DEFAULT-rw> <REDACTED:hash>
+        snmp-server community mode <secret>    -> community <REDACTED:hash> <REDACTED:hash>
+
+    That extra token is deliberately KEPT, not cleaned up. `<REDACTED:DEFAULT-rw>` /
+    `-ro` is the only thing that reveals FASTPATH access mode at all, the dashboard
+    reads exactly that shape (`src/lib/rules/config-parse.ts`, platform-scoped, so it
+    is not mistaken for a weak community), and every historical snapshot carries it
+    forever. Narrowing it here would need a fleet rollout and would silently
+    invalidate that cloud-side parse. Interpretation belongs where interpretation
+    happens; this function's job is only that no secret leaves the LAN."""
     if not text:
         return text, 0
 
@@ -248,17 +369,13 @@ def _redact_config(text: str | None, key: bytes) -> tuple[str | None, int]:
         for s, e in reversed(merged):
             text = text[:s] + _token(text[s:e], key) + text[e:]
 
-    # 4. Fail-closed backstop over the result.
+    # 4. Fail-closed backstop over the UN-REDACTED remainder of EVERY line (a
+    #    partially-masked line is where a pattern gap hides — see _backstop_line).
     suspects = 0
     out: list[str] = []
     for line in text.split("\n"):
-        if "<REDACTED:" not in line:
-            km = _SECRET_KEYWORD_RE.search(line)
-            if km:
-                tm = _SECRET_TAIL_RE.search(line, km.end())
-                if tm:
-                    suspects += 1
-                    line = line[: tm.start()] + "<REDACTED:suspect>" + line[tm.end():]
+        line, n = _backstop_line(line)
+        suspects += n
         out.append(line)
     return "\n".join(out), suspects
 
