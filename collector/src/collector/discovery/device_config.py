@@ -191,11 +191,27 @@ _REDACT_PATTERNS = [
         # FASTPATH form above — and `_SECRET_KEYWORD_RE` knows neither `authentication `
         # nor `privacy `, so the backstop never saw these either and BOTH passwords
         # shipped in cleartext. Found while fixing the FASTPATH community leak; same
-        # class, independent gap. The lookahead keeps Cisco's
-        # `standby N authentication md5 key-string ...` from having its literal
-        # `key-string` keyword masked (that line's real secret has its own pattern).
-        r"(\bauthentication (?:md5|sha\d*) (?:encrypted )?(?:hex )?)(?P<sec>(?!key-string\b)(?:\"[^\"]*\"|\S+))",
-        r"(\bprivacy (?:(?:3?des|aes\d*) )?(?:encrypted )?(?:hex )?)(?P<sec>\"[^\"]*\"|\S+)",
+        # class, independent gap.
+        #
+        # ⚠️ ANCHORED TO THE EXOS COMMAND ON PURPOSE. `authentication ` and `privacy `
+        # are ordinary English AND ordinary Cisco/Aruba syntax; unanchored, every
+        # discriminator here is optional so `privacy ` degenerated to `privacy \S+` and
+        # masked the next word of any banner reading "...district privacy policy...",
+        # while `authentication (md5|sha) ` swallowed the literal keyword in Cisco's
+        # `standby N authentication md5 key-chain <name>`. Both silently corrupt config
+        # on cisco_ios/aruba_aoscx — the only two platforms in production. EXOS is the
+        # one platform that spells these out, so anchoring costs nothing and removes
+        # the whole class of cross-vendor collateral.
+        # The optional discriminators cover EXOS's display forms too: `show config`
+        # renders a stored key as `auth-encrypted localized-key <hex>` /
+        # `privacy-encrypted localized-key <hex>`. Without them the pattern masks the
+        # DISCRIMINATOR and the key itself ships in cleartext — the FASTPATH failure
+        # shape, reproduced inside the fix for it. ⚠️ These EXOS forms are written to
+        # the documented grammar and have NOT been checked against a real device
+        # capture (no EXOS device is enrolled yet); confirm against `show configuration`
+        # from real gear before trusting them.
+        r"^(\s*configure snmpv3 add user .*?\bauthentication (?:md5|sha\d*) (?:auth-encrypted |encrypted )?(?:localized-key |hex )?)(?P<sec>\"[^\"]*\"|\S+)",
+        r"^(\s*configure snmpv3 add user .*?\bprivacy (?:(?:3?des|aes\d*) )?(?:privacy-encrypted |encrypted )?(?:localized-key |hex )?)(?P<sec>\"[^\"]*\"|\S+)",
         r"(\bshared-secret (?:encrypted )?)(?P<sec>\"[^\"]*\"|\S+)",
         r"(\bsimple-password )(?P<sec>\"[^\"]*\"|[^\s;]+)",
         # -- Juniper Junos (set-form) --
@@ -224,9 +240,15 @@ _DOLLAR_RE = re.compile(r"(?P<sec>\$(?:9|1|2[aby]?|5|6|8|y|sha1|apr1)\$[^\s\"';]
 # Fail-closed backstop: a secret-family keyword followed by a credential-shaped tail
 # that NO pattern masked gets that tail masked + counted — so a silent pattern gap
 # becomes a visible signal instead of a leak.
+# ⚠️ THIS GATE IS ITSELF A PATTERN, AND A GAP HERE DISARMS THE BACKSTOP ENTIRELY —
+# the same failure mode as the "line already looks handled" guard, one level up. Both
+# EXOS SNMPv3 leaks were invisible for exactly this reason: the list carried
+# `authentication-key` and `auth-key` but not bare `authentication`, and `\bpriv\b`
+# does NOT match "privacy". Prefer a false keyword hit (the tail still has to look
+# credential-shaped) over a missing one.
 _SECRET_KEYWORD_RE = re.compile(
     r"(?i)\b(?:passwd|password|secret|passphrase|community|pre-shared|shared-secret|"
-    r"auth-key|authentication-key|priv|psk|wep|cak|key-string)\b"
+    r"auth-key|authentication-key|authentication|priv|privacy|psk|wep|cak|key-string)\b"
 )
 _SECRET_TAIL_RE = re.compile(r"\"[^\"]{6,}\"|\$\S+|[A-Za-z0-9+/=]{12,}|\S*\d\S{7,}")
 # Tokens this module has already inserted. The backstop blanks these out and scans
@@ -246,12 +268,18 @@ def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[s
     Two candidates are stepped over — SKIPPED AND CONTINUED past, never abandoning
     the line, so a real secret sitting further right is still caught:
 
-    * **A bare IPv4 literal.** A dotted quad trips `_SECRET_TAIL_RE`'s "random-ish
-      string containing a digit" alternative, but it is CONFIG — on FASTPATH's
-      `snmp-server community ipaddr <ip> <name>` it is the ACL address saying who may
-      poll SNMP. Masking it hides config the operator owns (an over-broad SNMP ACL is
-      itself a finding) and would fire `redaction_suspects` on every healthy FASTPATH
-      box, turning a review signal into background noise.
+    * **A bare IPv4 literal, but only at/after `run_on_from`** (see below for that
+      offset). A dotted quad trips `_SECRET_TAIL_RE`'s "random-ish string containing a
+      digit" alternative, but on FASTPATH's `snmp-server community ipaddr <ip> <name>`
+      it is CONFIG — the ACL address saying who may poll SNMP. Masking it hides config
+      the operator owns (an over-broad SNMP ACL is itself a finding) and would fire
+      `redaction_suspects` on every healthy FASTPATH box, turning a review signal into
+      background noise. ⚠️ The offset guard matters: on an UNTOKENED line the backstop
+      is the only guard there is, and skipping dotted quads there silently un-caught
+      `configure snmpv3 add community <ip> user ...` — a community literally set to an
+      IP address, which is a real lazy-admin habit and which the pre-fix code DID
+      catch. FASTPATH ipaddr/ipmask lines always carry a token by the time the
+      backstop runs, so their ACL address is still kept.
 
     * **A single-case alphabetic word, but only at/after `run_on_from`** — the offset
       of the first token already on the line. Before that offset nothing has been
@@ -272,10 +300,10 @@ def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[s
         if tm is None:
             return None
         cand = tm.group(0)
-        if _IPV4_LITERAL_RE.fullmatch(cand):
-            at = tm.end()
-        elif tm.start() >= run_on_from and _PLAIN_WORD_RE.fullmatch(cand):
-            at = tm.end()
+        if tm.start() >= run_on_from and (
+            _IPV4_LITERAL_RE.fullmatch(cand) or _PLAIN_WORD_RE.fullmatch(cand)
+        ):
+            at = tm.end()  # run-on argument text, not the grammar's secret slot
         else:
             return tm
 

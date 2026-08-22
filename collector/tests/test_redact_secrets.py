@@ -294,6 +294,63 @@ def test_exos_snmpv3_user_passwords_never_leave_the_lan(
         assert secret not in out, f"EXOS SNMPv3 password leaked: {out}"
 
 
+def test_exos_snmpv3_localized_key_display_form_is_masked() -> None:
+    # ⚠️ The FASTPATH failure shape, reproduced INSIDE the fix for it. EXOS renders a
+    # stored key as `auth-encrypted localized-key <hex>`; without the discriminator in
+    # the pattern, `auth-encrypted` gets masked as though it were the secret and the
+    # actual key ships in cleartext on a line that now LOOKS handled — and the backstop
+    # missed it too, because the keyword gate knew neither `authentication` nor
+    # `privacy`. Both holes are closed; this pins them.
+    line = (
+        'configure snmpv3 add user "netmon" authentication md5 auth-encrypted'
+        " localized-key 22:e6:9a:1b:cd:ef:01:23 privacy privacy-encrypted"
+        " localized-key 4e:5f:6a:7b:8c:9d:ae:bf"
+    )
+    out, _ = _redact(line)
+    for key in ("22:e6:9a:1b:cd:ef:01:23", "4e:5f:6a:7b:8c:9d:ae:bf"):
+        assert key not in out, f"EXOS localized key leaked: {out}"
+
+
+def test_community_set_to_an_ip_address_is_still_caught() -> None:
+    # ⚠️ Regression guard on the backstop's IPv4 skip. A community literally set to an
+    # IP is a real lazy-admin habit. The skip must apply ONLY in run-on territory
+    # (after an existing token) — on an UNTOKENED line the backstop is the only guard
+    # there is, and skipping dotted quads there silently un-caught this.
+    out, suspects = _redact("configure snmpv3 add community 10.48.52.128 user netmon")
+    assert "10.48.52.128" not in out, f"IP-as-community leaked: {out}"
+    assert suspects == 1
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # `privacy ` and `authentication ` are ordinary English and ordinary Cisco
+        # syntax. Unanchored, the EXOS patterns masked the next word of any banner
+        # saying "...district privacy policy..." — silent config corruption on the two
+        # platforms actually in production.
+        "This system is monitored under the district privacy policy and AUP.",
+        " banner motd ^C Student privacy notice applies ^C",
+        "aaa authentication login default group tacacs+ local",
+        "ppp authentication chap pap callin",
+        "ip ospf authentication message-digest",
+    ],
+)
+def test_exos_patterns_do_not_reach_into_prose_or_other_vendors(line: str) -> None:
+    out, suspects = _redact(line)
+    assert out == line, f"EXOS pattern over-reached: {out}"
+    assert suspects == 0
+
+
+def test_cisco_standby_key_chain_keyword_is_not_masked_as_a_secret() -> None:
+    # Sibling of the key-string guard: `key-chain` is the OTHER Cisco form, and real
+    # HSRP/VRRP/GLBP syntax. Anchoring the EXOS patterns to `configure snmpv3 add user`
+    # is what keeps both safe — a lookahead list would have needed every future spelling.
+    line = "standby 10 authentication md5 key-chain HSRP-KEYS"
+    out, suspects = _redact(line)
+    assert out == line, f"a Cisco grammar keyword was masked: {out}"
+    assert suspects == 0
+
+
 def test_cisco_standby_key_string_keyword_is_not_masked_as_a_secret() -> None:
     # ⚠️ Guards the EXOS `authentication (md5|sha)` pattern against over-reaching onto
     # Cisco. `standby N authentication md5 key-string <secret>` puts the literal keyword
@@ -304,6 +361,38 @@ def test_cisco_standby_key_string_keyword_is_not_masked_as_a_secret() -> None:
     out, _ = _redact(line)
     assert "key-string" in out, f"a Cisco grammar keyword was masked: {out}"
     assert "060506324F41" not in out, "the actual standby key must still be masked"
+
+
+@pytest.mark.parametrize(
+    "line, identifier",
+    [
+        ("snmp-server community S3cretC0mm view ReadOnlyViewAll ro", "ReadOnlyViewAll"),
+        ("snmp-server community S3cretC0mm RO SNMPMGMT2024", "SNMPMGMT2024"),
+    ],
+)
+def test_known_over_mask_of_mixed_case_trailing_identifiers(line: str, identifier: str) -> None:
+    """⚠️ PINS A DELIBERATE TRADE-OFF, not desired behaviour.
+
+    A MIXED-CASE trailing identifier (a Cisco SNMP view name, an ACL name) is
+    indistinguishable in shape from a community, so the run-on scan masks it as a
+    suspect. The single-case guard does not catch these, and broadening it to
+    "identifier-shaped" would also skip real communities — re-opening the very leak
+    class this module was fixed for.
+
+    Shipped as-is on evidence, not assumption: a count-only probe over all 9,650 lines
+    of the 33 stored production snapshots found ZERO instances of these shapes
+    (`view <12+ chars>`, `R[OW] <12+ chars>`, `Unrestricted`), against a positive
+    control of 32 real `snmp-server community` lines. And the failure is LOUD, not
+    silent — it lands in `redaction_suspects`, so the first real occurrence is visible
+    and can be fixed with a real capture rather than a guess.
+
+    If this test starts failing, someone deliberately changed that trade. Re-run the
+    prod probe before deciding which way is right.
+    """
+    out, suspects = _redact(line)
+    assert identifier not in out, "behaviour changed — see the docstring before editing"
+    assert suspects == 1, "the over-mask must stay VISIBLE as a suspect, never silent"
+    assert "S3cretC0mm" not in out, "the actual community must still be masked"
 
 
 def test_backstop_keeps_a_grammar_keyword_after_a_masked_value() -> None:
