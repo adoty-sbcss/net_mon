@@ -428,12 +428,21 @@ def _snmp_candidates(
     discovered ARP/nmap host is added too, so printers / PCs / IoT get
     classified via SNMP (Printer-MIB, Host-Resources). Per-device community
     caching + 24h backoff keep the repeat cost down after the first scan.
+
+    Excluded IPs (NETMON_SNMP_EXCLUDE) are dropped here, at the source. This
+    used to be honoured by the topology crawl ALONE, which made the dashboard's
+    own promise false — "the sensors will stop SNMP-polling them" — and, worse,
+    cost coverage: an excluded device still occupied a slot against
+    snmp_poll_max_candidates and still burned budget failing to answer, so
+    excluding noise made the poll reach FEWER real devices, not more. Measured
+    at Roy C Hill 2026-08-24: 73 excluded IPs against a 64-candidate cap.
     """
+    exclude = set(get_settings().snmp_exclude_list)
     ips: list[str] = []
     seen: set[str] = set()
 
     def add(ip: str | None) -> None:
-        if ip and ip not in seen:
+        if ip and ip not in seen and ip not in exclude:
             seen.add(ip)
             ips.append(ip)
 

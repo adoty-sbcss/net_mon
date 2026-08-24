@@ -274,6 +274,7 @@ def test_snmp_candidate_order_puts_registered_infra_before_oui_guesses(monkeypat
             # A per-device credential override is the OTHER form of "an operator
             # said to poll this", and the dashboard promises it is tried FIRST.
             snmp_credential_override_map={"10.0.0.8": "secret"},
+            snmp_exclude_list=(),
         ),
     )
     ips = scan._snmp_candidates(
@@ -305,10 +306,76 @@ def test_snmp_candidates_dedupe_keeps_the_earliest_position(monkeypatch) -> None
         scan,
         "get_settings",
         lambda: SimpleNamespace(
-            snmp_extra_target_list=("10.0.0.2",), snmp_credential_override_map={"10.0.0.1": "s"}
+            snmp_extra_target_list=("10.0.0.2",), snmp_credential_override_map={"10.0.0.1": "s"},
+            snmp_exclude_list=(),
         ),
     )
     ips = scan._snmp_candidates(
         "10.0.0.1", [{"mgmt_ip": "10.0.0.2"}], [], [],
     )
     assert ips == ["10.0.0.1", "10.0.0.2"]
+
+
+def test_snmp_candidates_drops_excluded_ips_from_every_block(monkeypatch) -> None:
+    """An excluded IP must not reach the poll from ANY source.
+
+    Exclusion used to be honoured by the topology crawl alone, so the dashboard's
+    "the sensors will stop SNMP-polling them" was false, and — the part that cost
+    real coverage — an excluded device still consumed one of the
+    snmp_poll_max_candidates slots and still burned budget failing to answer.
+
+    Every block is exercised, including the two OPERATOR-ASSERTED ones: a later
+    "stop polling this" has to beat an earlier "always poll this", or unexcluding
+    would be the only way to undo a registry entry.
+    """
+    monkeypatch.setattr(
+        scan,
+        "get_settings",
+        lambda: SimpleNamespace(
+            snmp_extra_target_list=("10.0.0.9",),
+            snmp_credential_override_map={"10.0.0.8": "secret"},
+            snmp_exclude_list=(
+                "10.0.0.1",   # gateway
+                "10.0.0.2",   # LLDP-announced
+                "10.0.0.9",   # registered target
+                "10.0.0.8",   # credential override
+                "10.0.0.50",  # OUI-guessed (arp)
+            ),
+        ),
+    )
+    ips = scan._snmp_candidates(
+        "10.0.0.1",
+        [{"mgmt_ip": "10.0.0.2"}],
+        [{"ip": "10.0.0.50", "vendor": "Aruba Networks"}],
+        [{"ip": "10.0.0.51", "vendor": "Cisco Systems"}],
+    )
+
+    # POSITIVE CONTROL FIRST: the one un-excluded device must survive. Without it
+    # this test passes just as well against a change that returns [] always,
+    # which would take the whole SNMP poll down while looking like a clean pass.
+    assert ips == ["10.0.0.51"]
+
+
+def test_snmp_candidates_exclusion_does_not_reorder_the_survivors(monkeypatch) -> None:
+    """Removing an excluded device must CLOSE the gap, not shuffle the rest.
+
+    Order is coverage here (the poll walks the list and stops), so an exclusion
+    that reordered survivors would silently change which devices get reached —
+    the same class of bug the exclusion is meant to fix.
+    """
+    monkeypatch.setattr(
+        scan,
+        "get_settings",
+        lambda: SimpleNamespace(
+            snmp_extra_target_list=("10.0.0.9",),
+            snmp_credential_override_map={},
+            snmp_exclude_list=("10.0.0.2",),  # the LLDP block, i.e. the MIDDLE
+        ),
+    )
+    ips = scan._snmp_candidates(
+        "10.0.0.1",
+        [{"mgmt_ip": "10.0.0.2"}],
+        [{"ip": "10.0.0.50", "vendor": "Aruba Networks"}],
+        [],
+    )
+    assert ips == ["10.0.0.1", "10.0.0.9", "10.0.0.50"]
