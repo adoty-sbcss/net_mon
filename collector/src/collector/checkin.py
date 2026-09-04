@@ -116,18 +116,44 @@ def _post(url: str, token: str | None, body: dict) -> dict | None:
 # burns bandwidth) every cycle during an outage. Spooling decouples "did we
 # measure" from "did the dashboard receive it."
 RESULT_SPOOL_DIR = Path("/var/lib/netmon/result-spool")
-RESULT_SPOOL_MAX = 500  # cap files so a long outage can't fill the disk
-RESULT_SPOOL_DRAIN_PER_RUN = 50  # bound redelivery work per check-in
+RESULT_SPOOL_MAX = 500  # cap FILES so a long outage can't fill the disk
+RESULT_SPOOL_DRAIN_PER_RUN = 50  # bound redelivery files per check-in
+RESULT_SPOOL_DRAIN_PAYLOADS = 200  # …and payloads: one file can now hold several
 _result_spool_seq = 0
 
+# A spool FILE holds one endpoint and one-or-more payloads. Single-payload files
+# keep the original {"endpoint", "payload"} shape (so a rollback to an older
+# collector can still drain them); a batch writes {"endpoint", "payloads": [...]}.
+# The drain reads both. Batching matters for the outage case: the cap is on files,
+# and one check-in cycle's latency probe is ~4 results. Spooled one-per-file at
+# ~16 cycles/hour the 500-file cap filled in ~7h and then dropped the OLDEST —
+# i.e. a multi-day outage kept the tail and lost the ONSET, which is the part
+# anyone investigating actually needs. One file per cycle stretches that to ~31h.
+# (Beyond that, a downsampled outage-summary record would need a new dashboard
+# endpoint — deliberately not built here.)
 
-def _spool_result(endpoint: str, payload: dict) -> None:
-    """Persist a result payload that failed to POST, for later redelivery.
+
+def _write_spool_file(path: Path, endpoint: str, payloads: list[dict]) -> None:
+    """Write a spool file atomically — a partial write is never drained."""
+    doc: dict = (
+        {"endpoint": endpoint, "payload": payloads[0]}
+        if len(payloads) == 1
+        else {"endpoint": endpoint, "payloads": payloads}
+    )
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(doc))
+    tmp.replace(path)
+
+
+def _spool_results(endpoint: str, payloads: list[dict]) -> None:
+    """Persist result payloads that could not be POSTed, for later redelivery.
     Filenames sort oldest-first: a zero-padded ns timestamp orders across process
     restarts, an in-run counter breaks ties (clocks can be coarse)."""
     import time
 
     global _result_spool_seq
+    if not payloads:
+        return
     try:
         RESULT_SPOOL_DIR.mkdir(parents=True, exist_ok=True)
         existing = sorted(RESULT_SPOOL_DIR.glob("*.json"))
@@ -136,11 +162,16 @@ def _spool_result(endpoint: str, payload: dict) -> None:
             stale.unlink(missing_ok=True)
         _result_spool_seq += 1
         name = f"{time.time_ns():020d}-{_result_spool_seq:09d}.json"
-        tmp = RESULT_SPOOL_DIR / f".{name}.tmp"
-        tmp.write_text(json.dumps({"endpoint": endpoint, "payload": payload}))
-        tmp.replace(RESULT_SPOOL_DIR / name)  # atomic — a partial write is never drained
+        _write_spool_file(RESULT_SPOOL_DIR / name, endpoint, payloads)
     except Exception as exc:  # noqa: BLE001 — spooling is best-effort
-        log.warning("could not spool result", endpoint=endpoint, error=str(exc))
+        log.warning(
+            "could not spool result", endpoint=endpoint, count=len(payloads), error=str(exc)
+        )
+
+
+def _spool_result(endpoint: str, payload: dict) -> None:
+    """Spool a single result payload (see _spool_results)."""
+    _spool_results(endpoint, [payload])
 
 
 def _post_result(url: str, token: str | None, endpoint: str, payload: dict) -> bool:
@@ -159,15 +190,28 @@ def _drain_result_spool(url: str, token: str | None) -> None:
         pending = sorted(RESULT_SPOOL_DIR.glob("*.json"))
     except Exception:  # noqa: BLE001
         return
+    budget = RESULT_SPOOL_DRAIN_PAYLOADS
     for spooled in pending[:RESULT_SPOOL_DRAIN_PER_RUN]:
         try:
             doc = json.loads(spooled.read_text())
-            endpoint, payload = doc["endpoint"], doc["payload"]
+            endpoint = doc["endpoint"]
+            raw = doc.get("payloads")
+            payloads = list(raw) if isinstance(raw, list) else [doc["payload"]]
         except Exception:  # noqa: BLE001 — corrupt/partial file: drop it
             spooled.unlink(missing_ok=True)
             continue
-        if _post(f"{url}{endpoint}", token, payload) is None:
-            return  # still unreachable; keep this and the rest for next time
+        for sent, payload in enumerate(payloads):
+            # Out of budget, or still unreachable: rewrite the file with only the
+            # payloads we did NOT deliver, so a retry can't duplicate rows. The
+            # filename is reused, so its place in the oldest-first order is kept.
+            if budget <= 0 or _post(f"{url}{endpoint}", token, payload) is None:
+                if sent:
+                    try:
+                        _write_spool_file(spooled, endpoint, payloads[sent:])
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("could not rewrite spool remainder", error=str(exc))
+                return
+            budget -= 1
         spooled.unlink(missing_ok=True)
 
 
@@ -1497,28 +1541,45 @@ def _maybe_scheduled_speedtest(url: str, token: str | None, settings) -> None:
         log.warning("could not persist speedtest last-run", error=str(exc))
 
 
-def _report_latency(url: str, token: str | None, results: list[dict], trigger: str) -> None:
-    """POST each latency probe result to the dashboard (best-effort)."""
+def _report_latency(
+    url: str,
+    token: str | None,
+    results: list[dict],
+    trigger: str,
+    *,
+    spool_only: bool = False,
+) -> None:
+    """POST each latency probe result to the dashboard (best-effort).
+
+    spool_only: the dashboard is already known-unreachable this cycle (the
+    check-in POST itself just failed), so don't attempt delivery at all — each
+    attempt would burn the full urllib timeout against an endpoint we know is
+    down, 4× per cycle. Write the whole cycle to the spool as ONE file instead and
+    let a later check-in drain it. `startedAt` is stamped at measurement time, so
+    however late the rows arrive they land in the right time bucket.
+    """
     from datetime import UTC, datetime
 
     ts = datetime.now(UTC).isoformat()
-    for r in results:
-        _post_result(
-            url,
-            token,
-            "/api/sensor/latency-result",
-            {
-                "trigger": trigger,
-                "label": r.get("label"),
-                "target": r.get("host"),
-                "latencyMs": r.get("latency_ms"),
-                "jitterMs": r.get("jitter_ms"),
-                "lossPct": r.get("loss_pct"),
-                "ok": r.get("ok", False),
-                "error": r.get("error"),
-                "startedAt": ts,
-            },
-        )
+    payloads = [
+        {
+            "trigger": trigger,
+            "label": r.get("label"),
+            "target": r.get("host"),
+            "latencyMs": r.get("latency_ms"),
+            "jitterMs": r.get("jitter_ms"),
+            "lossPct": r.get("loss_pct"),
+            "ok": r.get("ok", False),
+            "error": r.get("error"),
+            "startedAt": ts,
+        }
+        for r in results
+    ]
+    if spool_only:
+        _spool_results("/api/sensor/latency-result", payloads)
+        return
+    for payload in payloads:
+        _post_result(url, token, "/api/sensor/latency-result", payload)
 
 
 def _write_webperf_urls(urls: list) -> None:
@@ -1609,8 +1670,17 @@ def _dns_resolver() -> str | None:
     return None
 
 
-def _maybe_latency(url: str, token: str | None, settings) -> None:
-    """Probe latency/jitter/loss to internet + gateway + DNS each check-in (cheap)."""
+def _maybe_latency(url: str, token: str | None, settings, *, offline: bool = False) -> None:
+    """Probe latency/jitter/loss to internet + gateway + DNS each check-in (cheap).
+
+    offline: this cycle's check-in already failed, so the dashboard is unreachable.
+    The probe still RUNS — that is exactly the sample worth having — but its results
+    go straight to the spool rather than through a POST that would only time out.
+    The trigger stays "scheduled": the dashboard's latency-result route maps
+    anything that isn't "manual" to "scheduled", so a new value would be silently
+    coerced anyway. `ok=false` + `lossPct=100` on the internet targets while the
+    gateway target still answers is what distinguishes a WAN outage from a dead box.
+    """
     if not settings.latency_enabled:
         return
     from . import latency as latency_mod
@@ -1633,7 +1703,7 @@ def _maybe_latency(url: str, token: str | None, settings) -> None:
     except Exception as exc:  # noqa: BLE001
         log.warning("latency probe failed", error=str(exc))
         return
-    _report_latency(url, token, results, "scheduled")
+    _report_latency(url, token, results, "scheduled", spool_only=offline)
 
 
 def _current_sha() -> str | None:
@@ -1808,6 +1878,14 @@ def run_checkin() -> int:
     # the box can auto-re-pair instead of 401ing silently forever.
     _note_checkin_auth(settings, http_status)
     if resp is None:
+        # The check-in failed — a WAN outage, a dead uplink, or a dashboard that is
+        # down. That is PRECISELY when a latency sample is worth having, and until
+        # now we took none: _maybe_latency lived below this early return, so a hard
+        # outage reached the database as a GAP in the timestamps (which reads as "the
+        # sensor was off") instead of rows showing 100% loss. Probe anyway and spool
+        # the result for delivery on recovery. Bounded: `ping -w` deadlines each
+        # target, and it only runs when latency probing is enabled.
+        _maybe_latency(url, token, settings, offline=True)
         return 1
 
     config_changed = False
