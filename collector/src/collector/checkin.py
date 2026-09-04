@@ -26,6 +26,7 @@ HTTP uses the stdlib only — no new dependency.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -238,8 +239,46 @@ def _write_applied_version(v: int) -> None:
     _write_file_atomic(APPLIED_VERSION_FILE, str(v), 0o644)
 
 
+# U+0085 NEL, U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR: the three
+# str.splitlines() separators outside the C0 range. Written as codepoints so the
+# source file itself stays pure ASCII -- embedding them raw makes this very line
+# invisible to line-oriented tooling (it splits here), which is how they hide.
+_EXTRA_BREAK_CODES = frozenset({0x85, 0x2028, 0x2029})
+
+
+def _reject_control_chars(label: str, value: str) -> None:
+    """Reject any character that could end a line in this file's readers.
+
+    Blocklisting "\\n\\r\\x00" is NOT enough, and the gap is exploitable in two
+    pushes. `_update_env_file` re-reads the file with `str.splitlines()`, which
+    splits on TEN separators — \\x0b \\x0c \\x1c \\x1d \\x1e \\x85 \\u2028 \\u2029 as
+    well as \\n \\r. compose's own parser splits on \\n only, so push #1 writes
+    `KEY=public\\x0bPOSTGRES_PASSWORD=owned` inertly; on push #2 (any key at all)
+    our own reader splits that line and re-joins with "\\n", promoting the tail to a
+    real env line. So screen by CATEGORY, not by a list: every C0 control, DEL, and
+    the three non-ASCII breaks. That is a superset of splitlines()' separators —
+    test_config_env_injection derives Python's list at runtime and asserts so, which
+    keeps this from drifting if CPython ever adds one.
+    """
+    for ch in value:
+        code = ord(ch)
+        if code < 0x20 or code == 0x7F or code in _EXTRA_BREAK_CODES:
+            raise ValueError(
+                f"{label} must not contain the control character U+{code:04X}"
+            )
+
+
 def _update_env_file(path: Path, mapping: dict[str, str]) -> None:
     """Idempotently set KEY=VALUE lines in an env file, preserving the rest."""
+    # Defense in depth. Every value is emitted as one `KEY=VALUE` line, so a value
+    # carrying a line break appends attacker-chosen KEY=VALUE lines of its own.
+    # netmon.env is the `env_file:` for BOTH the collector and the postgres service,
+    # so an injected line can set any NETMON_* or POSTGRES_* variable. Callers
+    # validate their inputs (_validate_desired_config hard-rejects these); this
+    # refuses even if a future caller forgets, and refuses BEFORE reading the file
+    # so a rejected mapping writes nothing at all.
+    for key, value in mapping.items():
+        _reject_control_chars(f"refusing to write {key}: value", value)
     lines = path.read_text().splitlines() if path.exists() else []
     seen: set[str] = set()
     out: list[str] = []
@@ -302,11 +341,129 @@ _CONFIG_INT_BOUNDS: dict[str, tuple[int, int]] = {
 }
 
 
+# Every dashboard-pushed key whose value _apply_config copies into netmon.env
+# VERBATIM (`str(data.get(...))`). Keys normalized to a fixed set (update_channel,
+# bundle_transport, snmp_topology_scope, wifi_join_auth, speedtest_providers),
+# stripped to a character class (trunk_vlans, wifi_join_quiet), coerced to a bool,
+# or bounded as an int are already safe by construction and are NOT listed here.
+# Keep this in sync with _apply_config: a new pushed string belongs in this tuple.
+_CONFIG_STR_KEYS: tuple[str, ...] = (
+    "snmp_communities",
+    "snmp_credential_overrides",
+    "snmp_targets",
+    "snmp_exclude",
+    "update_ref",
+    "iperf_server",
+    "iperf_direction",
+    "iperf_protocol",
+    "iperf_timezone",
+    "latency_targets",
+    "trunk_parent",
+    "trunk_statics",
+    "wifi_district_ssids",
+    "wifi_join_iface",
+    "wifi_join_ssid",
+    "wifi_join_identity",
+    "wifi_join_secret",
+)
+
+# Host/ref-shaped scalars that reach a subprocess argv. The live hazard is a BARE
+# OPERAND: `ping ... <host>` (latency.py) puts the host last, and GNU getopt
+# permutes, so a value beginning with "-" is parsed as an OPTION instead — a
+# latency target of "-f" turns the collector's root `ping` into a flood ping. The
+# keys below are option ARGUMENTS (`iperf3 -c <server>`, `git rev-parse <ref>`,
+# nmcli/netplan in the host scripts), where a leading dash is consumed as the
+# option's value and is not exploitable today; they are held to the same rule so
+# that stays true if an argv is ever reordered. Whitespace is rejected too (it
+# would split one operand into several). Not the full host grammar — these
+# legitimately hold hostnames, IPs, interface names, and git refs alike.
+_CONFIG_HOST_KEYS = frozenset(
+    {"iperf_server", "trunk_parent", "wifi_join_iface", "update_ref"}
+)
+
+# Comma-separated host lists: every token must be a literal IPv4 or hostname, and
+# the list is capped so one push can't turn the box into a fan-out probe source.
+_CONFIG_HOST_LIST_CAPS: dict[str, int] = {"latency_targets": 8}
+
+# RFC-1123 hostname: dot-separated labels of letters/digits/hyphens, no leading or
+# trailing hyphen in a label, each label <= 63 chars.
+_HOSTNAME_RE = re.compile(
+    r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*\.?"
+)
+
+
+def _is_host_token(token: str) -> bool:
+    """True if `token` is a literal IP address (v4 or v6) or an RFC-1123 hostname."""
+    if len(token) > 253:
+        return False
+    try:
+        # stdlib rather than a hand-rolled regex: it accepts IPv6 (ping -n handles
+        # it, so screening it out would silently drop a v6 latency target on the
+        # next push) and correctly rejects near-misses like "999.1.1.1" and the
+        # ambiguous leading-zero "010.1.1.1".
+        ipaddress.ip_address(token)
+        return True
+    except ValueError:
+        pass
+    if not _HOSTNAME_RE.fullmatch(token):
+        return False
+    # RFC 1123 2.1: the top label must not be all-numeric, so a near-miss address
+    # like "999.1.1.1" (every label is a legal hostname label) is rejected as the
+    # malformed IP it is rather than accepted as a name that can never resolve.
+    labels = [label for label in token.rstrip(".").split(".") if label]
+    return not labels[-1].isdigit()
+
+
+def _checked_config_str(data: dict, key: str) -> str:
+    """Validate one dashboard-pushed STRING before it can reach netmon.env.
+
+    netmon.env is written one `KEY=VALUE` line per entry AND is the `env_file:` for
+    both the collector and the postgres service, so a value carrying a newline
+    injects arbitrary NETMON_*/POSTGRES_* settings into both. Hard-reject instead of
+    silently rewriting, so the whole generation is refused and the failure is audited
+    (`dashboard_config_apply_failed`) rather than half-applied — same contract as the
+    integer bounds.
+    """
+    value = data.get(key)
+    text = "" if value is None else str(value)
+    _reject_control_chars(key, text)
+    # Availability, not injection: compose treats a value that BEGINS with a quote as
+    # a quoted value that may span lines, and an unterminated one is a hard parse
+    # error. A pushed value of `"` would therefore fail `docker compose up` for every
+    # service reading netmon.env -- including the recreate inside scripts/rollback.sh,
+    # so the auto-rollback safety net dies with it. That is a one-character remote
+    # brick of a field box with no SSH, so refuse the push (loud, audited, retried)
+    # rather than write a value that cannot be read back.
+    if text[:1] in ('"', "'"):
+        raise ValueError(f"{key} must not begin with a quote")
+    if key in _CONFIG_HOST_KEYS and text:
+        if text.startswith("-"):
+            raise ValueError(f"{key} must not begin with '-'")
+        if any(c.isspace() for c in text):
+            raise ValueError(f"{key} must not contain whitespace")
+    cap = _CONFIG_HOST_LIST_CAPS.get(key)
+    if cap is not None and text.strip():
+        tokens = [t.strip() for t in text.split(",")]
+        if len(tokens) > cap:
+            raise ValueError(f"{key} must list at most {cap} hosts")
+        for token in tokens:
+            if not token:
+                raise ValueError(f"{key} must not contain an empty host")
+            if token.startswith("-"):
+                raise ValueError(f"{key} host {token!r} must not begin with '-'")
+            if not _is_host_token(token):
+                raise ValueError(f"{key} host {token!r} is not an IPv4 address or hostname")
+    return text
+
+
 def _validate_desired_config(data: dict) -> None:
-    """Validate the whole numeric generation before any side file is written."""
+    """Validate the whole generation — ints and strings — before any file is written."""
     for key, (minimum, maximum) in _CONFIG_INT_BOUNDS.items():
         if key in data and data.get(key) is not None:
             _bounded_config_int(data, key, minimum=minimum, maximum=maximum)
+    for key in _CONFIG_STR_KEYS:
+        if key in data:
+            _checked_config_str(data, key)
     if "rescan_interval" in data and data.get("rescan_interval") is not None:
         requested = _bounded_config_int(
             data, "rescan_interval", minimum=60, maximum=604800
@@ -729,6 +886,13 @@ def _run_diag(command: str) -> tuple[str, dict]:
         return "failed", {"command": command, "error": str(exc)}
 
 
+# A console session id must be usable as a single record field, a socket FILENAME,
+# and a systemd unit-name suffix. This charset covers every id shape the dashboard
+# plausibly mints (UUID, hex, base64url/nanoid) while excluding the separators that
+# make injection possible; 128 matches netmon-host-console.py's own cap.
+_CONSOLE_SID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+
 def _spawn_console_session(args: dict) -> tuple[str, dict]:
     """Kick off a DETACHED remote-console session process.
 
@@ -752,6 +916,31 @@ def _spawn_console_session(args: dict) -> tuple[str, dict]:
     mode = "full" if str(args.get("mode") or "") == "full" else "restricted"
     if not broker or not token or not sid:
         return "failed", {"error": "missing broker/token/sid"}
+    # Validate BEFORE the request-file append below, which is the dangerous sink:
+    # full-shell mode writes "<sid>\t<nonce>\n" for netmon-console-poll.sh to drain,
+    # and that host poll turns EACH line into a root `systemd-run` PTY server. A sid
+    # carrying a tab or newline therefore injects extra records — arming host-root
+    # shells whose nonce the pusher CHOSE, instead of the secrets.token_hex(16) this
+    # box generates and never discloses. netmon-host-console.py screens its own --sid
+    # ("/", "..", length) but only sees an already-split line, so the split has to be
+    # made impossible here. Fail closed: a bad sid is refused, never sanitized into a
+    # different session's id. This tightens the containment model; it does not touch
+    # the fixed-argv _DIAG_COMMANDS path.
+    if not _CONSOLE_SID_RE.fullmatch(sid) or ".." in sid:
+        return "failed", {"error": "invalid sid"}
+    # `broker` is interpolated into the dial URL (remote_console builds
+    # "<broker>?role=sensor&token=..&sid=..") and passed on the session argv. Pin the
+    # websocket scheme create_connection would require anyway, and reject anything
+    # that could add a line, an argv word, or an extra query parameter.
+    if (
+        not broker.startswith(("wss://", "ws://"))
+        or any(c.isspace() or c in "\x00#" for c in broker)
+    ):
+        return "failed", {"error": "invalid broker"}
+    # The token never rides argv (env only), but it IS interpolated into that same
+    # query string, where a '&' or '#' would forge/truncate the following parameters.
+    if any(c.isspace() or c in "\x00&#" for c in token):
+        return "failed", {"error": "invalid token"}
     try:
         env = dict(os.environ)
         env["NETMON_CONSOLE_TOKEN"] = token

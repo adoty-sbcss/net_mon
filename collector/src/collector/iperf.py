@@ -25,6 +25,17 @@ def run_iperf(
     """Run one iperf3 test. Returns a result dict (ok / throughput_mbps / …)."""
     if not server:
         return {"ok": False, "error": "no iperf server configured"}
+    # `server` is the ARGUMENT of `-c` below, so a leading dash is consumed as that
+    # argument rather than parsed as a new option — not exploitable as written. This
+    # guard keeps it that way if the argv is ever reordered to put the host last (the
+    # shape that IS exploitable: see latency.py, where `ping ... <host>` is a bare
+    # operand and getopt permutation makes "-f" a root flood ping). Guard here rather
+    # than only at the callers because BOTH reach this: the pushed
+    # NETMON_IPERF_SERVER (validated in checkin._checked_config_str) and the check-in
+    # command queue's `args.server`, which has no other validation at all.
+    # Note this is option injection, never shell injection — subprocess gets a list.
+    if server.startswith("-") or any(c.isspace() for c in server):
+        return {"ok": False, "error": "invalid iperf server"}
     proto = "udp" if protocol == "udp" else "tcp"
     dur = max(1, min(int(duration or 10), 60))
     cmd = ["iperf3", "-c", server, "-p", str(int(port or 5201)), "-t", str(dur), "-J"]
