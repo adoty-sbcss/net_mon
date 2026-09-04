@@ -89,10 +89,11 @@ def test_corrupt_spool_file_is_dropped(monkeypatch, tmp_path):
 
 
 # --- batching: the cap is on FILES, so a cycle must not cost four of them -----
-# One check-in cycle's latency probe is ~4 results. Spooled one-per-file at ~16
-# cycles/hour, the 500-file cap filled in ~7h and then evicted the OLDEST — so a
-# multi-day outage kept its tail and lost its ONSET, the part an investigator
-# actually needs. A batched cycle is one file.
+# One check-in cycle's latency probe is ~4 results. Spooled one-per-file at ~20
+# cycles/hour, the old 500-file cap filled in ~7h and then evicted the OLDEST — so
+# a multi-day outage kept its tail and lost its ONSET, the part an investigator
+# actually needs. A batched cycle is one file; with RESULT_SPOOL_MAX raised to
+# 3000 that carries ~6 days, enough to hold the onset of the 8-day incident.
 
 
 def test_a_batch_is_one_file_and_drains_in_order(monkeypatch, tmp_path):

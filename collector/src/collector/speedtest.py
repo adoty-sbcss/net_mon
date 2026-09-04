@@ -86,10 +86,11 @@ def run_cloudflare(duration: int = 5, streams: int = 16, timeout: int = 60) -> d
 
     # Each transfer worker returns (bytes_moved, first_exception_or_None). The
     # exception is CAPTURED, not swallowed: a stream that moved nothing because it
-    # was reset/timed out is evidence of a blocked path, and without it a firewall
-    # that passes the tiny latency GETs but chokes every bulk stream is recorded as
-    # a perfectly successful 0.0 Mbps measurement. (Cucamonga, 2026-08/09: 47% of
-    # speed tests stored 0.0 Mbps with ok=true and nothing ever flagged it.)
+    # was reset/timed out is evidence of a blocked path, and the exception CLASS is
+    # the most useful thing in the row. (Cucamonga, 2026-08/09: 47% of speed tests
+    # stored 0.0 Mbps with ok=true and nothing ever flagged it.)
+    # Note the exception is diagnostic, NOT the failure trigger — zero bytes is.
+    # Setup can outlast the window without ever raising; see the `blocked` rules.
     def _download(deadline: float) -> tuple[int, str | None]:
         n = 0
         # Cloudflare 403s very large single /__down requests (100MB is rejected;
@@ -147,23 +148,37 @@ def run_cloudflare(duration: int = 5, streams: int = 16, timeout: int = 60) -> d
     except Exception as exc:  # noqa: BLE001
         return _empty("cloudflare", f"throughput probe failed: {exc}")
 
-    # A direction is BLOCKED — not merely slow — when it moved zero bytes AND at
-    # least one stream raised. Two cases are deliberately NOT failures:
-    #   * zero bytes with no exception   → the edge served nothing but nothing broke;
-    #                                      a genuine (if odd) zero-throughput reading.
-    #   * some streams raised, some moved bytes → a real, if degraded, measurement.
-    #     Reporting it as a failure would erase the only number we have during a
-    #     brown-out. The per-direction stream-error counts go into `raw` instead, so
-    #     the degradation is visible without the row being dropped from baselines.
+    # A direction that moved ZERO bytes MEASURED NOTHING. It is a failed test, not
+    # a 0.0 Mbps reading, and reporting it as a success is the whole Cucamonga bug.
+    # TWO different mechanisms produce a zero, and both were reachable there:
+    #   * one or more streams RAISED (reset / timed out) → the path is actively
+    #     blocked mid-transfer;
+    #   * NO stream raised and still nothing moved → every stream's request setup
+    #     (TCP + TLS, typically through an overloaded inspection proxy) outlasted
+    #     the `dur`-second window, so the read loop never got to run. There is no
+    #     exception to catch on this path — which is why keying the failure on
+    #     "an exception was seen" was not enough: a firewall that merely makes
+    #     setup slow, rather than resetting, still produced ok=true / 0.0 Mbps.
+    # The error text names which mechanism it was, because they need different
+    # fixes (a block/ACL vs. a saturated proxy).
+    #
+    # Deliberately NOT a failure: some streams raised but bytes still moved — a
+    # degraded yet genuine measurement. Erasing it would remove the only number
+    # available during a brown-out; the per-stream failure counts go into `raw`
+    # instead, so the degradation is visible without the row leaving the baselines.
+    def _blocked_reason(direction: str, failed: int, error: str | None) -> str:
+        if error:
+            return f"{direction} moved 0 bytes ({failed}/{streams} streams failed): {error}"
+        return (
+            f"{direction} moved 0 bytes (no stream raised — every request's setup "
+            f"outlasted the {dur}s measurement window)"
+        )
+
     blocked: list[str] = []
-    if dl_bytes == 0 and dl_error:
-        blocked.append(
-            f"download moved 0 bytes ({dl_failed}/{streams} streams failed): {dl_error}"
-        )
-    if ul_bytes == 0 and ul_error:
-        blocked.append(
-            f"upload moved 0 bytes ({ul_failed}/{streams} streams failed): {ul_error}"
-        )
+    if dl_bytes == 0:
+        blocked.append(_blocked_reason("download", dl_failed, dl_error))
+    if ul_bytes == 0:
+        blocked.append(_blocked_reason("upload", ul_failed, ul_error))
 
     result = {
         # Partial numbers are preserved either way: a blocked download with a

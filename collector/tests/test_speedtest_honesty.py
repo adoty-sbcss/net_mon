@@ -9,12 +9,15 @@ the dashboard, which filters `ok=true` and takes max() per day. 47% of that
 district's speed tests stored 0.0 Mbps and nothing ever flagged it.
 
 The rules under test:
-  * a direction that moved ZERO bytes AND raised is `ok=false` with an error that
-    names the direction and the exception;
+  * a direction that moved ZERO bytes is `ok=false` — it measured nothing. BOTH
+    mechanisms count, and the error text says which one it was:
+      - one or more streams RAISED (reset / timeout): actively blocked;
+      - NOTHING raised and still no bytes: every request's setup outlasted the
+        measurement window (a saturated inspection proxy). Keying the failure on
+        "an exception was seen" missed this second path entirely, which left the
+        original 0.0-Mbps-with-ok=true symptom reachable after the first fix.
   * partial numbers survive — a blocked download still reports the upload figure
     and the latency/jitter sample;
-  * zero bytes with NO exception stays `ok=true` — "blocked" and "slow" are not
-    the same finding and must not be conflated;
   * some streams failing while others move bytes stays `ok=true` (a degraded but
     real measurement), with the stream-failure counts recorded in `raw`.
 
@@ -104,17 +107,46 @@ def test_both_directions_blocked_names_both(monkeypatch):
     assert res["raw"]["upload_bytes"] == 0
 
 
-def test_genuine_zero_without_an_exception_stays_ok(monkeypatch):
-    """The edge served an empty body but nothing broke — a real (if odd) zero
-    reading, NOT evidence of blocking. Do not conflate 'blocked' with 'slow'."""
+def test_zero_bytes_without_an_exception_is_still_a_failure(monkeypatch):
+    """Zero bytes and NOTHING raised. Keying the failure on "an exception was
+    seen" left this path reporting ok=true / 0.0 Mbps — the incident symptom
+    verbatim, reached by a second mechanism. A direction that moved zero bytes
+    measured nothing, so it is a failed test however it got there; the error
+    text says which mechanism, because they need different fixes."""
     _install(monkeypatch, down=_FakeResp, up=_serves_data)
 
     res = speedtest.run_cloudflare(duration=2, streams=1)
 
-    assert res["ok"] is True
-    assert res["download_mbps"] == 0.0
-    assert res.get("error") is None
+    assert res["ok"] is False, "a direction that moved zero bytes measured nothing"
+    assert "download moved 0 bytes" in res["error"]
+    assert "no stream raised" in res["error"], "name the mechanism: setup, not a reset"
     assert res["raw"]["download_streams_failed"] == 0
+    assert res["raw"]["download_error"] is None
+    # The working direction and the latency sample still survive.
+    assert res["upload_mbps"] > 0
+    assert res["latency_ms"] is not None
+
+
+def test_slow_setup_outlasting_the_window_is_a_failure(monkeypatch):
+    """The realistic Cucamonga mechanism: an overloaded inspection proxy passes
+    the 20 tiny `bytes=0` latency GETs (10s timeout each) but takes longer than
+    the entire measurement window just to establish each bulk transfer. The read
+    loop never runs, no exception is ever raised, and the exception-keyed rule
+    scored it as a perfectly successful 0.0 Mbps measurement."""
+
+    def _setup_outlasts_window():
+        time.sleep(2.5)  # longer than the 2s duration below
+        return _FakeResp([b"x" * 131072])
+
+    _install(monkeypatch, down=_setup_outlasts_window, up=_serves_data)
+
+    res = speedtest.run_cloudflare(duration=2, streams=2)
+
+    assert res["ok"] is False, "0.0 Mbps from a stalled setup is not a success"
+    assert res["download_mbps"] == 0.0
+    assert "no stream raised" in res["error"]
+    assert res["raw"]["download_bytes"] == 0
+    assert res["raw"]["download_error"] is None
 
 
 def test_partly_failing_streams_still_report_a_measurement(monkeypatch):

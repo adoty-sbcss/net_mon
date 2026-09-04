@@ -116,7 +116,12 @@ def _post(url: str, token: str | None, body: dict) -> dict | None:
 # burns bandwidth) every cycle during an outage. Spooling decouples "did we
 # measure" from "did the dashboard receive it."
 RESULT_SPOOL_DIR = Path("/var/lib/netmon/result-spool")
-RESULT_SPOOL_MAX = 500  # cap FILES so a long outage can't fill the disk
+# Cap FILES so a long outage can't fill the disk. Batching a cycle into one file
+# (below) only moved the horizon from ~7h to ~25h at a 3-minute check-in — still
+# far short of the 8-day outage this work exists to record, and the end that gets
+# evicted is the ONSET, which is the part an investigator needs. A spooled cycle
+# is ~1-2 KB, so 3000 files is ~3-6 MB on a 256 GB field box: buy the ~6 days.
+RESULT_SPOOL_MAX = 3000
 RESULT_SPOOL_DRAIN_PER_RUN = 50  # bound redelivery files per check-in
 RESULT_SPOOL_DRAIN_PAYLOADS = 200  # …and payloads: one file can now hold several
 _result_spool_seq = 0
@@ -126,11 +131,12 @@ _result_spool_seq = 0
 # collector can still drain them); a batch writes {"endpoint", "payloads": [...]}.
 # The drain reads both. Batching matters for the outage case: the cap is on files,
 # and one check-in cycle's latency probe is ~4 results. Spooled one-per-file at
-# ~16 cycles/hour the 500-file cap filled in ~7h and then dropped the OLDEST —
+# ~20 cycles/hour the old 500-file cap filled in ~7h and then dropped the OLDEST —
 # i.e. a multi-day outage kept the tail and lost the ONSET, which is the part
-# anyone investigating actually needs. One file per cycle stretches that to ~31h.
-# (Beyond that, a downsampled outage-summary record would need a new dashboard
-# endpoint — deliberately not built here.)
+# anyone investigating actually needs. One file per cycle plus the raised cap
+# (RESULT_SPOOL_MAX above) carries ~6 days, which covers the 8-day incident's
+# onset. (Beyond that, a downsampled outage-summary record would need a new
+# dashboard endpoint — deliberately not built here.)
 
 
 def _write_spool_file(path: Path, endpoint: str, payloads: list[dict]) -> None:
