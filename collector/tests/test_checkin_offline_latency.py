@@ -26,6 +26,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import collector as collector_pkg
+import collector.latency  # noqa: F401  — so the package attribute exists to patch
 from collector import checkin
 
 
@@ -44,6 +46,13 @@ def _settings(**over):
         "snmp_topology_max_depth": 2,
         "snmp_topology_interval": 3600,
         "bundle_transport": "blob",
+        # Reported in the check-in's currentConfig block so the dashboard can show
+        # the box's ACTUAL scan cadence (capture_seconds especially: two sensors
+        # silently disagreeing about their sampling window makes any per-site
+        # comparison of capture-derived rates unsound).
+        "capture_seconds": 120,
+        "capture_interval": 900,
+        "rescan_interval": 3600,
     }
     base.update(over)
     return SimpleNamespace(**base)
@@ -111,10 +120,14 @@ def _harness(monkeypatch, tmp_path, *, checkin_ok: bool):
     fake_latency = SimpleNamespace(
         probe_latency=_probe, default_gateway=lambda: None
     )
-    monkeypatch.setitem(
-        __import__("sys").modules, "collector.latency", fake_latency
-    )
-    monkeypatch.setattr(checkin, "_dns_resolver", lambda: None)
+    # Patch the ATTRIBUTE on the package, which is what `from . import latency`
+    # resolves to. A sys.modules patch only works while the real submodule has
+    # never been imported — the moment any other test file imports it, the package
+    # attribute exists, getattr wins, and this harness silently runs the REAL ping.
+    monkeypatch.setattr(collector_pkg, "latency", fake_latency)
+    # No DNS target: this file is about the outage path, not resolver discovery
+    # (see test_dns_latency_target.py). Returns (host, unavailable_reason).
+    monkeypatch.setattr(checkin, "_dns_latency_target", lambda: (None, None))
     return spool, posted, ran
 
 
