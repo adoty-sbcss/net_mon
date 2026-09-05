@@ -833,7 +833,7 @@ _DIAG_COMMANDS: dict[str, list[str]] = {
     # table, the verdict, and the diff against the site's known-good path. READS
     # stored captures; it does not take a new one, so it is instant and safe to
     # run at any time. Fixed argv, no operator input: the targets come from
-    # validated pushed config, never from the caller.
+    # the box's own env config (re-validated as IP literals), never the caller.
     "diag-wan-path": ["python", "-m", "collector", "wan-path", "--report"],
 }
 
@@ -1729,12 +1729,21 @@ def _maybe_latency(url: str, token: str | None, settings, *, offline: bool = Fal
 def _spawn_wan_path(reason: str) -> bool:
     """Start the WAN-path ladder DETACHED, and don't wait for it.
 
-    Two independent reasons it cannot run inline. The check-in service is
-    `Type=oneshot`, so anything still running when we exit is killed; and the
-    watchdog recreates the collector after a prolonged upload stall — which a WAN
-    outage produces by definition. An inline ladder would therefore be terminated
-    at random, mid-capture, precisely during the incident it exists to record.
-    Same pattern the console session uses: a new session so it reparents to PID 1.
+    The check-in service is `Type=oneshot`, so an inline ladder would still be
+    running when the unit completes. Detaching survives that, and it was worth
+    proving rather than assuming: verified on a live sensor that a child spawned
+    this way outlives both the `docker compose exec` parent exiting (it reparents
+    to the container's PID 1) and a hard SIGKILL of the host-side compose client.
+    The control-group kill documented in scripts/netmon-wifi-experience.sh reaches
+    host-side units only — in-container children sit in the container's cgroup.
+
+    What detaching does NOT survive: `netmon-watchdog.sh` runs
+    `docker compose restart collector` once uploads have stalled for 6h — which a
+    long outage guarantees — every 15 minutes thereafter. That kills the whole
+    container, this ladder included. Nothing in-process can prevent it, so the
+    design absorbs it instead: captures are written atomically, and `degraded` is
+    cleared by the CHILD after the capture lands rather than by the spawner, so a
+    killed run is retried instead of being recorded as already handled.
     """
     import subprocess
     import sys
@@ -1771,11 +1780,23 @@ def _maybe_wan_path(settings, reason: str) -> bool:
 
     if not getattr(settings, "wan_path_enabled", False):
         return False
+    # Check the targets HERE, not only in the child. With no valid IP literals
+    # the child exits before writing a baseline, so `updated_at` never advances
+    # and `_wan_path_on_success` would respawn a baseline every check-in until the
+    # daily cap was gone — leaving a real outage that day with no capture at all.
+    if not wan_path_mod.targets_from(settings):
+        log.warning("wan-path skipped: no valid IP-literal targets configured")
+        return False
     state = wan_path_mod.load_state()
     now = time.time()
     today = datetime.now(UTC).strftime("%Y-%m-%d")
     runs_today = int(state.get("runs_today") or 0) if state.get("day") == today else 0
-    if runs_today >= int(settings.wan_path_daily_cap):
+    # A recovery capture is exempt from the cap. It is the snapshot of the HEALED
+    # path — one per outage, and outages are themselves capped, so this stays
+    # bounded. Without the exemption, an outage that exhausts the cap leaves
+    # `degraded` latched: recovery is refused, and the refusal also blocks the
+    # baseline refresh until UTC midnight.
+    if reason != "recovery" and runs_today >= int(settings.wan_path_daily_cap):
         log.info("wan-path capture skipped: daily cap reached", cap=runs_today)
         return False
     # A recovery capture is the one that records the HEALED path, so it is worth
@@ -1791,8 +1812,13 @@ def _maybe_wan_path(settings, reason: str) -> bool:
                   "last_reason": reason})
     if reason == "outage":
         state["degraded"] = True
-    elif reason == "recovery":
-        state["degraded"] = False
+    # NOTE `degraded` is deliberately NOT cleared here for a recovery capture.
+    # The watchdog runs `docker compose restart collector` every 15 minutes once
+    # uploads have stalled for 6h — which an outage guarantees — and that kills
+    # everything in the container, this ladder included. Clearing the flag on
+    # SPAWN would then lose the healed-path snapshot permanently: the flag says
+    # "already handled" while no capture was ever written. The child clears it
+    # once the capture is safely on disk, so a killed run simply retries.
     wan_path_mod.save_state(state)
     return True
 

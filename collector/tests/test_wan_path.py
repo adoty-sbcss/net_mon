@@ -370,6 +370,66 @@ def test_a_dashboard_outage_is_never_reported_as_a_site_outage():
     assert v["code"] == wan_path.VERDICT_DASHBOARD_ONLY
 
 
+def test_a_missing_default_route_is_not_a_wan_outage():
+    """Never assert a probe that did not run.
+
+    `latency.default_gateway()` returns None when the default route is gone — a
+    dropped carrier, a lapsed DHCP lease. The gateway ping is then never taken,
+    and treating "not measured" as "fine" reported a local uplink fault as
+    "no path to the internet, WHILE THE LOCAL GATEWAY STILL ANSWERS" — a claim
+    about a probe that never happened.
+    """
+    unprobed = {"target": None, "alive": None, "loss_pct": None,
+                "error": "no default route"}
+    v = wan_path.decide(unprobed, [_FAIL, _FAIL], _FAIL, _DNS_FAIL,
+                        icmp_internet_ok=False)
+    assert v["code"] == wan_path.VERDICT_NO_ROUTE
+    assert "gateway still answers" not in v["summary"]
+
+
+def test_the_gateway_clause_is_claimed_only_when_measured():
+    """The 'fault is upstream' inference requires a gateway that actually replied."""
+    with_gw = wan_path.decide(_ALIVE, [_FAIL, _FAIL], _FAIL, _DNS_OK,
+                              icmp_internet_ok=False)
+    assert with_gw["code"] == wan_path.VERDICT_WAN_DOWN
+    assert "gateway still answers" in with_gw["summary"]
+
+    no_gw = wan_path.decide(None, [_FAIL, _FAIL], _FAIL, _DNS_OK,
+                            icmp_internet_ok=False)
+    assert no_gw["code"] == wan_path.VERDICT_WAN_DOWN
+    assert "gateway still answers" not in no_gw["summary"], (
+        "no gateway record means no gateway claim"
+    )
+
+
+def test_capture_records_a_missing_route_rather_than_skipping_it(monkeypatch):
+    """A skipped probe and a passed probe must never look alike to a reader."""
+    monkeypatch.setattr(wan_path, "tcp_connect", lambda *a, **k: dict(_FAIL))
+    monkeypatch.setattr(wan_path, "dns_resolves", lambda *a, **k: dict(_DNS_FAIL))
+    monkeypatch.setattr(wan_path, "ping", lambda *a, **k: {"alive": False})
+    monkeypatch.setattr(
+        wan_path, "trace",
+        lambda dest, mode, **kw: {"mode": mode, "dest": dest, "hops": [],
+                                  "reached_at": None, "last_responding_hop": None,
+                                  "error": None},
+    )
+    rec = wan_path.capture(reason="outage", controls=["1.1.1.1"], gateway_ip=None)
+    assert rec["gateway"]["alive"] is None
+    assert rec["gateway"]["error"] == "no default route"
+    assert rec["verdict"]["code"] == wan_path.VERDICT_NO_ROUTE
+    assert "NOT PROBED" in wan_path.render(rec, wan_path.empty_baseline())
+
+
+def test_an_errored_trace_does_not_claim_a_shortened_path():
+    """A trace that never ran must not be described as 'short by N'."""
+    base = _baseline_from(_HEALTHY)
+    tr = {"mode": "icmp", "dest": "1.1.1.1", "hops": [], "reached_at": None,
+          "last_responding_hop": None, "error": "traceroute timed out"}
+    diff = wan_path.compare(base, tr)
+    assert diff["short_by"] is None
+    assert diff["break_after_hop"] is None
+
+
 def test_lan_fault_outranks_a_wan_claim():
     v = wan_path.decide(_DEAD, [_FAIL, _FAIL], _FAIL, _DNS_FAIL, icmp_internet_ok=False)
     assert v["code"] == wan_path.VERDICT_LAN, (
@@ -410,7 +470,10 @@ def test_capture_is_bounded_and_skips_traces_it_cannot_finish(monkeypatch):
 
     monkeypatch.setattr(wan_path, "trace", _never_called)
 
-    rec = wan_path.capture(reason="outage", controls=["1.1.1.1"], budget_sec=0)
+    # Pass a gateway so this isolates the BUDGET; without one the capture
+    # correctly reports no_route and we would be testing that instead.
+    rec = wan_path.capture(reason="outage", controls=["1.1.1.1"],
+                           gateway_ip="10.8.3.254", budget_sec=0)
     assert traced == [], "no trace may start that the budget cannot cover"
     assert rec["truncated"] is True, "and the record must SAY it was cut short"
     assert rec["verdict"]["code"] in {

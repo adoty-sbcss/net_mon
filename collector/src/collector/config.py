@@ -369,7 +369,8 @@ class Settings(BaseSettings):
 
     # WAN-path evidence (PERF-7). When a check-in fails at the NETWORK level, the
     # sensor runs a bounded traceroute/TCP ladder on its own and stores the result
-    # locally for delivery on recovery — the outage window is the only time the
+    # locally and read back via the `diag-wan-path` diagnostic — the outage
+    # window is the only time the
     # measurement can be taken, and it is precisely when the box cannot be
     # commanded. ON by default: it costs nothing while healthy (it only fires on a
     # failed check-in, plus one baseline refresh a day).

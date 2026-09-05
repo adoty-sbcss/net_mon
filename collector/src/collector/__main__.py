@@ -454,6 +454,15 @@ def cmd_wan_path(reason: str, report: bool, limit: int) -> None:
     path = wan_path_mod.save_capture(rec)
     log.info("wan-path capture stored", reason=reason, path=str(path),
              verdict=(rec.get("verdict") or {}).get("code"))
+    if reason == "recovery":
+        # Clear the degraded flag only now that the healed-path snapshot is
+        # actually on disk. The spawner deliberately leaves it set: the watchdog
+        # restarts this container every 15 minutes during a long outage and would
+        # otherwise kill the ladder after the flag had already been cleared,
+        # losing the snapshot for good. A killed run just retries next check-in.
+        state = wan_path_mod.load_state()
+        state["degraded"] = False
+        wan_path_mod.save_state(state)
     click.echo(wan_path_mod.render(rec, baseline))
 
 

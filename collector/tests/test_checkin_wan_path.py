@@ -162,14 +162,72 @@ def test_recovery_is_captured_once_the_path_comes_back(monkeypatch, tmp_path):
     checkin.run_checkin()
 
     assert spawned2 == ["recovery"]
-    assert wan_path.load_state()["degraded"] is False
+    # The flag stays set until the CHILD writes the capture (see
+    # test_recovery_does_not_clear_degraded_on_spawn), so a run killed by the
+    # watchdog retries instead of being recorded as handled. Simulate the child
+    # finishing, which is what the `wan-path --reason recovery` command does.
+    st = wan_path.load_state()
+    st["degraded"] = False
+    wan_path.save_state(st)
 
-    # …and it does not keep firing once recovered.
+    # …and it does not keep re-capturing once recovered.
     spawned2.clear()
     checkin.run_checkin()
     assert spawned2 == ["baseline"], (
         "with no baseline on file the healthy path refreshes it, once"
     )
+
+
+def test_recovery_does_not_clear_degraded_on_spawn(monkeypatch, tmp_path):
+    """The watchdog restarts this container every 15 min during a long outage.
+
+    Clearing `degraded` when the recovery capture is SPAWNED means a killed run
+    is recorded as handled and the healed-path snapshot is lost for good. The
+    child clears it once the capture is on disk.
+    """
+    _harness(monkeypatch, tmp_path, status=None)
+    checkin.run_checkin()
+    assert wan_path.load_state()["degraded"] is True
+
+    spawned = _harness(monkeypatch, tmp_path, status=200)
+    checkin.run_checkin()
+
+    assert spawned == ["recovery"]
+    assert wan_path.load_state()["degraded"] is True, (
+        "still degraded until the child actually writes the capture"
+    )
+
+
+def test_recovery_is_exempt_from_the_daily_cap(monkeypatch, tmp_path):
+    """Otherwise an outage that exhausts the cap latches `degraded` all day."""
+    settings = _settings(wan_path_daily_cap=1, wan_path_min_interval_sec=120)
+    _harness(monkeypatch, tmp_path, status=None, settings=settings)
+    checkin.run_checkin()
+    st = wan_path.load_state()
+    assert st["runs_today"] == 1 and st["degraded"] is True
+
+    spawned = _harness(monkeypatch, tmp_path, status=200, settings=settings)
+    checkin.run_checkin()
+
+    assert spawned == ["recovery"], "the healed-path snapshot outranks the cap"
+
+
+def test_no_valid_targets_does_not_burn_the_daily_cap(monkeypatch, tmp_path):
+    """A hostname in the target list must not spend the day's captures.
+
+    `targets_from` keeps only IP literals, so the child would exit before writing
+    a baseline; `updated_at` never advances and every healthy check-in respawns
+    one — until the cap is gone and a real outage that day gets nothing.
+    """
+    spawned = _harness(
+        monkeypatch, tmp_path, status=200,
+        settings=_settings(wan_path_targets="cloudflare.com"),
+    )
+    for _ in range(4):
+        checkin.run_checkin()
+
+    assert spawned == []
+    assert wan_path.load_state() == {}, "no ledger churn either"
 
 
 def test_a_healthy_box_refreshes_a_stale_baseline(monkeypatch, tmp_path):

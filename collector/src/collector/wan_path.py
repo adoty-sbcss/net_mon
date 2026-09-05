@@ -58,8 +58,11 @@ rules keep it honest:
 
 Everything is bounded: per-probe timeouts, a hop cap, and a wall-clock ceiling
 that abandons remaining traces rather than overrunning. Nothing here takes
-caller-supplied arguments — targets come from validated pushed config — so the
-sensor's fixed-argv containment model is preserved.
+caller-supplied arguments — targets are read from the box's own env config
+(/etc/netmon/netmon.env, 0600) and re-validated as IP literals here — so the
+sensor's fixed-argv containment model is preserved. NOTE these keys are
+deliberately NOT in _apply_config's pushed-config tables: the dashboard cannot
+set them, which is one less operator-reachable surface feeding a subprocess.
 """
 from __future__ import annotations
 
@@ -203,6 +206,13 @@ def dns_resolves(name: str, timeout: float = 5.0) -> dict[str, Any]:
     Kept separate from the TCP controls, which use IP literals precisely so that
     a dead resolver cannot masquerade as a dead WAN. If the literals connect and
     this fails, the finding is DNS, not the circuit.
+
+    `timeout` is a BEST-EFFORT hint, not a guarantee: `getaddrinfo` goes through
+    libc, which `socket.setdefaulttimeout` does not bound (it applies to socket
+    objects). The real ceiling is resolv.conf's `timeout x attempts x
+    nameservers`, typically 10-30s against a dead resolver. That is survivable
+    here — the whole capture still lands far inside the 900s floor between runs —
+    but the number in this signature should not be read as enforced.
     """
     started = time.monotonic()
     prior = socket.getdefaulttimeout()
@@ -460,7 +470,11 @@ def compare(baseline: dict[str, Any], tr: dict[str, Any]) -> dict[str, Any]:
     # baseline happens to go. Without this, a route that legitimately shortened
     # (a closer anycast node, a restored direct path) reads as a failure — the
     # measurement arriving is the strongest possible evidence that it did not.
-    if tr.get("reached_at"):
+    if tr.get("reached_at") or tr.get("error") or not last_int:
+        # Reached the destination -> no break. Errored, or nothing answered at
+        # all -> we have no hop to name, so claiming "short by N" would describe
+        # a trace that never ran as though it had mapped a shortened path. The
+        # verdict already carries the finding in that case.
         short_by = None
     else:
         gap = deepest_known - last_int
@@ -491,6 +505,7 @@ def compare(baseline: dict[str, Any], tr: dict[str, Any]) -> dict[str, Any]:
 # each is a claim we can actually support from the measurements above.
 VERDICT_OK = "ok"
 VERDICT_LAN = "lan"
+VERDICT_NO_ROUTE = "no_route"
 VERDICT_DNS = "dns"
 VERDICT_TCP_BLOCKED = "tcp_blocked"
 VERDICT_WAN_DOWN = "wan_down"
@@ -500,14 +515,21 @@ _VERDICT_TEXT = {
     VERDICT_OK: "the path is healthy from here",
     VERDICT_LAN: "the sensor's own gateway is not answering - this is a LAN-side "
                  "fault, and nothing beyond it can be diagnosed from this box",
+    VERDICT_NO_ROUTE: "this box has NO default route - it cannot reach anything "
+                      "beyond its own subnet. A dropped carrier or an expired "
+                      "DHCP lease looks like this; it is a local uplink fault, "
+                      "not a WAN outage",
     VERDICT_DNS: "name resolution is failing while direct IP connections still "
                  "work - the circuit is up, the resolver is not",
     VERDICT_TCP_BLOCKED: "ICMP crosses the path but NO new TCP session to :443 "
                          "completes - the signature of a stateful device dropping "
                          "new sessions (state table, licence, or policy), not a "
                          "dead circuit",
+    # Deliberately says nothing about the gateway: when the default route is gone
+    # we never pinged one, and a verdict must not assert what it did not measure.
+    # `decide` appends the gateway clause only when the gateway actually answered.
     VERDICT_WAN_DOWN: "no path to the internet: neither ICMP nor TCP reaches any "
-                      "control target, while the local gateway still answers",
+                      "control target",
     VERDICT_DASHBOARD_ONLY: "the internet is reachable but the dashboard is not - "
                             "this is a dashboard-side or DNS-side fault, NOT a "
                             "site outage",
@@ -527,7 +549,15 @@ def decide(
     outage, and a dashboard outage is never reported as a site outage — that
     misattribution is the whole reason this exists.
     """
-    if gateway is not None and not gateway.get("alive"):
+    # `alive is None` means we never got to ask — there was no default route to
+    # ping. That is NOT the same as "the gateway is fine", and treating it as
+    # such let a dropped carrier or a lapsed DHCP lease be reported as "no path
+    # to the internet, while the local gateway still answers": a local fault
+    # announced as a district outage, with a claim about a probe that never ran.
+    gw_alive = gateway.get("alive") if gateway is not None else None
+    if gateway is not None and gw_alive is None:
+        code = VERDICT_NO_ROUTE
+    elif gateway is not None and not gw_alive:
         code = VERDICT_LAN
     elif controls and all(not c.get("ok") for c in controls):
         # Every independent internet control refused a new TCP session.
@@ -540,7 +570,13 @@ def decide(
         code = VERDICT_DASHBOARD_ONLY
     else:
         code = VERDICT_OK
-    return {"code": code, "summary": _VERDICT_TEXT[code]}
+    summary = _VERDICT_TEXT[code]
+    if code == VERDICT_WAN_DOWN and gw_alive:
+        # Only claimed when the gateway was actually probed AND answered — it is
+        # what puts the fault upstream of this box rather than inside the site.
+        summary += (", while the local gateway still answers - so the fault is "
+                    "upstream of this box")
+    return {"code": code, "summary": summary}
 
 
 def capture(
@@ -580,6 +616,12 @@ def capture(
 
     if gateway_ip:
         rec["gateway"] = ping(gateway_ip)
+    else:
+        # Record the ABSENCE as a measurement rather than leaving the field null.
+        # A skipped probe and a passed probe must never look alike to a reader —
+        # "no default route" is itself the most useful finding on the box.
+        rec["gateway"] = {"target": None, "alive": None, "rtt_ms": None,
+                          "loss_pct": None, "error": "no default route"}
 
     # TCP controls first: they are fast and they carry the verdict.
     for target in controls:
@@ -713,9 +755,15 @@ def render(rec: dict[str, Any], baseline: dict[str, Any] | None = None) -> str:
 
     gw = rec.get("gateway")
     if gw:
-        state = "alive" if gw.get("alive") else "NO REPLY"
-        lines.append(f"  gateway  {gw.get('target', ''):<22} {state:<9} "
-                     f"loss {gw.get('loss_pct')}%")
+        if gw.get("alive") is None:
+            # Never probed (no default route) — say so rather than showing a
+            # blank that reads as "fine".
+            lines.append(f"  gateway  {'(none)':<22} {'NOT PROBED':<9} "
+                         f"{gw.get('error') or ''}")
+        else:
+            state = "alive" if gw.get("alive") else "NO REPLY"
+            lines.append(f"  gateway  {gw.get('target') or '':<22} {state:<9} "
+                         f"loss {gw.get('loss_pct')}%")
     dns = rec.get("dns")
     if dns:
         lines.append(f"  dns      {dns.get('name', ''):<22} "
