@@ -1892,6 +1892,18 @@ def _maybe_latency(url: str, token: str | None, settings, *, offline: bool = Fal
         except Exception as exc:  # noqa: BLE001
             log.warning("latency probe failed", error=str(exc))
             return
+        # probe_latency de-dupes by HOST, so on a network where the router is also
+        # the resolver the dns target collides with the gateway and its row simply
+        # vanishes. That never happened before this change (the old target was
+        # 127.0.0.53, which collides with nothing), and a row that silently
+        # disappears is the same trap as one that lies: the operator cannot tell
+        # "not measured" from "nobody looked". Re-attach the dns label to the
+        # measurement that WAS taken — same host, so the numbers are literally the
+        # RTT to the resolver — rather than pinging the identical address twice.
+        if dns and not any(r.get("label") == "dns" for r in results):
+            same = next((r for r in results if r.get("host") == dns), None)
+            if same is not None:
+                results.append({**same, "label": "dns"})
     if dns_unavailable:
         # The third state, spelled out on the wire: not ok, and every measurement
         # NULL — including lossPct, which is what keeps this distinguishable from a

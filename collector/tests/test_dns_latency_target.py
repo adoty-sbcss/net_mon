@@ -229,6 +229,49 @@ def test_stub_only_box_emits_an_unavailable_row_and_never_pings_loopback(
     assert row["error"]
 
 
+def test_the_dns_row_survives_when_the_resolver_IS_the_gateway(monkeypatch, tmp_path):
+    """probe_latency de-dupes by host. On a small network the router is often also
+    the resolver, so the dns target collides with the gateway and its row used to
+    vanish outright — an absence the operator cannot distinguish from "nobody
+    looked". It must still be reported, carrying the measurement that was taken,
+    and the identical address must NOT be pinged twice.
+
+    Uses the REAL probe_latency with only _ping stubbed: a fake probe_latency does
+    not de-dupe, so it would pass this test without exercising the bug at all.
+    """
+    from collector import latency as real_latency
+
+    _paths(monkeypatch, tmp_path, systemd="nameserver 10.0.0.1\n")
+    pings: list[str] = []
+
+    def _fake_ping(host, count=10):
+        pings.append(host)
+        return {"host": host, "ok": True, "latency_ms": 0.9,
+                "jitter_ms": 0.2, "loss_pct": 0.0}
+
+    monkeypatch.setattr(real_latency, "_ping", _fake_ping)
+    monkeypatch.setattr(real_latency, "default_gateway", lambda: "10.0.0.1")
+    monkeypatch.setattr(collector_pkg, "latency", real_latency)
+    reported: list[list[dict]] = []
+    monkeypatch.setattr(
+        checkin, "_report_latency",
+        lambda url, tok, results, trig, spool_only=False: reported.append(results),
+    )
+
+    checkin._maybe_latency(
+        "https://dash", "tok",
+        SimpleNamespace(latency_enabled=True, latency_targets="1.1.1.1"),
+    )
+
+    assert pings.count("10.0.0.1") == 1, "the shared address was pinged twice"
+    labels = [r["label"] for r in reported[0]]
+    assert labels.count("dns") == 1, f"the dns row vanished: {labels}"
+    dns_row = next(r for r in reported[0] if r["label"] == "dns")
+    assert dns_row["host"] == "10.0.0.1"
+    assert dns_row["latency_ms"] == 0.9   # the real measurement, not a fabrication
+    assert dns_row["ok"] is True
+
+
 def test_healthy_box_pings_the_real_upstream_and_emits_no_unavailable_row(
     monkeypatch, tmp_path
 ):
