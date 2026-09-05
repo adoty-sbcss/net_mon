@@ -33,6 +33,7 @@
     "diag-selftest",
     "diag-sftp-test",
     "diag-uptime",
+    "diag-wan-path",
     "run-scan",
     "upload-now"
   ]
