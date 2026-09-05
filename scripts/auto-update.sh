@@ -41,6 +41,7 @@ HEALTHCHECK_WAIT_SECONDS="${NETMON_HEALTHCHECK_WAIT:-120}"
 # Resolution order: the installed unit (authoritative) -> the sudo invoker ->
 # the repo's current owner -> ourselves.
 UPDATE_UNIT="/etc/systemd/system/netmon-update.service"
+valid_user() { [[ -n "${1:-}" ]] && id -u "$1" >/dev/null 2>&1; }
 netmon_service_user() {
     local u=""
     if [[ -r "$UPDATE_UNIT" ]]; then
@@ -48,13 +49,22 @@ netmon_service_user() {
         u="${u%%[[:space:]]*}"            # drop trailing CR/whitespace
         u="${u#\"}"; u="${u%\"}"          # drop optional quoting
     fi
-    [[ -n "$u" ]] || u="${SUDO_USER:-}"
-    [[ -n "$u" ]] || u="$(stat -c %U "$REPO_DIR" 2>/dev/null || true)"
-    if [[ -z "$u" ]] || ! id -u "$u" >/dev/null 2>&1; then u="$(id -un)"; fi
+    # Validate EVERY candidate, not just the last one. A non-empty but invalid
+    # value (the service account was renamed, a typo, a unit left behind for a
+    # deleted user) used to satisfy a bare -n test, skip the remaining
+    # candidates and land on `id -un` - which under sudo is root, reproducing
+    # the exact bug this function exists to prevent.
+    valid_user "$u" || u="${SUDO_USER:-}"
+    valid_user "$u" || u="$(stat -c %U "$REPO_DIR" 2>/dev/null || true)"
+    valid_user "$u" || u="$(id -un)"
     printf '%s' "$u"
 }
 SERVICE_USER="$(netmon_service_user)"
 SERVICE_GROUP="$(id -gn "$SERVICE_USER" 2>/dev/null || printf '%s' "$SERVICE_USER")"
+# systemd accepts a numeric User=, so "is the service account root?" has to be
+# asked of the uid: `User=0` is root but is not the string "root", and every
+# guard below turns on that question. -gt 0 also rejects an unresolvable -1.
+SERVICE_UID="$(id -u "$SERVICE_USER" 2>/dev/null || echo -1)"
 
 # Run a privileged command: directly when already root, else via the
 # passwordless sudo that install-auto-update.sh's sudoers drop-in provides.
@@ -109,7 +119,7 @@ repo_dir_is_sane() {
 # Put it back on the way out, on every exit path.
 restore_repo_ownership() {
     [[ "$(id -u)" -eq 0 ]] || return 0
-    [[ -n "${SERVICE_USER:-}" && "$SERVICE_USER" != "root" ]] || return 0
+    [[ -n "${SERVICE_USER:-}" && "${SERVICE_UID:-0}" -gt 0 ]] || return 0
     repo_dir_is_sane || return 0
     chown -R "$SERVICE_USER:$SERVICE_GROUP" "$REPO_DIR" 2>/dev/null || true
     # Same trap for the retrievable log: a root run that creates it first leaves
@@ -198,8 +208,18 @@ ensure_paths_if_available() {
 ensure_repo_ownership() {
     local repo_uid want_uid owner
     repo_uid="$(stat -c %u "$REPO_DIR/.git" 2>/dev/null || stat -c %u "$REPO_DIR" 2>/dev/null || echo -1)"
-    want_uid="$(id -u "$SERVICE_USER" 2>/dev/null || echo -1)"
+    want_uid="$SERVICE_UID"
     [[ "$repo_uid" == "$want_uid" ]] && return 0
+    # Never hand a user-owned checkout to root. Resolution can only land on root
+    # if the unit really says so or every candidate failed, and in both cases
+    # chowning a real account's tree to root is the failure mode this function
+    # exists to prevent, not a repair. Root can already write anywhere, and
+    # ensure_git_trusts_repo below makes git accept the tree, so leaving it
+    # alone costs nothing.
+    if [[ "${SERVICE_UID:-0}" -eq 0 && "$repo_uid" != "0" ]]; then
+        log "WARN: resolved service user is 'root' but $REPO_DIR belongs to uid $repo_uid - leaving ownership alone. If this box really should run as root, that is what $UPDATE_UNIT says; otherwise fix User= there."
+        return 0
+    fi
     if ! repo_dir_is_sane; then
         log "WARN: refusing to touch ownership of '$REPO_DIR' - it does not look like the NetMon checkout (no .git, or a system directory)"
         return 0
@@ -219,14 +239,25 @@ ensure_repo_ownership
 # makes an exception for the invoking user (it matches $SUDO_UID), which is why
 # the manual force update still works with the tree owned by $SERVICE_USER - but
 # a root cron or `su -` has no SUDO_UID and WOULD be refused, driving the fetch
-# failure below into selfheal_reclone for no reason. Trust the path for THIS
-# PROCESS only (inherited by every child git), leaving no safe.directory entry
-# behind in whichever ~/.gitconfig root happened to be pointed at.
+# failure below into selfheal_reclone for no reason.
+#
+# Prefer trusting the path for THIS PROCESS only, so we leave no entry behind in
+# whichever ~/.gitconfig root happened to be pointed at. That form is only
+# honoured from git 2.38 ("protected configuration"); older builds - Ubuntu
+# 22.04 ships 2.34 - ignore it silently. So PROBE rather than match on a version
+# string, and fall back to the durable global entry, deduped: the unconditional
+# `git config --global --add` this replaces has already stacked five copies of
+# the same path in the service user's ~/.gitconfig on Monitor1.
 ensure_git_trusts_repo() {
     local repo_uid
     repo_uid="$(stat -c %u "$REPO_DIR/.git" 2>/dev/null || stat -c %u "$REPO_DIR" 2>/dev/null || echo -1)"
     [[ "$repo_uid" == "$(id -u)" ]] && return 0
     export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="safe.directory" GIT_CONFIG_VALUE_0="$REPO_DIR"
+    git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1 && return 0
+    if ! git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$REPO_DIR"; then
+        git config --global --add safe.directory "$REPO_DIR" 2>/dev/null || true
+        log "git: this build ignores safe.directory from the environment (pre-2.38); added a global entry for $REPO_DIR instead"
+    fi
     return 0
 }
 ensure_git_trusts_repo
@@ -304,7 +335,7 @@ selfheal_reclone() {
     # The clone inherits the ownership of whoever is running us; a root-run
     # re-clone left root-owned would swap one dubious-ownership freeze for
     # another. The exec below skips the EXIT trap, so settle it here.
-    if [[ "$(id -u)" -eq 0 && "$SERVICE_USER" != "root" ]]; then
+    if [[ "$(id -u)" -eq 0 && "${SERVICE_UID:-0}" -gt 0 ]]; then
         chown -R "$SERVICE_USER:$SERVICE_GROUP" "$fresh" 2>/dev/null || true
     fi
 
