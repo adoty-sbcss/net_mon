@@ -1472,6 +1472,16 @@ def _maybe_scheduled_iperf(url: str, token: str | None, settings) -> None:
 
 
 SPEEDTEST_LAST_FILE = Path("/var/lib/netmon/speedtest-last-run")
+# PERF-2 backoff. A `unavailable` speed test means speed.cloudflare.com REFUSED
+# the probe (429 above all) — self-inflicted load, not a network fault: districts
+# routinely run several sensors behind one egress IP. Retrying on the normal
+# cadence just feeds the limiter, so a refused run parks the scheduler for an
+# hour (or the configured interval, whichever is longer).
+#
+# ONLY `unavailable` backs off. A genuinely `failed` run means the district's
+# link is broken, and that is precisely the signal we must keep measuring.
+SPEEDTEST_COOLDOWN_FILE = Path("/var/lib/netmon/speedtest-cooldown-until")
+SPEEDTEST_REFUSED_COOLDOWN_SEC = 3600
 # PERF-5 website performance: the URL list (a real list → JSON file, not env) + the
 # scheduler's last-run ledger. The list is pushed from the dashboard's district-
 # managed website config; the dashboard always sends a non-empty list (its defaults
@@ -1501,6 +1511,11 @@ def _report_speedtest(url: str, token: str | None, res: dict, trigger: str) -> N
             "resultUrl": res.get("result_url"),
             "externalIp": res.get("external_ip"),
             "ok": res.get("ok", False),
+            # THREE states, not two: "ok" | "failed" | "unavailable". `ok` keeps
+            # its old meaning; `status` is what tells the dashboard whether a
+            # non-ok row is evidence about the link or just the provider
+            # refusing us. See collector/speedtest.py.
+            "status": res.get("status"),
             "error": res.get("error"),
             "raw": res.get("raw"),
             "startedAt": datetime.now(UTC).isoformat(),
@@ -1515,11 +1530,17 @@ def _run_speedtest_command(url: str, token: str | None, args: dict, trigger: str
 
     res = run_speedtest("cloudflare", duration=int(args.get("duration") or 5))
     _report_speedtest(url, token, res, trigger)
+    # An operator asked for this run, so it is NOT subject to the refusal cooldown
+    # — but the answer must still say which of the three things happened. The
+    # command-queue vocabulary is a closed set ("done"|"failed"|"scheduled"), so
+    # a refusal stays "failed" there (it produced no measurement) and `status`
+    # rides the free-form result object to say the link was never tested.
     summary = (
         {"download_mbps": res.get("download_mbps"), "upload_mbps": res.get("upload_mbps")}
         if res.get("ok")
         else {"error": res.get("error")}
     )
+    summary["status"] = res.get("status")
     return ("done" if res.get("ok") else "failed"), {"cloudflare": summary}
 
 
@@ -1530,6 +1551,8 @@ def _maybe_scheduled_speedtest(url: str, token: str | None, settings) -> None:
     if not settings.speedtest_enabled:
         return
     now = time.time()
+    if _speedtest_cooling_off(now):
+        return
     try:
         last = float(SPEEDTEST_LAST_FILE.read_text().strip())
     except Exception:
@@ -1545,6 +1568,45 @@ def _maybe_scheduled_speedtest(url: str, token: str | None, settings) -> None:
         SPEEDTEST_LAST_FILE.write_text(str(now))
     except Exception as exc:  # noqa: BLE001
         log.warning("could not persist speedtest last-run", error=str(exc))
+    _record_speedtest_cooldown(res, now)
+
+
+def _speedtest_cooling_off(now: float) -> bool:
+    """True while a refused probe's backoff is still in force.
+
+    A cooldown further out than SPEEDTEST_REFUSED_COOLDOWN_SEC cannot have been
+    written by us at a sane clock, so it is ignored rather than trusted: a box
+    whose clock jumped forward once must not stop speed-testing forever."""
+    try:
+        until = float(SPEEDTEST_COOLDOWN_FILE.read_text().strip())
+    except Exception:
+        return False
+    if until <= now:
+        return False
+    if until - now > SPEEDTEST_REFUSED_COOLDOWN_SEC:
+        log.warning(
+            "ignoring an implausible speedtest cooldown (clock moved?)",
+            seconds_remaining=round(until - now),
+        )
+        return False
+    return True
+
+
+def _record_speedtest_cooldown(res: dict, now: float) -> None:
+    """Arm the backoff after a REFUSED run; clear it after any other outcome."""
+    try:
+        if res.get("status") == "unavailable":
+            SPEEDTEST_COOLDOWN_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SPEEDTEST_COOLDOWN_FILE.write_text(str(now + SPEEDTEST_REFUSED_COOLDOWN_SEC))
+            log.warning(
+                "speed test refused by the provider — backing off",
+                cooldown_sec=SPEEDTEST_REFUSED_COOLDOWN_SEC,
+                error=res.get("error"),
+            )
+        else:
+            SPEEDTEST_COOLDOWN_FILE.unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not persist speedtest cooldown", error=str(exc))
 
 
 def _report_latency(
