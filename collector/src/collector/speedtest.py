@@ -105,12 +105,32 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"[:200]
 
 
+# Which HTTP statuses mean "the MEASUREMENT SOURCE refused us" and nothing else.
+#
+# Deliberately just 429. The first cut treated any 4xx/5xx as a refusal, which is
+# wrong in the one direction that matters: a school's own filtering proxy happily
+# answers 403 on a block page, so a 403 cannot tell "Cloudflare turned us away"
+# from "this district is blocking speed tests" — and the second is a real,
+# actionable finding about the site that must not be filed as "not measured".
+# Same for a 502/503 from an intercepting middlebox.
+#
+# 429 has no such second author: no campus firewall rate-limits a client with a
+# 429. A status earns its place here by being UNAMBIGUOUS, not by being
+# plausible. (The dashboard's lib/perf/measurement-source.ts reasons its way to
+# the same list from the other end — the two must agree.)
+#
+# Every status code is still recorded in `raw` regardless: the CLASSIFICATION is
+# narrow, the evidence is not.
+_REFUSAL_HTTP_STATUSES = frozenset({429})
+
+
 def _http_code(exc: BaseException) -> int | None:
     """The HTTP status if the endpoint ANSWERED us with one, else None.
 
-    This is the whole discriminator between `failed` and `unavailable`: a status
-    code means speed.cloudflare.com was reached, understood the request, and
-    declined it. A reset or a timeout means the transfer itself broke.
+    A status means speed.cloudflare.com was reached, understood the request and
+    declined it; a reset or a timeout means the transfer itself broke. WHICH
+    statuses count as a refusal is a narrower question — see
+    _REFUSAL_HTTP_STATUSES.
 
     Note HTTPError subclasses URLError (and OSError), so this must be checked
     BEFORE any generic transport-error branch."""
@@ -160,14 +180,23 @@ def run_cloudflare(duration: int = 5, streams: int = 16, timeout: int = 60) -> d
                 r.read()
             samples.append((time.monotonic() - t0) * 1000.0)
     except urllib.error.HTTPError as exc:
-        # The endpoint answered — it just refused. Nothing was learned about the
-        # link, so this is `unavailable`, not a WAN fault. (A rate limit reaches
-        # these tiny GETs too once the IP is over budget.)
+        # The endpoint answered. If it is an unambiguous refusal, nothing was
+        # learned about the link and this is `unavailable`, not a WAN fault (a
+        # rate limit reaches these tiny GETs too once the IP is over budget).
+        # Any other status — a 403 block page above all — could just as easily be
+        # THIS SITE refusing us, which is a real finding, so it stays `failed`.
+        # NOT named `refused`: that name is an int (a stream COUNT) further down
+        # in this same function scope, and mypy rightly refuses the collision.
+        is_refusal = exc.code in _REFUSAL_HTTP_STATUSES
         return _empty(
             "cloudflare",
-            f"latency probe refused by speed.cloudflare.com "
-            f"(HTTP {exc.code}): {_describe(exc)}",
-            STATUS_UNAVAILABLE,
+            (
+                f"latency probe refused by speed.cloudflare.com "
+                f"(HTTP {exc.code}): {_describe(exc)}"
+                if is_refusal
+                else f"latency probe failed (HTTP {exc.code}): {_describe(exc)}"
+            ),
+            STATUS_UNAVAILABLE if is_refusal else STATUS_FAILED,
             latency_http_status=exc.code,
             latency_samples=len(samples),
         )
@@ -258,22 +287,25 @@ def run_cloudflare(duration: int = 5, streams: int = 16, timeout: int = 60) -> d
         total = sum(n for n, _, _ in outcomes)
         errs = [(e, code) for _, e, code in outcomes if e]
         mbps = round(total * 8 / 1e6 / elapsed, 3)
-        refused = sum(1 for _, code in errs if code is not None)
+        # A stream counts as REFUSED only for an unambiguous refusal status; any
+        # other HTTP answer (a 403 block page, a middlebox 502) is evidence about
+        # the site's own network and stays a failure. See _REFUSAL_HTTP_STATUSES.
+        refused = sum(1 for _, code in errs if code in _REFUSAL_HTTP_STATUSES)
         # The reported error must match the VERDICT the caller will reach, or the
-        # row contradicts itself. When refusal explains everything the run is
-        # `unavailable` and the HTTP status is the story; when it does not, the
-        # run is `failed` on the strength of a TRANSPORT error, so that is the
-        # one to name — surfacing a lone 429 there would print "429" beside a
-        # verdict of "the link broke" and send the reader back to square one.
-        # `refused` and the status code stay in `raw` either way.
-        transport = [(e, c) for e, c in errs if c is None]
-        refusals = [(e, c) for e, c in errs if c is not None]
-        preferred = refusals if refused and refused == len(errs) else transport or refusals
+        # row contradicts itself. When refusal explains everything, the run is
+        # `unavailable` and the refusal IS the story. Otherwise the run is
+        # `failed`, and what it rests on is the evidence about this site — a
+        # transport error, or an HTTP answer that is not an unambiguous refusal
+        # (a 403 block page). Naming a lone 429 beside a verdict of "the link
+        # broke" would send the reader back to the wrong suspect.
+        refusals = [(e, c) for e, c in errs if c in _REFUSAL_HTTP_STATUSES]
+        site_evidence = [(e, c) for e, c in errs if c not in _REFUSAL_HTTP_STATUSES]
+        preferred = refusals if refused and refused == len(errs) else site_evidence or refusals
         first_error, first_code = preferred[0] if preferred else (None, None)
-        # The status code is worth surfacing even when a transport error names
-        # the failure, so keep the first one seen anywhere in the direction.
-        if first_code is None and refusals:
-            first_code = refusals[0][1]
+        # The status code is worth surfacing whatever named the failure, so fall
+        # back to the first one seen anywhere in this direction.
+        if first_code is None:
+            first_code = next((c for _, c in errs if c is not None), None)
         return mbps, total, len(errs), refused, first_error, first_code
 
     try:

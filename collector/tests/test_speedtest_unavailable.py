@@ -20,16 +20,20 @@ district's link, and filing it as `ok=false` alongside a real outage is what
 sent a week of diagnosis at the wrong device.
 
 The rules under test:
-  * an HTTP status (429 and any other 4xx/5xx) that leaves a direction with no
-    bytes is `unavailable` — a refusal, not a network failure;
+  * an UNAMBIGUOUS refusal status (429, and only 429) that leaves a direction
+    with no bytes is `unavailable` — a refusal, not a network failure;
+  * every OTHER HTTP status stays `failed`. A school's own filtering proxy
+    answers 403 on a block page and a middlebox can answer 5xx, so those cannot
+    tell "the provider turned us away" from "this district turned us away" — and
+    the latter is a real finding that must not be buried under "not measured";
   * a transport error (reset / timeout) with no bytes is still `failed`;
   * MIXED is `failed`, not `unavailable` — if even one stream was reset there is
     real evidence about the link in this run, and suppressing a genuine WAN
     failure is the more expensive mistake;
   * zero bytes with NO exception at all stays `failed` (the stalled-setup path
     from test_speedtest_honesty.py must not drift into the refusal bucket);
-  * a refusal on the tiny latency GETs is `unavailable` too — that early return
-    is a separate code path with its own way of being wrong;
+  * the tiny latency GETs return early on failure and classify the same way —
+    a separate code path with its own way of being wrong;
   * `ok` KEEPS ITS OLD MEANING (`status == "ok"`), so every existing reader stays
     truthful without being touched.
 
@@ -128,14 +132,50 @@ def test_a_429_is_unavailable_not_a_network_failure(monkeypatch):
     assert res["latency_ms"] is not None
 
 
-def test_the_status_code_is_carried_for_any_4xx_5xx(monkeypatch):
-    """Not a 429 special case: any status means the endpoint answered."""
+def test_a_5xx_from_an_intercepting_middlebox_is_also_a_failure(monkeypatch):
+    """A 502/503 can equally come from an intercepting middlebox on the site side."""
     _install(monkeypatch, down=_http_error(503, "Service Unavailable"), up=_serves_data)
 
     res = speedtest.run_cloudflare(duration=2, streams=1)
 
-    assert res["status"] == "unavailable"
+    assert res["status"] == "failed"
     assert res["raw"]["download_http_status"] == 503
+
+
+def test_a_403_block_page_is_a_FAILURE_not_a_refusal(monkeypatch):
+    """The narrowing that matters, and a deliberate reversal of this file's first
+    cut (which called any 4xx/5xx a refusal).
+
+    A school's own filtering proxy answers 403 on a block page, so a 403 cannot
+    tell "Cloudflare turned us away" from "this district blocks speed tests" —
+    and the second is a real, actionable finding about the site. Filing it under
+    "not measured" is the same class of mistake as the incident itself, pointed
+    the other way. Only a status with no second possible author counts, and 429
+    is the one: no campus firewall rate-limits a client with a 429."""
+    _install(monkeypatch, down=_http_error(403, "Forbidden"), up=_serves_data)
+
+    res = speedtest.run_cloudflare(duration=2, streams=1)
+
+    assert res["status"] == "failed", (
+        "a 403 has a second possible author — this site's own proxy — so it must "
+        "not be filed as the provider refusing us"
+    )
+    # The evidence is fully recorded either way; only the CLASSIFICATION is narrow.
+    assert res["raw"]["download_http_status"] == 403
+    assert res["raw"]["download_streams_refused"] == 0
+    assert "403" in res["error"]
+
+
+def test_the_latency_early_return_narrows_the_same_way(monkeypatch):
+    """The early return is its own code path and had the same over-broad rule."""
+    _install(
+        monkeypatch, down=_serves_data, up=_serves_data, latency=_http_error(403, "Forbidden")
+    )
+
+    res = speedtest.run_cloudflare(duration=2, streams=1)
+
+    assert res["status"] == "failed"
+    assert res["raw"]["latency_http_status"] == 403
 
 
 def test_both_directions_refused_is_unavailable(monkeypatch):
