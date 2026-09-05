@@ -268,6 +268,19 @@ def cmd_speedtest() -> None:
             f"latency={res.get('latency_ms')} ms  jitter={res.get('jitter_ms')} ms"
         )
         sys.exit(0)
+    if res.get("status") == "unavailable":
+        # This is the on-box diagnostic someone runs while standing next to a
+        # box they suspect. Printing FAIL for a refused probe points them at the
+        # district's link — the exact wrong turn Cucamonga took for a week. Its
+        # own exit code so a script can tell "no measurement" from "bad link".
+        click.echo(
+            f"SKIP cloudflare: {res.get('error')}\n"
+            "     The provider refused the probe — this says NOTHING about this "
+            "site's link. Usually rate limiting when several sensors share one "
+            "egress IP; scheduled runs back off for an hour after this.",
+            err=True,
+        )
+        sys.exit(2)
     click.echo(f"FAIL cloudflare: {res.get('error')}", err=True)
     sys.exit(1)
 
