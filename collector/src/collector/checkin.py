@@ -1816,6 +1816,14 @@ WAN_PATH_REPORT_PER_RUN = 5
 # 401/403 are NOT here — a bad token is a fact about our credential, and skipping
 # on it would silently discard the whole backlog during a rotation.
 _WAN_PATH_PERMANENT_REJECT = {400, 413, 422}
+# Capture filenames are `{time.time_ns():020d}.json` and the delivery marker is
+# one of them, compared with `>`. Anything else in that directory breaks the
+# ordering the marker depends on: a name like `notes.json` sorts ABOVE every
+# numeric one, so once it is stepped over (rejected or unreadable) the marker
+# strands every future capture below it — permanently, and silently. Only
+# save_capture writes here, but an operator with a shell is enough, so the queue
+# is defined by the pattern rather than by whatever the directory happens to hold.
+_WAN_PATH_CAPTURE_NAME = re.compile(r"^\d{20}\.json$")
 
 
 def _report_wan_path(url: str, token: str | None) -> None:
@@ -1834,7 +1842,10 @@ def _report_wan_path(url: str, token: str | None) -> None:
     from . import wan_path as wan_path_mod
 
     try:
-        pending = sorted(wan_path_mod.CAPTURE_DIR.glob("*.json"))
+        pending = sorted(
+            p for p in wan_path_mod.CAPTURE_DIR.glob("*.json")
+            if _WAN_PATH_CAPTURE_NAME.match(p.name)
+        )
     except Exception:  # noqa: BLE001 — no capture dir yet is the normal case
         return
     if not pending:

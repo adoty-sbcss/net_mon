@@ -86,9 +86,17 @@ BASELINE_FILE = WAN_PATH_DIR / "baseline.json"
 STATE_FILE = WAN_PATH_DIR / "state.json"
 CAPTURE_DIR = WAN_PATH_DIR / "captures"
 
-# Captures are small (~2-6 KB). 300 covers a multi-day incident at the 15-minute
-# degraded cadence with room for the daily baselines either side of it.
-CAPTURE_MAX = 300
+# Captures are small (~2-6 KB).
+#
+# The cap has to clear the incident this feature exists for, and 300 did not.
+# During an outage nothing is delivered (the dashboard is the thing that is
+# unreachable), so captures accumulate at the daily cap of 48 — 300/48 is ~6.25
+# days against a ~7-day incident. Eviction is oldest-first and knows nothing
+# about delivery, so the overflow discards the ONSET: precisely the part an
+# investigator needs, gone before `_report_wan_path` ever sees it, and silently.
+# 1200 buys ~25 days at that cadence for ~7 MB on a 256 GB field box, which is
+# not a trade worth being clever about.
+CAPTURE_MAX = 1200
 
 # Traceroute bounds. 15 hops reaches the dashboard (measured: 15 hops to
 # netmon.sbcss.net) without paying for a long walk to nowhere; -w 2 is the
@@ -674,7 +682,18 @@ def capture(
     )
     # Attach the hop bracket to the verdict when the diff supports one, so the
     # headline can say WHERE without the reader assembling it.
-    brk = next((d for d in rec["diffs"] if d.get("break_after_ip")), None)
+    #
+    # ONLY for a verdict that actually found the path broken. A traceroute that
+    # stops short is corroboration, never a conclusion (see the module docstring),
+    # and on a path whose TCP controls all SUCCEEDED it is not even that — it is
+    # ICMP policing, the exact artifact this module spends its length warning
+    # about. Without this gate a healthy capture reads "VERDICT: ok - the path is
+    # healthy from here" with "the path stops after hop 5" printed underneath, and
+    # the dashboard renders a green header above a red break box. The two codes
+    # below are the ones where the ladder established that nothing got out.
+    brk = None
+    if rec["verdict"]["code"] in (VERDICT_WAN_DOWN, VERDICT_TCP_BLOCKED):
+        brk = next((d for d in rec["diffs"] if d.get("break_after_ip")), None)
     if brk:
         rec["verdict"]["breakAfterHop"] = brk["break_after_hop"]
         rec["verdict"]["breakAfterIp"] = brk["break_after_ip"]
