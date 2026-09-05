@@ -106,6 +106,18 @@ CAPTURE_BUDGET_SEC = 150
 # Four runs was enough on Monitor1 to expose both flapping hops.
 BASELINE_SAMPLES = 4
 
+# How many hops SHORT of the baseline before we will call it a break.
+#
+# Not a magic number: we send one query per hop (`-q 1`), so a single dropped
+# probe at the tail costs exactly one hop of apparent depth, and a destination
+# that declines to answer one round costs one more. A healthy production capture
+# on Monitor1 showed hop 10 silent with hop 11 answering — had hop 11 also missed
+# its single probe, a 1-2 hop shortfall would have been headlined "PATH ENDS
+# HERE" on a perfectly good path. A real break is not subtle: the incident this
+# feature exists for truncated the path by most of its length. So require the
+# shortfall to exceed what tail-end probe loss can manufacture.
+MIN_SHORTFALL_HOPS = 2
+
 _IPV4 = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
 _HOP_LINE = re.compile(r"^\s*(\d+)\s+(.*)$")
 _FLOAT_MS = re.compile(r"([\d.]+)\s*ms")
@@ -451,7 +463,8 @@ def compare(baseline: dict[str, Any], tr: dict[str, Any]) -> dict[str, Any]:
     if tr.get("reached_at"):
         short_by = None
     else:
-        short_by = deepest_known - last_int if deepest_known > last_int else None
+        gap = deepest_known - last_int
+        short_by = gap if gap >= MIN_SHORTFALL_HOPS else None
 
     break_after_ip = None
     if short_by:

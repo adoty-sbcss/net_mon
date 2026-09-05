@@ -179,6 +179,31 @@ def test_break_is_named_only_relative_to_the_baseline():
     assert diff["break_after_ip"] == "10.2.20.254"
 
 
+def test_a_single_silent_tail_hop_is_not_a_break():
+    """The false alarm a healthy sensor would otherwise raise on itself.
+
+    We send one query per hop, so ONE dropped probe at the tail costs one hop of
+    apparent depth. A live healthy capture on Monitor1 had hop 10 silent and hop
+    11 answering; if hop 11 had also missed its single probe, the headline would
+    have read "PATH ENDS HERE" on a working path. A real break is not subtle.
+    """
+    base = _baseline_from(_HEALTHY)  # reaches hop 11
+    quiet_tail = _HEALTHY.replace("11  1.1.1.1  2.788 ms", "11  *")
+    tr = {"mode": "icmp", "dest": "1.1.1.1", "hops": _hops(quiet_tail),
+          "reached_at": None, "last_responding_hop": 10, "error": None}
+    diff = wan_path.compare(base, tr)
+    assert diff["short_by"] is None, "one silent tail hop is probe loss, not a break"
+    assert diff["break_after_ip"] is None
+
+
+def test_a_real_truncation_still_counts_as_a_break():
+    """The threshold must not swallow the case the feature exists for."""
+    base = _baseline_from(_HEALTHY)
+    tr = {"mode": "icmp", "dest": "1.1.1.1", "hops": _hops(_TRUNCATED),
+          "reached_at": None, "last_responding_hop": 3, "error": None}
+    assert wan_path.compare(base, tr)["short_by"] == 8
+
+
 def test_no_baseline_means_no_break_claim():
     """Without a known-good path, stars are uninterpretable — say nothing.
 
