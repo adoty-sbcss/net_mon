@@ -11,8 +11,18 @@ prompt_scan_cadence() {
     echo "The collector continuously monitors every active network and re-scans"
     echo "each one on the interval below. Defaults are fine for most sites."
     echo ""
+    echo "Note: the capture window is PER INTERFACE and blocks for its full length."
+    echo "On a trunk, each monitored VLAN pays it in turn — 8 VLANs x 60s = 8 min"
+    echo "per pass. Keep (VLANs x window) well under the light-capture interval."
+    echo ""
     prompt NETMON_RESCAN_INTERVAL  "Re-scan each network every (seconds, 3600=hourly)" "3600"
-    prompt NETMON_CAPTURE_SECONDS  "Capture window per scan (seconds)" "60"
+    # 60 here, in .env.example, and in config.py's capture_seconds — all three now
+    # agree. They did not before: config.py said 120. Because bin/netmon-wizard SEEDS
+    # netmon.env from .env.example on every fresh box, an explicit 60 already lands on
+    # effectively every field sensor, so 120 was the number almost nothing ran while
+    # still being what a box with no key would have used. Reconciling DOWN to 60 is
+    # the direction that matches the fleet instead of silently doubling its window.
+    prompt NETMON_CAPTURE_SECONDS  "Capture window per scan (seconds, per interface)" "60"
     prompt NETMON_POLL_INTERVAL    "Interface poll tick (seconds)" "30"
     prompt NETMON_COOLDOWN_SECONDS "Anti-flap floor between scans of same network (seconds)" "300"
 }

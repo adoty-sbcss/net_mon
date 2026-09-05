@@ -373,6 +373,10 @@ def _bounded_config_int(
 
 _CONFIG_INT_BOUNDS: dict[str, tuple[int, int]] = {
     "rescan_interval": (60, 604800),
+    # Mirrors config.Settings.capture_seconds (ge=1, le=3600). Bounds alone are not
+    # enough for this one — it also has to stay under the cadences it runs inside;
+    # see the cross-check in _validate_desired_config.
+    "capture_seconds": (1, 3600),
     "snmp_topology_max_depth": (1, 32),
     "snmp_topology_time_budget": (10, 3600),
     "snmp_topology_interval": (0, 365 * 24 * 3600),
@@ -514,13 +518,39 @@ def _validate_desired_config(data: dict) -> None:
     for key in _CONFIG_STR_KEYS:
         if key in data:
             _checked_config_str(data, key)
+    settings = get_settings()
     if "rescan_interval" in data and data.get("rescan_interval") is not None:
         requested = _bounded_config_int(
             data, "rescan_interval", minimum=60, maximum=604800
         )
-        capture_interval = get_settings().capture_interval
+        capture_interval = settings.capture_interval
         if capture_interval and requested <= capture_interval:
             raise ValueError("rescan_interval must exceed the current capture_interval")
+    if "capture_seconds" in data and data.get("capture_seconds") is not None:
+        capture_seconds = _bounded_config_int(
+            data, "capture_seconds", minimum=1, maximum=3600
+        )
+        # The capture window BLOCKS the scan for its whole length, so it has to fit
+        # inside the cadences that schedule it. A window >= capture_interval means a
+        # light pass can never finish before the next one is due; a window >=
+        # rescan_interval starves full discovery outright. Both are unambiguous
+        # nonsense, so refuse the whole generation (audited as
+        # dashboard_config_apply_failed) rather than half-apply a box into a stall.
+        if settings.capture_interval and capture_seconds >= settings.capture_interval:
+            raise ValueError(
+                "capture_seconds must be less than the current capture_interval"
+            )
+        # rescan_interval can be pushed in the SAME generation. Validate against the
+        # value this push will LEAVE on the box, not the one it is replacing —
+        # otherwise a push that raises both together is judged against a stale
+        # baseline and a legitimate pair gets rejected (or a bad one accepted).
+        rescan_interval = settings.rescan_interval
+        if data.get("rescan_interval") is not None:
+            rescan_interval = _bounded_config_int(
+                data, "rescan_interval", minimum=60, maximum=604800
+            )
+        if rescan_interval and capture_seconds >= rescan_interval:
+            raise ValueError("capture_seconds must be less than the rescan_interval")
 
 
 def _apply_config(data: dict) -> None:
@@ -546,6 +576,14 @@ def _apply_config(data: dict) -> None:
         if capture_interval and rescan_interval <= capture_interval:
             raise ValueError("rescan_interval must exceed the current capture_interval")
         mapping["NETMON_RESCAN_INTERVAL"] = str(rescan_interval)
+    # Passive-capture window per scan. Pushable so the sampling window can be tuned
+    # (or made CONSISTENT across a district) without touching each box — two sensors
+    # silently disagreeing about their own window makes any per-site comparison of
+    # capture-derived rates unsound. The cadence cross-checks ran in
+    # _validate_desired_config above, which _apply_config calls before this point.
+    if "capture_seconds" in data and data.get("capture_seconds") is not None:
+        mapping["NETMON_CAPTURE_SECONDS"] = str(_bounded_config_int(
+            data, "capture_seconds", minimum=1, maximum=3600))
     # SNMP topology crawl (pushed from the dashboard so 'spine' / 'full' + tuning
     # are flippable without SSH). scope is validated to the known set; the rest are
     # ints. Mirrors the topology settings in config.py.
@@ -1730,18 +1768,108 @@ def _maybe_webperf(url: str, token: str | None, settings) -> None:
         log.warning("could not persist webperf last-run", error=str(exc))
 
 
-def _dns_resolver() -> str | None:
-    """First nameserver from /etc/resolv.conf, for the latency 'dns' target."""
-    try:
-        for line in Path("/etc/resolv.conf").read_text().splitlines():
-            s = line.strip()
-            if s.startswith("nameserver"):
-                parts = s.split()
-                if len(parts) >= 2:
-                    return parts[1]
-    except Exception:  # noqa: BLE001
-        return None
-    return None
+# The host's resolver files, as docker-compose.yml mounts them into the collector
+# container. ORDER IS THE FIX: the collector runs `network_mode: host`, so its own
+# /etc/resolv.conf is literally the host's — and on these Ubuntu boxes that file
+# names systemd-resolved's LOCAL STUB (127.0.0.53), not a resolver on the network.
+# /run/systemd/resolve/resolv.conf is the file that lists the district's real
+# upstreams, so it is consulted first. discovery/dns_health.py reads the same three
+# paths in the same order for the same reason — keep the two lists in step.
+_RESOLV_CONF_PATHS: tuple[Path, ...] = (
+    Path("/etc/host-systemd-resolv.conf"),  # host /run/systemd/resolve/resolv.conf
+    Path("/etc/host-resolv.conf"),          # host /etc/resolv.conf
+    Path("/etc/resolv.conf"),               # container's own (== host's under network_mode: host)
+)
+
+# Anchored and single-token, so `nameserver 10.0.0.1 junk` is ignored rather than
+# half-read. The character class is shape only — it is NOT what makes this safe.
+# The guarantee that nothing can reach `ping` as an OPTION instead of the bare
+# operand it is meant to be (the hazard documented for the dashboard-pushed
+# latency_targets) is ipaddress.ip_address() in _dns_latency_target: a value that
+# is not a literal IP address is dropped, and no literal IP starts with "-".
+_NAMESERVER_RE = re.compile(r"^nameserver\s+([0-9A-Fa-f:.]+)\s*$")
+
+
+def _resolv_nameservers() -> list[str]:
+    """Every nameserver the host is configured with, best-effort, in file order.
+
+    De-duped, first occurrence wins. A missing mount is normal (a box that has not
+    recreated its container since the mounts were added), and Docker materializes a
+    bind mount whose source does not exist as an empty DIRECTORY — so read_text()
+    can raise IsADirectoryError as easily as FileNotFoundError. Both are OSError.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for path in _RESOLV_CONF_PATHS:
+        try:
+            # read_bytes + errors="replace", NOT read_text: a single non-UTF-8 byte
+            # anywhere in the file (a hand-edited /etc/resolv.conf with an accented
+            # comment) makes read_text raise UnicodeDecodeError, which is a
+            # ValueError — NOT an OSError. The reader it replaced had a blanket
+            # `except Exception`, so catching only OSError here would have turned a
+            # cosmetic byte into a failed check-in on every cycle: no config apply,
+            # no queued update, no host action, forever. Decoding leniently also
+            # keeps the good nameserver lines usable instead of discarding the file.
+            text = path.read_bytes().decode("utf-8", "replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            m = _NAMESERVER_RE.match(line.strip())
+            if not m:
+                continue
+            ip = m.group(1)
+            if ip not in seen:
+                seen.add(ip)
+                out.append(ip)
+    return out
+
+
+def _dns_latency_target() -> tuple[str | None, str | None]:
+    """Pick the latency probe's 'dns' target: (host, unavailable_reason).
+
+    `reason is None` means `host` is a real, non-loopback resolver out on the
+    district's network — ping it, the measurement means something.
+
+    A non-None `reason` means the only thing configured is a loopback stub. `host`
+    is then that stub, carried purely so the reported row still NAMES the resolver
+    the box is pointed at; it must not be pinged. Pinging 127.0.0.53 measures the
+    sensor's own loopback and reports a flawless DNS path no matter what the
+    district's resolvers are doing — worse than reporting nothing, because the
+    dashboard renders it as a healthy DNS path nobody measured.
+
+    Both None: no nameserver anywhere. Unchanged from before — no 'dns' row at all,
+    which asserts nothing. (dns_health.py covers "the box has no resolvers".)
+    """
+    stub: tuple[str, str] | None = None   # (address, what it is)
+    for ip in _resolv_nameservers():
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        # is_unspecified as well as is_loopback: 0.0.0.0 is NOT loopback by
+        # ipaddress's reckoning, but Linux routes a ping to it straight at
+        # 127.0.0.1 — so treating it as a real target would reproduce this exact
+        # bug (a flawless measurement of the box's own stack) through a different
+        # literal. Same for `::`.
+        if addr.is_loopback or addr.is_unspecified:
+            if stub is None:
+                stub = (
+                    ip,
+                    "systemd-resolved's local stub" if addr.is_loopback
+                    else "an unspecified address",
+                )
+            continue
+        return ip, None
+    if stub is not None:
+        return stub[0], (
+            f"not measured: the only nameserver configured is {stub[0]} "
+            f"({stub[1]}); no upstream resolver was visible to the collector"
+        )
+    return None, None
+
+
+# Latch for the stub-only notice below: a standing condition, logged once.
+_dns_unavailable_logged = False
 
 
 def _maybe_latency(url: str, token: str | None, settings, *, offline: bool = False) -> None:
@@ -1754,7 +1882,16 @@ def _maybe_latency(url: str, token: str | None, settings, *, offline: bool = Fal
     anything that isn't "manual" to "scheduled", so a new value would be silently
     coerced anyway. `ok=false` + `lossPct=100` on the internet targets while the
     gateway target still answers is what distinguishes a WAN outage from a dead box.
+
+    The 'dns' target is the district's real upstream resolver, NOT the local
+    systemd-resolved stub (see _dns_latency_target). What this adds over the
+    per-scan dns_health probes is a different measurement, not a duplicate one:
+    dns_health asks `dig` whether a resolver ANSWERS and answers correctly, once a
+    scan, into the hourly bundle. This is the ICMP PATH to that resolver — jitter
+    and packet loss, which dig cannot report — sampled every check-in and posted
+    live, so a degrading link to the resolver is separable from a sick resolver.
     """
+    global _dns_unavailable_logged
     if not settings.latency_enabled:
         return
     from . import latency as latency_mod
@@ -1767,15 +1904,65 @@ def _maybe_latency(url: str, token: str | None, settings, *, offline: bool = Fal
     gw = latency_mod.default_gateway()
     if gw:
         targets.append(("gateway", gw))
-    dns = _dns_resolver()
-    if dns:
-        targets.append(("dns", dns))
-    if not targets:
-        return
+    # Belt and braces. A latency target is a nicety; a check-in is the box's only
+    # control plane — if this raises, _apply_config has already run and acked its
+    # version, so the box would ack a config it never loads and skip every queued
+    # update, on every cycle. Reading a file the operator can edit must not be able
+    # to do that, so the failure is contained here as well as inside the reader.
     try:
-        results = latency_mod.probe_latency(targets, count=10)
+        dns, dns_unavailable = _dns_latency_target()
     except Exception as exc:  # noqa: BLE001
-        log.warning("latency probe failed", error=str(exc))
+        log.warning("could not determine a dns latency target", error=str(exc))
+        dns, dns_unavailable = None, None
+    if dns and not dns_unavailable:
+        targets.append(("dns", dns))
+    results: list[dict] = []
+    if targets:
+        try:
+            results = latency_mod.probe_latency(targets, count=10)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("latency probe failed", error=str(exc))
+            return
+        # probe_latency de-dupes by HOST, so on a network where the router is also
+        # the resolver the dns target collides with the gateway and its row simply
+        # vanishes. That never happened before this change (the old target was
+        # 127.0.0.53, which collides with nothing), and a row that silently
+        # disappears is the same trap as one that lies: the operator cannot tell
+        # "not measured" from "nobody looked". Re-attach the dns label to the
+        # measurement that WAS taken — same host, so the numbers are literally the
+        # RTT to the resolver — rather than pinging the identical address twice.
+        if dns and not any(r.get("label") == "dns" for r in results):
+            same = next((r for r in results if r.get("host") == dns), None)
+            if same is not None:
+                results.append({**same, "label": "dns"})
+    if dns_unavailable:
+        # The third state, spelled out on the wire: not ok, and every measurement
+        # NULL — including lossPct, which is what keeps this distinguishable from a
+        # target that was probed and lost every packet. A row that says "we did not
+        # measure this" is the whole point; a 0.1 ms loopback success was the bug.
+        # `host` still names the stub so the row identifies what the box is pointed
+        # at (and so `target` is never null on the wire).
+        results.append(
+            {
+                "label": "dns",
+                "host": dns,
+                "ok": False,
+                "latency_ms": None,
+                "jitter_ms": None,
+                "loss_pct": None,
+                "error": dns_unavailable,
+            }
+        )
+        # Latched: check-in runs every few minutes, and a stub-only box is a
+        # STANDING condition, so logging it each cycle buries the box's journal in
+        # a line that never changes. The reported row carries the state; the log is
+        # only there to explain it once. Re-arms when the condition clears.
+        if not _dns_unavailable_logged:
+            _dns_unavailable_logged = True
+            log.info("dns latency target unavailable", reason=dns_unavailable)
+    else:
+        _dns_unavailable_logged = False
+    if not results:
         return
     _report_latency(url, token, results, "scheduled", spool_only=offline)
 
@@ -2102,6 +2289,17 @@ def run_checkin() -> int:
                 "snmp_topology_max_depth": settings.snmp_topology_max_depth,
                 "snmp_topology_interval": settings.snmp_topology_interval,
                 "bundle_transport": settings.bundle_transport,
+                # Scan cadence. capture_seconds is the point: it is the sampling
+                # window every capture-derived rate is measured over, and two boxes
+                # that silently disagree about it make a per-site comparison of
+                # those rates unsound — so the effective value has to be VISIBLE,
+                # not merely settable. The other two come along because the
+                # push-time cross-checks are stated in terms of them ("must be less
+                # than the current capture_interval"); an operator who cannot see
+                # the bound cannot clear the rejection.
+                "capture_seconds": settings.capture_seconds,
+                "capture_interval": settings.capture_interval,
+                "rescan_interval": settings.rescan_interval,
             },
         },
     )

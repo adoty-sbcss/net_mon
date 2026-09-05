@@ -22,7 +22,18 @@ class Settings(BaseSettings):
 
     # Passive-capture window length per scan (full OR light): tshark listens
     # this long for DHCP/STP/ARP/broadcast on the scanned interface.
-    capture_seconds: int = Field(default=120, ge=1, le=3600, alias="NETMON_CAPTURE_SECONDS")
+    #
+    # 60, matching `.env.example` and the wizard prompt. These three disagreed:
+    # the code said 120 while `.env.example` said 60 — and since the wizard SEEDS
+    # netmon.env from that template on every fresh box (bin/netmon-wizard ->
+    # seed_env_from_example), an explicit 60 lands on effectively every field
+    # sensor whether or not the operator ever opens the opt-in cadence prompt. So
+    # 120 was the number almost nothing actually ran, and two sensors could still
+    # disagree about the window every capture-derived rate is measured over.
+    # Reconciled DOWN to the value the fleet is already running, which is also the
+    # safer duty cycle: the window is paid per interface, sequentially, so on a
+    # trunk it multiplies (see poller._warn_capture_budget).
+    capture_seconds: int = Field(default=60, ge=1, le=3600, alias="NETMON_CAPTURE_SECONDS")
     poll_interval: int = Field(default=30, ge=1, le=3600, alias="NETMON_POLL_INTERVAL")
     # The poller re-scans any active interface whose network hasn't been
     # scanned within this window. Covers both link-up (no prior scan) and

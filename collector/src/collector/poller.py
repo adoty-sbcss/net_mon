@@ -98,6 +98,57 @@ def run_poller() -> None:
             time.sleep(1)
 
 
+def _is_excluded_vlan(iface_name: str, settings) -> bool:
+    """True if this interface is a VLAN the operator excluded (NETMON_EXCLUDE_VLANS).
+
+    One predicate, used by BOTH the scan loop and the capture-budget warning below,
+    so the count the warning reasons about can never drift from the set of
+    interfaces actually scanned.
+    """
+    vlan_id, _ = _vlan_of(iface_name)
+    return vlan_id is not None and vlan_id in settings.exclude_vlan_set
+
+
+# Latched so a standing misconfiguration logs once, not every poll tick (~30s);
+# cleared when the condition clears, so a later regression is reported again.
+_capture_budget_warned = False
+
+
+def _warn_capture_budget(settings, monitored: int) -> None:
+    """Warn when the capture window, MULTIPLIED across monitored interfaces, no
+    longer fits in the light-capture interval.
+
+    capture_seconds is a per-scan number, but run_scan blocks for its full length
+    and tick() walks the interfaces sequentially — so the real cost of a pass is
+    monitored x capture_seconds. On a trunk carrying several VLANs that product
+    quietly outgrows capture_interval, and light passes then run continuously and
+    still fall behind. Nothing bounds it at config time because the VLAN count is
+    only known at runtime, which is exactly why it has to be said out loud here:
+    this product has repeatedly shipped budgets that were silently exceeded with no
+    message naming the limit that bound.
+    """
+    global _capture_budget_warned
+    if not settings.capture_interval or monitored <= 0:
+        return
+    total = monitored * settings.capture_seconds
+    if total < settings.capture_interval:
+        _capture_budget_warned = False
+        return
+    if _capture_budget_warned:
+        return
+    _capture_budget_warned = True
+    log.warning(
+        "capture window x monitored interfaces exceeds capture_interval — light "
+        "capture passes cannot keep their cadence and will run back-to-back; lower "
+        "NETMON_CAPTURE_SECONDS, exclude VLANs (NETMON_EXCLUDE_VLANS), or raise "
+        "NETMON_CAPTURE_INTERVAL",
+        monitored_interfaces=monitored,
+        capture_seconds=settings.capture_seconds,
+        total_capture_seconds=total,
+        capture_interval=settings.capture_interval,
+    )
+
+
 def tick() -> None:
     """Scan every active interface whose current network hasn't been scanned
     within the rescan interval.
@@ -139,14 +190,19 @@ def tick() -> None:
     states = iface_mod.snapshot(exclude_prefixes=settings.exclude_prefixes)
     primary = iface_mod.primary_interface()
 
+    _warn_capture_budget(
+        settings,
+        sum(1 for st in states
+            if st.has_usable_ip and not _is_excluded_vlan(st.name, settings)),
+    )
+
     for st in states:
         if not st.has_usable_ip:
             continue
 
         # Skip VLANs the operator excluded (NETMON_EXCLUDE_VLANS) — e.g. noisy or
         # irrelevant VLANs on a monitored trunk. A manual `scan` ignores this.
-        vlan_id, _ = _vlan_of(st.name)
-        if vlan_id is not None and vlan_id in settings.exclude_vlan_set:
+        if _is_excluded_vlan(st.name, settings):
             continue
 
         net_id = _network_id(st.gateway_mac, st.primary_cidr)

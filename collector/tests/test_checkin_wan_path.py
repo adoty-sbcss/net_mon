@@ -43,6 +43,13 @@ def _settings(**over):
         "snmp_topology_max_depth": 2,
         "snmp_topology_interval": 3600,
         "bundle_transport": "blob",
+        # Scan cadence, reported in the check-in's currentConfig block so the
+        # dashboard can show the box's ACTUAL sampling window (two sensors silently
+        # disagreeing about it makes per-site comparison of capture-derived rates
+        # unsound). Not what this file tests — present because run_checkin reads it.
+        "capture_seconds": 60,
+        "capture_interval": 900,
+        "rescan_interval": 3600,
         "wan_path_enabled": True,
         "wan_path_targets": "1.1.1.1,8.8.8.8",
         "wan_path_min_interval_sec": 900,
