@@ -194,6 +194,67 @@ def test_no_baseline_means_no_break_claim():
     assert diff["short_by"] is None
 
 
+def test_a_baseline_for_a_different_destination_is_not_used():
+    """Found on a live sensor, with every gate green.
+
+    A capture aimed at a target one hop away was headlined "the path stops after
+    hop 1" — not because anything was broken, but because the stored baseline had
+    been measured to 1.1.1.1, eleven hops out. Changing `wan_path_targets` would
+    have left every sensor claiming a permanent break until its next daily
+    baseline. Fail closed: no comparable baseline means no claim.
+    """
+    base = _baseline_from(_HEALTHY)  # measured to 1.1.1.1
+    tr = {"mode": "icmp", "dest": "10.8.3.254",
+          "hops": [{"hop": 1, "ip": "10.8.3.254", "rtt_ms": 0.5}],
+          "reached_at": 1, "last_responding_hop": 1, "error": None}
+    diff = wan_path.compare(base, tr)
+    assert diff["have_baseline"] is False
+    assert diff["break_after_ip"] is None, "a different destination is not a break"
+
+
+def test_reaching_the_destination_is_never_a_break():
+    """Arrival is the strongest evidence the path works — outrank the baseline.
+
+    Otherwise a route that legitimately shortened (a closer anycast node) reads
+    as a failure.
+    """
+    base = _baseline_from(_HEALTHY)
+    short = """traceroute to 1.1.1.1 (1.1.1.1), 12 hops max, 60 byte packets
+ 1  10.8.3.254  0.4 ms
+ 2  1.1.1.1  1.2 ms
+"""
+    tr = {"mode": "icmp", "dest": "1.1.1.1", "hops": _hops(short),
+          "reached_at": 2, "last_responding_hop": 2, "error": None}
+    diff = wan_path.compare(base, tr)
+    assert diff["short_by"] is None, "we got there; there is no break to report"
+    assert diff["break_after_ip"] is None
+
+
+def test_changing_the_destination_resets_that_mode_baseline():
+    """No chimera baselines: new dest + old hops would defeat the dest check.
+
+    Sibling of the bug above. `compare()` refuses a baseline built for another
+    destination — but only if the stored `dest` still says so. Merging a new
+    target's traces into the old entry rewrites `dest` while leaving the previous
+    route's `hop_ips` and depth in place, so the guard passes and the two
+    unrelated paths get diffed against each other.
+    """
+    base = _baseline_from(_HEALTHY)  # to 1.1.1.1, 11 hops deep
+    moved = wan_path.merge_baseline(
+        base,
+        [{"mode": "icmp", "dest": "9.9.9.9",
+          "hops": [{"hop": 1, "ip": "10.8.3.254", "rtt_ms": 0.4},
+                   {"hop": 2, "ip": "9.9.9.9", "rtt_ms": 3.0}],
+          "reached_at": 2, "error": None}],
+    )
+    entry = moved["modes"]["icmp"]
+    assert entry["dest"] == "9.9.9.9"
+    assert entry["deepest_responding_hop"] == 2, (
+        "depth must describe the NEW path, not inherit the old one's 11 hops"
+    )
+    assert "163.150.15.189" not in str(entry["hop_ips"]), "old route must be gone"
+
+
 def test_baseline_ignores_failed_traces():
     """A trace that errored must not teach the baseline that the path is short."""
     base = wan_path.merge_baseline(

@@ -374,6 +374,16 @@ def merge_baseline(
             continue
         mode = str(tr.get("mode"))
         entry = dict(out["modes"].get(mode) or {})
+        # If the destination changed, the accumulated hops describe a path to
+        # somewhere else. Merging into them would build a chimera — `dest` naming
+        # the new target while `hop_ips` and `deepest_responding_hop` still hold
+        # the old route — which then PASSES compare()'s destination check and
+        # reports the difference between two unrelated paths as a break. Start
+        # this mode's baseline over instead.
+        if entry.get("dest") and entry["dest"] != tr.get("dest"):
+            log.info("wan-path baseline reset: destination changed",
+                     mode=mode, was=entry["dest"], now=tr.get("dest"))
+            entry = {}
         entry["dest"] = tr.get("dest")
         hop_ips: dict[str, list[str]] = {
             str(k): list(v) for k, v in (entry.get("hop_ips") or {}).items()
@@ -409,6 +419,14 @@ def compare(baseline: dict[str, Any], tr: dict[str, Any]) -> dict[str, Any]:
     """
     mode = str(tr.get("mode"))
     entry = (baseline.get("modes") or {}).get(mode)
+    # A baseline is only meaningful for the destination it was measured against.
+    # Change `wan_path_targets` and the stored path is a path to somewhere else —
+    # comparing against it manufactures a break out of a shorter route. Caught on
+    # a live sensor: a capture aimed one hop away was headlined "the path stops
+    # after hop 1" purely because the baseline had been built to 1.1.1.1, eleven
+    # hops out. Fail closed and claim nothing until the baseline is rebuilt.
+    if entry and entry.get("dest") and tr.get("dest") and entry["dest"] != tr["dest"]:
+        entry = None
     if not entry:
         return {"mode": mode, "have_baseline": False, "short_by": None,
                 "break_after_hop": None, "break_after_ip": None, "new_ips": []}
@@ -426,7 +444,14 @@ def compare(baseline: dict[str, Any], tr: dict[str, Any]) -> dict[str, Any]:
     deepest_known = int(entry.get("deepest_responding_hop") or 0)
     last = tr.get("last_responding_hop")
     last_int = int(last) if last else 0
-    short_by = deepest_known - last_int if deepest_known > last_int else None
+    # A trace that REACHED its destination did not break, however deep the
+    # baseline happens to go. Without this, a route that legitimately shortened
+    # (a closer anycast node, a restored direct path) reads as a failure — the
+    # measurement arriving is the strongest possible evidence that it did not.
+    if tr.get("reached_at"):
+        short_by = None
+    else:
+        short_by = deepest_known - last_int if deepest_known > last_int else None
 
     break_after_ip = None
     if short_by:
