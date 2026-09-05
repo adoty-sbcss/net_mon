@@ -155,6 +155,59 @@ def test_a_nameserver_line_with_trailing_junk_is_ignored(monkeypatch, tmp_path):
     assert checkin._dns_latency_target() == ("10.5.5.5", None)
 
 
+def test_a_non_utf8_byte_does_not_kill_the_checkin(monkeypatch, tmp_path):
+    """A hand-edited /etc/resolv.conf with an accented comment is invalid UTF-8.
+    read_text() raises UnicodeDecodeError — a ValueError, NOT an OSError — which
+    would escape all the way out of run_checkin.
+
+    That matters far more than a missing latency row: _apply_config has already run
+    and acked its version by then, so the box would ack a config it never loads and
+    skip every queued update, on every cycle, until someone fixed the byte by hand
+    on a box that often has no SSH. The reader this replaced had a blanket
+    `except Exception`, so catching only OSError would have been a strict
+    regression. The good nameserver line must still be found.
+    """
+    p = tmp_path / "systemd.conf"
+    # 0x81 deliberately, NOT a Latin-1 letter like 0xE9: 0xE9 is a VALID cp1252
+    # byte, so on a Windows dev box read_text() decodes it happily and this test
+    # passes even with the fix reverted — it would only fail on the Linux/UTF-8
+    # runtime. 0x81 is undefined in cp1252 AND invalid UTF-8, so the assertion
+    # holds on both platforms. (Caught by mutation testing; the first version of
+    # this test was green against the bug it exists to pin.)
+    p.write_bytes(b"# admin note \x81\nnameserver 10.6.6.6\n")
+    monkeypatch.setattr(checkin, "_RESOLV_CONF_PATHS", (p,))
+    assert checkin._dns_latency_target() == ("10.6.6.6", None)
+
+
+def test_an_unspecified_address_is_not_a_usable_target(monkeypatch, tmp_path):
+    """0.0.0.0 is NOT is_loopback by ipaddress's reckoning, but Linux routes a ping
+    to it straight at 127.0.0.1 — so accepting it would reproduce the original bug
+    (a flawless measurement of the box's own stack) through a different literal."""
+    _paths(monkeypatch, tmp_path, systemd="nameserver 0.0.0.0\n")
+    host, reason = checkin._dns_latency_target()
+    assert host == "0.0.0.0"
+    assert reason is not None and "unspecified" in reason
+
+    # ...and it must not shadow a real upstream listed after it.
+    _paths(monkeypatch, tmp_path, systemd="nameserver 0.0.0.0\nnameserver 10.7.7.7\n")
+    assert checkin._dns_latency_target() == ("10.7.7.7", None)
+
+
+def test_the_stub_notice_is_logged_once_not_every_checkin(monkeypatch, tmp_path):
+    """Check-in runs every few minutes and a stub-only box is a STANDING condition;
+    the reported row carries the state, so the log line explains it once."""
+    _paths(monkeypatch, tmp_path, own=_STUB_RESOLV)
+    settings, _pinged, _reported = _latency_harness(monkeypatch)
+    monkeypatch.setattr(checkin, "_dns_unavailable_logged", False)
+    seen: list[str] = []
+    monkeypatch.setattr(checkin.log, "info", lambda msg, **kw: seen.append(msg))
+
+    for _ in range(4):
+        checkin._maybe_latency("https://dash", "tok", settings)
+
+    assert seen.count("dns latency target unavailable") == 1
+
+
 def test_the_production_search_order_puts_the_real_upstreams_first(monkeypatch):
     """The whole fix is the ORDER of the REAL constant, and every other test in
     this file monkeypatches that constant away — so without this one, reversing the

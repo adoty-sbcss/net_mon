@@ -12,17 +12,17 @@ prompt_scan_cadence() {
     echo "each one on the interval below. Defaults are fine for most sites."
     echo ""
     echo "Note: the capture window is PER INTERFACE and blocks for its full length."
-    echo "On a trunk, each monitored VLAN pays it in turn — 6 VLANs x 120s = 12 min"
+    echo "On a trunk, each monitored VLAN pays it in turn — 8 VLANs x 60s = 8 min"
     echo "per pass. Keep (VLANs x window) well under the light-capture interval."
     echo ""
     prompt NETMON_RESCAN_INTERVAL  "Re-scan each network every (seconds, 3600=hourly)" "3600"
-    # 120 to match collector/src/collector/config.py's capture_seconds default. These
-    # two disagreed (120 here vs 60 in code), so a box provisioned through this wizard
-    # and a box that never ran it sampled over different windows while both reported
-    # the same capture-derived rates. 120 is the reconciliation that changes NOTHING
-    # in the field: boxes carrying an explicit NETMON_CAPTURE_SECONDS keep it, and
-    # boxes without the key were already running the code default of 120.
-    prompt NETMON_CAPTURE_SECONDS  "Capture window per scan (seconds, per interface)" "120"
+    # 60 here, in .env.example, and in config.py's capture_seconds — all three now
+    # agree. They did not before: config.py said 120. Because bin/netmon-wizard SEEDS
+    # netmon.env from .env.example on every fresh box, an explicit 60 already lands on
+    # effectively every field sensor, so 120 was the number almost nothing ran while
+    # still being what a box with no key would have used. Reconciling DOWN to 60 is
+    # the direction that matches the fleet instead of silently doubling its window.
+    prompt NETMON_CAPTURE_SECONDS  "Capture window per scan (seconds, per interface)" "60"
     prompt NETMON_POLL_INTERVAL    "Interface poll tick (seconds)" "30"
     prompt NETMON_COOLDOWN_SECONDS "Anti-flap floor between scans of same network (seconds)" "300"
 }

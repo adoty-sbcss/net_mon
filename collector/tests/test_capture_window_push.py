@@ -148,16 +148,76 @@ def test_a_co_pushed_rescan_interval_that_is_still_too_small_is_refused(monkeypa
 # --- drift is visible, not just settable -------------------------------------
 
 
-def test_the_effective_window_is_reported_back(monkeypatch):
+def test_the_effective_window_is_reported_back(monkeypatch, tmp_path):
     """A setter without a readback leaves the original defect in place: you still
     cannot tell whether two sensors agree. The cross-check bounds ride along
-    because the rejection messages are stated in terms of them."""
-    import inspect
+    because the rejection messages are stated in terms of them.
 
-    src = inspect.getsource(checkin.run_checkin)
-    assert '"capture_seconds": settings.capture_seconds' in src
-    assert '"capture_interval": settings.capture_interval' in src
-    assert '"rescan_interval": settings.rescan_interval' in src
+    Asserts on the BODY actually posted. An earlier version of this test grepped
+    inspect.getsource(run_checkin) for the three literals — which would have passed
+    with all three lines commented out.
+    """
+    from tests.test_checkin_offline_latency import _harness
+
+    _harness(monkeypatch, tmp_path, checkin_ok=True)
+    bodies: list[dict] = []
+    monkeypatch.setattr(
+        checkin,
+        "_post_status",
+        lambda url, tok, body: (bodies.append(body), ({}, 200))[1],
+    )
+
+    checkin.run_checkin()
+
+    cc = bodies[0]["currentConfig"]
+    assert cc["capture_seconds"] == 120      # the fake settings' value, echoed back
+    assert cc["capture_interval"] == 900
+    assert cc["rescan_interval"] == 3600
+
+
+# --- the three defaults must agree -------------------------------------------
+
+
+def test_every_surface_declares_the_same_capture_window_default():
+    """THE defect, pinned so it cannot come back.
+
+    Three places declare this default and they must not drift:
+      * collector/src/collector/config.py  — what a box with no key runs
+      * .env.example                       — SEEDED onto netmon.env by
+        bin/netmon-wizard on every fresh box, so it is what the fleet actually runs
+      * lib/advanced.sh                    — the prompt an operator sees
+
+    config.py said 120 while the other two said 60. Because the wizard seeds the
+    template, an explicit 60 lands on effectively every field sensor whether or not
+    anyone opens the opt-in cadence prompt — so 120 was the number almost nothing
+    ran, and two sensors could still disagree about the window every
+    capture-derived rate is measured over.
+
+    Reads the real files rather than restating the number, so editing any ONE of
+    the three breaks this test.
+    """
+    from collector.config import Settings
+
+    root = Path(__file__).resolve().parents[2]
+
+    code = Settings.model_fields["capture_seconds"].default
+
+    env_line = next(
+        ln for ln in (root / ".env.example").read_text().splitlines()
+        if ln.strip().startswith("NETMON_CAPTURE_SECONDS=")
+    )
+    seeded = int(env_line.split("=", 1)[1].strip().strip('"').strip("'"))
+
+    sh_line = next(
+        ln for ln in (root / "lib" / "advanced.sh").read_text().splitlines()
+        if "prompt NETMON_CAPTURE_SECONDS" in ln
+    )
+    prompted = int(sh_line.rsplit('"', 2)[1])
+
+    assert code == seeded == prompted, (
+        f"capture window defaults disagree: config.py={code}, "
+        f".env.example={seeded}, lib/advanced.sh={prompted}"
+    )
 
 
 # --- the multiplication across VLANs ----------------------------------------

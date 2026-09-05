@@ -1802,7 +1802,15 @@ def _resolv_nameservers() -> list[str]:
     seen: set[str] = set()
     for path in _RESOLV_CONF_PATHS:
         try:
-            text = path.read_text()
+            # read_bytes + errors="replace", NOT read_text: a single non-UTF-8 byte
+            # anywhere in the file (a hand-edited /etc/resolv.conf with an accented
+            # comment) makes read_text raise UnicodeDecodeError, which is a
+            # ValueError — NOT an OSError. The reader it replaced had a blanket
+            # `except Exception`, so catching only OSError here would have turned a
+            # cosmetic byte into a failed check-in on every cycle: no config apply,
+            # no queued update, no host action, forever. Decoding leniently also
+            # keeps the good nameserver lines usable instead of discarding the file.
+            text = path.read_bytes().decode("utf-8", "replace")
         except OSError:
             continue
         for line in text.splitlines():
@@ -1832,23 +1840,36 @@ def _dns_latency_target() -> tuple[str | None, str | None]:
     Both None: no nameserver anywhere. Unchanged from before — no 'dns' row at all,
     which asserts nothing. (dns_health.py covers "the box has no resolvers".)
     """
-    stub: str | None = None
+    stub: tuple[str, str] | None = None   # (address, what it is)
     for ip in _resolv_nameservers():
         try:
             addr = ipaddress.ip_address(ip)
         except ValueError:
             continue
-        if addr.is_loopback:
+        # is_unspecified as well as is_loopback: 0.0.0.0 is NOT loopback by
+        # ipaddress's reckoning, but Linux routes a ping to it straight at
+        # 127.0.0.1 — so treating it as a real target would reproduce this exact
+        # bug (a flawless measurement of the box's own stack) through a different
+        # literal. Same for `::`.
+        if addr.is_loopback or addr.is_unspecified:
             if stub is None:
-                stub = ip
+                stub = (
+                    ip,
+                    "systemd-resolved's local stub" if addr.is_loopback
+                    else "an unspecified address",
+                )
             continue
         return ip, None
     if stub is not None:
-        return stub, (
-            f"not measured: {stub} is systemd-resolved's local stub and no upstream "
-            f"resolver was visible to the collector"
+        return stub[0], (
+            f"not measured: the only nameserver configured is {stub[0]} "
+            f"({stub[1]}); no upstream resolver was visible to the collector"
         )
     return None, None
+
+
+# Latch for the stub-only notice below: a standing condition, logged once.
+_dns_unavailable_logged = False
 
 
 def _maybe_latency(url: str, token: str | None, settings, *, offline: bool = False) -> None:
@@ -1870,6 +1891,7 @@ def _maybe_latency(url: str, token: str | None, settings, *, offline: bool = Fal
     and packet loss, which dig cannot report — sampled every check-in and posted
     live, so a degrading link to the resolver is separable from a sick resolver.
     """
+    global _dns_unavailable_logged
     if not settings.latency_enabled:
         return
     from . import latency as latency_mod
@@ -1882,7 +1904,16 @@ def _maybe_latency(url: str, token: str | None, settings, *, offline: bool = Fal
     gw = latency_mod.default_gateway()
     if gw:
         targets.append(("gateway", gw))
-    dns, dns_unavailable = _dns_latency_target()
+    # Belt and braces. A latency target is a nicety; a check-in is the box's only
+    # control plane — if this raises, _apply_config has already run and acked its
+    # version, so the box would ack a config it never loads and skip every queued
+    # update, on every cycle. Reading a file the operator can edit must not be able
+    # to do that, so the failure is contained here as well as inside the reader.
+    try:
+        dns, dns_unavailable = _dns_latency_target()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not determine a dns latency target", error=str(exc))
+        dns, dns_unavailable = None, None
     if dns and not dns_unavailable:
         targets.append(("dns", dns))
     results: list[dict] = []
@@ -1922,7 +1953,15 @@ def _maybe_latency(url: str, token: str | None, settings, *, offline: bool = Fal
                 "error": dns_unavailable,
             }
         )
-        log.info("dns latency target unavailable", reason=dns_unavailable)
+        # Latched: check-in runs every few minutes, and a stub-only box is a
+        # STANDING condition, so logging it each cycle buries the box's journal in
+        # a line that never changes. The reported row carries the state; the log is
+        # only there to explain it once. Re-arms when the condition clears.
+        if not _dns_unavailable_logged:
+            _dns_unavailable_logged = True
+            log.info("dns latency target unavailable", reason=dns_unavailable)
+    else:
+        _dns_unavailable_logged = False
     if not results:
         return
     _report_latency(url, token, results, "scheduled", spool_only=offline)
