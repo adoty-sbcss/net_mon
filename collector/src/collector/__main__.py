@@ -371,5 +371,91 @@ def cmd_console_session(broker: str, sid: str, mode: str) -> None:
     sys.exit(remote_console.run_from_env(broker, sid, mode=mode))
 
 
+@cli.command("wan-path")
+@click.option(
+    "--reason",
+    type=click.Choice(["outage", "recovery", "baseline", "manual"]),
+    default="manual",
+    help="Why this capture is being taken (recorded on the result).",
+)
+@click.option(
+    "--report", is_flag=True,
+    help="Print the most recent stored captures instead of taking a new one.",
+)
+@click.option("--limit", type=int, default=3, help="With --report: how many to show.")
+def cmd_wan_path(reason: str, report: bool, limit: int) -> None:
+    """Capture WAN-path evidence: where does the path stop, and does TCP still pass?
+
+    Normally spawned DETACHED by the check-in failure handler (PERF-7) — the
+    outage window is the only time this measurement exists to be taken, and it is
+    exactly when the dashboard cannot queue a command. `--report` renders what has
+    already been captured, which is how the diagnostic surfaces on a live box.
+    """
+    from . import checkin as checkin_mod
+    from . import latency as latency_mod
+    from . import wan_path as wan_path_mod
+
+    settings = get_settings()
+    baseline = wan_path_mod.load_baseline()
+
+    if report:
+        caps = wan_path_mod.recent_captures(max(1, limit))
+        if not caps:
+            click.echo("No WAN-path captures stored yet.")
+            click.echo(
+                "One is taken automatically when a check-in fails at the network "
+                "level, plus a daily known-good baseline."
+            )
+            return
+        for rec in caps:
+            click.echo(wan_path_mod.render(rec, baseline))
+            click.echo("")
+        return
+
+    targets = wan_path_mod.targets_from(settings)
+    if not targets:
+        click.echo("No valid WAN-path targets configured (need IP literals).")
+        sys.exit(1)
+
+    dashboard_host = None
+    dash_url = (settings.dashboard_url or checkin_mod.DEFAULT_DASHBOARD_URL or "").strip()
+    if dash_url:
+        import urllib.parse
+        dashboard_host = urllib.parse.urlparse(dash_url).hostname
+
+    if reason == "baseline":
+        # A baseline needs SEVERAL samples, not one: ECMP means a healthy path
+        # legitimately differs between runs, and a single sample would encode one
+        # arm of a load-balanced hop as "the" path — making every later healthy
+        # capture look like a reroute. Repeat sampling learns the alternatives.
+        traces = []
+        for _ in range(wan_path_mod.BASELINE_SAMPLES):
+            for mode in ("icmp", "tcp443"):
+                traces.append(wan_path_mod.trace(targets[0], mode))
+        merged = wan_path_mod.merge_baseline(baseline, traces)
+        wan_path_mod.save_baseline(merged)
+        modes = merged.get("modes") or {}
+        click.echo(
+            f"baseline updated: {len(modes)} mode(s), "
+            f"{merged.get('sample_count')} cumulative samples"
+        )
+        for name, entry in modes.items():
+            click.echo(f"  {name}: deepest responding hop "
+                       f"{entry.get('deepest_responding_hop')}")
+        return
+
+    rec = wan_path_mod.capture(
+        reason=reason,
+        controls=targets,
+        dashboard_host=dashboard_host,
+        gateway_ip=latency_mod.default_gateway(),
+        baseline=baseline,
+    )
+    path = wan_path_mod.save_capture(rec)
+    log.info("wan-path capture stored", reason=reason, path=str(path),
+             verdict=(rec.get("verdict") or {}).get("code"))
+    click.echo(wan_path_mod.render(rec, baseline))
+
+
 if __name__ == "__main__":
     cli()

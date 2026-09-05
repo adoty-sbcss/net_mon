@@ -367,6 +367,35 @@ class Settings(BaseSettings):
     # CSV of internet targets to ping; gateway + DNS resolver are added automatically.
     latency_targets: str = Field(default="1.1.1.1,8.8.8.8", alias="NETMON_LATENCY_TARGETS")
 
+    # WAN-path evidence (PERF-7). When a check-in fails at the NETWORK level, the
+    # sensor runs a bounded traceroute/TCP ladder on its own and stores the result
+    # locally for delivery on recovery — the outage window is the only time the
+    # measurement can be taken, and it is precisely when the box cannot be
+    # commanded. ON by default: it costs nothing while healthy (it only fires on a
+    # failed check-in, plus one baseline refresh a day).
+    wan_path_enabled: bool = Field(default=True, alias="NETMON_WAN_PATH_ENABLED")
+    # TCP-connect control targets. IP LITERALS ONLY, deliberately: the controls
+    # must not depend on DNS, or a dead resolver reads as a dead circuit. These are
+    # also the traceroute destination (first entry).
+    wan_path_targets: str = Field(default="1.1.1.1,8.8.8.8", alias="NETMON_WAN_PATH_TARGETS")
+    # Floor between outage captures. The ladder is ~20-150s; re-running it every
+    # 3-minute check-in through a multi-day outage would be pure noise on top of a
+    # box that is already struggling.
+    wan_path_min_interval_sec: int = Field(
+        default=900, ge=120, le=6 * 3600, alias="NETMON_WAN_PATH_MIN_INTERVAL_SEC"
+    )
+    # Hard stop on captures per UTC day, so a flapping circuit cannot spin the box.
+    wan_path_daily_cap: int = Field(
+        default=48, ge=2, le=500, alias="NETMON_WAN_PATH_DAILY_CAP"
+    )
+    # How often to refresh the known-good path while healthy. The baseline is what
+    # makes stars interpretable ("normal for this site"), so it must exist BEFORE
+    # the outage — there is no way to collect it afterwards.
+    wan_path_baseline_interval_sec: int = Field(
+        default=24 * 3600, ge=3600, le=30 * 24 * 3600,
+        alias="NETMON_WAN_PATH_BASELINE_INTERVAL_SEC",
+    )
+
     # Website / end-user experience probes (PERF-5). Per configured URL, one curl
     # captures the DNS/TCP/TLS/TTFB/total waterfall + status + speed. The URL LIST
     # rides a JSON file (checkin.WEBPERF_URLS_FILE), pushed from the dashboard's

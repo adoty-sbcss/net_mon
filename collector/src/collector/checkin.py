@@ -829,6 +829,12 @@ _DIAG_COMMANDS: dict[str, list[str]] = {
         "else echo 'no default-route interface to sniff'; fi",
     ],
     "diag-selftest": ["python", "-m", "collector", "selftest"],
+    # PERF-7: render the WAN-path evidence already captured on this box — the hop
+    # table, the verdict, and the diff against the site's known-good path. READS
+    # stored captures; it does not take a new one, so it is instant and safe to
+    # run at any time. Fixed argv, no operator input: the targets come from
+    # validated pushed config, never from the caller.
+    "diag-wan-path": ["python", "-m", "collector", "wan-path", "--report"],
 }
 
 # Ids that exist in the registries above but must NEVER run over the LIVE console —
@@ -1712,6 +1718,138 @@ def _maybe_latency(url: str, token: str | None, settings, *, offline: bool = Fal
     _report_latency(url, token, results, "scheduled", spool_only=offline)
 
 
+# --- WAN-path evidence (PERF-7) --------------------------------------------
+# A district lost its internet for a week and the product could not say what
+# broke. The measurement that would have named it can only be taken DURING the
+# outage — which is exactly when the dashboard cannot queue a command, because
+# the command channel runs over the path being diagnosed. So the decision to
+# investigate, and the investigation, both happen here on the box.
+
+
+def _spawn_wan_path(reason: str) -> bool:
+    """Start the WAN-path ladder DETACHED, and don't wait for it.
+
+    Two independent reasons it cannot run inline. The check-in service is
+    `Type=oneshot`, so anything still running when we exit is killed; and the
+    watchdog recreates the collector after a prolonged upload stall — which a WAN
+    outage produces by definition. An inline ladder would therefore be terminated
+    at random, mid-capture, precisely during the incident it exists to record.
+    Same pattern the console session uses: a new session so it reparents to PID 1.
+    """
+    import subprocess
+    import sys
+
+    # `reason` is one of our own literals below, never operator input; the argv is
+    # otherwise fixed, so this adds no injection surface.
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "collector", "wan-path", "--reason", reason],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        log.info("wan-path capture spawned", reason=reason)
+        return True
+    except Exception as exc:  # noqa: BLE001 — evidence collection is best-effort
+        log.warning("could not spawn wan-path capture", reason=reason, error=str(exc))
+        return False
+
+
+def _maybe_wan_path(settings, reason: str) -> bool:
+    """Budget-check and launch a capture. Returns True if one was started.
+
+    The budget lives in the PARENT so a flapping circuit cannot spawn a process
+    per check-in: at a 3-minute cadence an unbudgeted outage trigger would start
+    ~20 ladders an hour on a box whose network is already failing.
+    """
+    import time
+    from datetime import UTC, datetime
+
+    from . import wan_path as wan_path_mod
+
+    if not getattr(settings, "wan_path_enabled", False):
+        return False
+    state = wan_path_mod.load_state()
+    now = time.time()
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    runs_today = int(state.get("runs_today") or 0) if state.get("day") == today else 0
+    if runs_today >= int(settings.wan_path_daily_cap):
+        log.info("wan-path capture skipped: daily cap reached", cap=runs_today)
+        return False
+    # A recovery capture is the one that records the HEALED path, so it is worth
+    # a slot even if an outage capture ran moments ago; the interval floor exists
+    # to stop repeated outage captures, not to suppress the recovery snapshot.
+    if reason == "outage":
+        last = float(state.get("last_run") or 0)
+        if now - last < float(settings.wan_path_min_interval_sec):
+            return False
+    if not _spawn_wan_path(reason):
+        return False
+    state.update({"last_run": now, "day": today, "runs_today": runs_today + 1,
+                  "last_reason": reason})
+    if reason == "outage":
+        state["degraded"] = True
+    elif reason == "recovery":
+        state["degraded"] = False
+    wan_path_mod.save_state(state)
+    return True
+
+
+def _wan_path_on_failure(settings, http_status: int | None) -> None:
+    """Decide whether a failed check-in is a NETWORK fault worth investigating.
+
+    The gate is `http_status is None`, and that distinction is the whole point.
+    `_post_status` returns a status whenever the server RESPONDED — a 502 from a
+    dashboard deploy, a 401 from a rotated token. Those are application facts
+    about the dashboard, not the path, and running a ladder for them would train
+    everyone to ignore it. Only a request that never completed (DNS, TCP, TLS,
+    timeout) is a network fact.
+
+    Note this is a TCP-level control by construction: the check-in is an HTTPS
+    POST, so "it never completed" already means no new TCP session to :443
+    reached the dashboard. That is the trigger the stateful-firewall case needs —
+    a ping-based one would have said the link was fine. The capture itself then
+    re-tests against INDEPENDENT targets, because a dashboard that is simply down
+    also produces `http_status is None`, and calling that a site outage would be
+    the same misattribution in the other direction.
+    """
+    if http_status is not None:
+        return
+    _maybe_wan_path(settings, "outage")
+
+
+def _wan_path_on_success(settings) -> None:
+    """On a healthy check-in: snapshot the healed path, and keep the baseline fresh."""
+    import time
+
+    from . import wan_path as wan_path_mod
+
+    if not getattr(settings, "wan_path_enabled", False):
+        return
+    state = wan_path_mod.load_state()
+    if state.get("degraded"):
+        # We were down and now we are not: capture the path that came back, so the
+        # incident record has both ends of the break.
+        _maybe_wan_path(settings, "recovery")
+        return
+    baseline = wan_path_mod.load_baseline()
+    updated = baseline.get("updated_at")
+    if updated:
+        try:
+            from datetime import datetime as _dt
+            age = time.time() - _dt.fromisoformat(str(updated)).timestamp()
+        except Exception:  # noqa: BLE001 — unparseable timestamp: refresh it
+            age = float("inf")
+    else:
+        age = float("inf")
+    if age >= float(settings.wan_path_baseline_interval_sec):
+        # Without a known-good path on file, stars in an outage capture are not
+        # interpretable — and the baseline cannot be collected after the fact.
+        _maybe_wan_path(settings, "baseline")
+
+
 def _current_sha() -> str | None:
     """The git commit the box is running, written by scripts/auto-update.sh to a
     file the container can read (the repo itself lives on the host, not in here)."""
@@ -1892,6 +2030,11 @@ def run_checkin() -> int:
         # the result for delivery on recovery. Bounded: `ping -w` deadlines each
         # target, and it only runs when latency probing is enabled.
         _maybe_latency(url, token, settings, offline=True)
+        # PERF-7: the latency probe above records THAT the path is broken; this
+        # records WHERE. It only fires when the request never completed (see
+        # _wan_path_on_failure) and runs detached, so it neither delays this exit
+        # nor dies with it.
+        _wan_path_on_failure(settings, http_status)
         return 1
 
     config_changed = False
@@ -1960,6 +2103,10 @@ def run_checkin() -> int:
     _maybe_scheduled_speedtest(url, token, settings)
     _maybe_latency(url, token, settings)
     _maybe_webperf(url, token, settings)
+    # PERF-7: capture the healed path after an outage, and keep the known-good
+    # baseline fresh. The baseline is what makes an outage capture readable at
+    # all, and it cannot be collected retrospectively.
+    _wan_path_on_success(settings)
 
     # Exit precedence: update (11) already recreates + may host-reboot via the
     # update path, so it wins; then host actions (12); then a plain config
