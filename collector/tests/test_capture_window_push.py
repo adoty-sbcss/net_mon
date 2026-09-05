@@ -156,21 +156,53 @@ def test_the_effective_window_is_reported_back(monkeypatch, tmp_path):
     Asserts on the BODY actually posted. An earlier version of this test grepped
     inspect.getsource(run_checkin) for the three literals — which would have passed
     with all three lines commented out.
-    """
-    from tests.test_checkin_offline_latency import _harness
 
-    _harness(monkeypatch, tmp_path, checkin_ok=True)
+    Self-contained on purpose: importing the sibling test module's harness
+    (`from tests....`) works locally but not under CI's `cd collector && pytest
+    tests -q`, where `tests` is not an importable package.
+    """
+    settings = _settings(
+        dashboard_url="https://dash", enroll_token="tok", update_channel="stable",
+        latency_enabled=False, snmp_enabled=False, snmp_communities="",
+        snmp_exclude="", snmp_topology_enabled=False, snmp_topology_scope="",
+        snmp_topology_max_depth=2, snmp_topology_interval=3600,
+        bundle_transport="blob",
+    )
+    for name, stub in [
+        ("get_settings", lambda: settings),
+        ("_current_token", lambda _s: "tok"),
+        ("wait_for_db", lambda *a, **k: None),
+        ("_read_applied_version", lambda: 7),
+        ("_local_net", lambda: ("10.8.2.100", "eth0", "10.8.2.0/24")),
+        ("_current_sha", lambda: "abc123"),
+        ("_last_update", lambda: None),
+        ("_last_host_action", lambda: None),
+        ("_interfaces", lambda: []),
+        ("_note_checkin_auth", lambda *a, **k: None),
+        ("_maybe_scheduled_iperf", lambda *a, **k: None),
+        ("_maybe_scheduled_speedtest", lambda *a, **k: None),
+        ("_maybe_webperf", lambda *a, **k: None),
+        ("_maybe_latency", lambda *a, **k: None),
+    ]:
+        monkeypatch.setattr(checkin, name, stub)
+    monkeypatch.setattr(checkin.host_metrics_mod, "collect", lambda: {})
+
     bodies: list[dict] = []
     monkeypatch.setattr(
         checkin,
         "_post_status",
-        lambda url, tok, body: (bodies.append(body), ({}, 200))[1],
+        lambda url, tok, body: (
+            bodies.append(body), ({"config": None, "commands": []}, 200)
+        )[1],
     )
 
     checkin.run_checkin()
 
     cc = bodies[0]["currentConfig"]
-    assert cc["capture_seconds"] == 120      # the fake settings' value, echoed back
+    # The fake settings' values, echoed back — deliberately NOT the real defaults,
+    # so this proves the block reports what the box is running rather than a
+    # constant that happens to match.
+    assert cc["capture_seconds"] == 120
     assert cc["capture_interval"] == 900
     assert cc["rescan_interval"] == 3600
 
