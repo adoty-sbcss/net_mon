@@ -85,12 +85,16 @@ _UPLOAD_BLOCK_MAX = 25_000_000  # /__up serves 100MB; 25MB bounds one request's 
 _UPLOAD_TARGET_SEC = 1.0
 
 
-def _empty(provider: str, error: str, status: str = STATUS_FAILED) -> dict:
+def _empty(provider: str, error: str, status: str = STATUS_FAILED, **raw: object) -> dict:
+    # `raw` is carried even on the early returns: it is the only structured place
+    # a status code survives, and a reader that has to regex the message text to
+    # find out why a probe stopped is a reader that will eventually get it wrong.
     return {
         "ok": False,
         "status": status,
         "provider": provider,
         "error": error[:500],
+        "raw": dict(raw) or None,
     }
 
 
@@ -164,6 +168,8 @@ def run_cloudflare(duration: int = 5, streams: int = 16, timeout: int = 60) -> d
             f"latency probe refused by speed.cloudflare.com "
             f"(HTTP {exc.code}): {_describe(exc)}",
             STATUS_UNAVAILABLE,
+            latency_http_status=exc.code,
+            latency_samples=len(samples),
         )
     except Exception as exc:  # noqa: BLE001
         return _empty("cloudflare", f"latency probe failed: {exc}")
@@ -216,17 +222,23 @@ def run_cloudflare(duration: int = 5, streams: int = 16, timeout: int = 60) -> d
                     r.read()
                 sent += size
                 # Re-aim each request at ~1 s of THIS stream's own rate, measured
-                # CUMULATIVELY rather than from the last request alone. The
-                # per-request ratio compounds: where fixed overhead (RTT, TLS)
-                # dominates a small block, every step multiplies the size again
-                # and it runs away to the cap — worst on exactly the high-latency,
-                # low-bandwidth links that can least afford a 25MB request. A
-                # running average self-corrects instead: an over-large block
-                # takes proportionally longer, which pulls the next one back down.
+                # CUMULATIVELY. A per-request ratio converges too (its own
+                # transfer time is in the denominator, so it settles at a stable
+                # fixed point rather than growing without bound); the running
+                # average is preferred only because it is not thrown by ONE
+                # anomalous sample — a single fast or stalled request moves it a
+                # little instead of resizing the next request outright.
+                #
+                # The remaining window is part of the target: without it a link
+                # whose rate COLLAPSES mid-run keeps the block sized for the old
+                # rate, and the last request can run for a minute past `dur`,
+                # delaying the check-in behind it. Capping by what is left bounds
+                # the overshoot to ~1 s of measured rate on any profile.
                 rate = sent / max(time.monotonic() - began, 0.001)
+                window = max(0.0, deadline - time.monotonic())
                 size = max(
                     _UPLOAD_BLOCK_MIN,
-                    min(_UPLOAD_BLOCK_MAX, int(rate * _UPLOAD_TARGET_SEC)),
+                    min(_UPLOAD_BLOCK_MAX, int(rate * min(_UPLOAD_TARGET_SEC, window))),
                 )
         except Exception as exc:  # noqa: BLE001
             return sent, _describe(exc), _http_code(exc)
@@ -246,14 +258,22 @@ def run_cloudflare(duration: int = 5, streams: int = 16, timeout: int = 60) -> d
         total = sum(n for n, _, _ in outcomes)
         errs = [(e, code) for _, e, code in outcomes if e]
         mbps = round(total * 8 / 1e6 / elapsed, 3)
-        first_error, first_code = errs[0] if errs else (None, None)
-        # Surface an HTTP status if ANY stream saw one: it is the most useful
-        # thing in the row, and streams do not all fail the same way.
-        for err, code in errs:
-            if code is not None:
-                first_error, first_code = err, code
-                break
         refused = sum(1 for _, code in errs if code is not None)
+        # The reported error must match the VERDICT the caller will reach, or the
+        # row contradicts itself. When refusal explains everything the run is
+        # `unavailable` and the HTTP status is the story; when it does not, the
+        # run is `failed` on the strength of a TRANSPORT error, so that is the
+        # one to name — surfacing a lone 429 there would print "429" beside a
+        # verdict of "the link broke" and send the reader back to square one.
+        # `refused` and the status code stay in `raw` either way.
+        transport = [(e, c) for e, c in errs if c is None]
+        refusals = [(e, c) for e, c in errs if c is not None]
+        preferred = refusals if refused and refused == len(errs) else transport or refusals
+        first_error, first_code = preferred[0] if preferred else (None, None)
+        # The status code is worth surfacing even when a transport error names
+        # the failure, so keep the first one seen anywhere in the direction.
+        if first_code is None and refusals:
+            first_code = refusals[0][1]
         return mbps, total, len(errs), refused, first_error, first_code
 
     try:

@@ -193,6 +193,51 @@ def test_mixed_refusal_and_reset_is_failed_not_unavailable(monkeypatch):
     assert res["raw"]["download_streams_failed"] == 4
 
 
+def test_one_direction_refused_and_the_other_broken_is_failed(monkeypatch):
+    """ACROSS directions, same rule as within one: a refusal has to explain the
+    WHOLE run. Download refused, upload reset — the reset is real evidence about
+    the link, so the run is `failed`. Without this the cross-direction combiner
+    could be `any` instead of `all` and nothing would notice."""
+    _install(monkeypatch, down=_rate_limited, up=_blocked_reset)
+
+    res = speedtest.run_cloudflare(duration=2, streams=1)
+
+    assert res["status"] == "failed", (
+        "an upload that was RESET is evidence about the network; a refused "
+        "download alongside it must not downgrade the run to 'not measured'"
+    )
+    assert res["raw"]["download_http_status"] == 429
+    assert res["raw"]["upload_http_status"] is None
+
+
+def test_the_message_names_the_transport_error_not_a_lone_refusal(monkeypatch):
+    """When the verdict is `failed` because one stream was RESET, the reported
+    error must be that reset. Surfacing a lone 429 next to a verdict of "the
+    link broke" contradicts itself and sends the reader back to square one."""
+    lock = threading.Lock()
+    calls = {"n": 0}
+
+    def _first_is_refused():
+        with lock:
+            calls["n"] += 1
+            n = calls["n"]
+        if n == 1:
+            _rate_limited()
+        _blocked_reset()
+
+    _install(monkeypatch, down=_first_is_refused, up=_serves_data)
+
+    res = speedtest.run_cloudflare(duration=2, streams=4)
+
+    assert res["status"] == "failed"
+    assert "ConnectionResetError" in res["error"], (
+        "the failure the verdict rests on is the reset, so name the reset"
+    )
+    assert "429" not in res["error"]
+    # ...but the status code is not lost; it stays queryable in `raw`.
+    assert res["raw"]["download_http_status"] == 429
+
+
 def test_zero_bytes_with_no_exception_stays_failed(monkeypatch):
     """The stalled-setup path (test_speedtest_honesty.py): nothing raised, so
     nothing was REFUSED either. Guarding on `refused > 0` is what keeps this out
@@ -297,6 +342,61 @@ def test_upload_grows_its_block_so_a_fast_link_makes_few_requests(monkeypatch):
         f"would have needed {at_old_size:.0f} — the request rate is the thing "
         f"that tripped the rate limiter"
     )
+
+
+def test_a_block_is_never_started_that_cannot_fit_the_remaining_window(monkeypatch):
+    """Sizing at one second of the measured rate is not enough on its own: with
+    0.2 s of the window left, a full-size block still commits the stream to a
+    full second of transfer and the whole run waits for it. On a link that has
+    slowed since the estimate was taken that tail is longer still, and the
+    check-in behind it is delayed. So the target is the LESSER of one second and
+    what is actually left.
+
+    Runs on a VIRTUAL clock that advances only as the fake link moves bytes:
+    block size is a pure function of rate and remaining window, so the test is
+    too. (An earlier cut used real sleeps and passed alone but failed inside the
+    full suite — a timing-flaky test is worse than no test.)
+    """
+    rate_bps = 8_000_000  # 64 Mbps per stream — fast enough to leave the floor
+    dur = 3
+    now = {"t": 1000.0}
+    # `time` is imported lazily inside run_cloudflare, so it resolves
+    # `time.monotonic` off the stdlib module on every use — patch it there.
+    # `time.sleep` is untouched, so nothing else in the suite is affected.
+    monkeypatch.setattr(time, "monotonic", lambda: now["t"])
+
+    started: list[tuple[float, int]] = []  # (window remaining at start, size)
+    up_deadline: list[float] = []
+
+    def _urlopen(req, timeout=None, context=None, **_kw):  # noqa: ANN001
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "bytes=0" in url:
+            return _FakeResp()
+        if "__down" in url:
+            now["t"] += 0.5  # keep the download phase finite on a virtual clock
+            return _FakeResp([b"x" * 131072])
+        # The upload window opens at the first upload request.
+        if not up_deadline:
+            up_deadline.append(now["t"] + dur)
+        n = len(req.data)
+        started.append((max(0.0, up_deadline[0] - now["t"]), n))
+        now["t"] += n / rate_bps
+        return _FakeResp()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    speedtest.run_cloudflare(duration=dur, streams=1)
+
+    assert len(started) > 2, "need a few requests to see the ramp and the tail"
+    for remaining, size in started:
+        budget = rate_bps * min(speedtest._UPLOAD_TARGET_SEC, remaining)
+        assert size <= max(speedtest._UPLOAD_BLOCK_MIN, budget), (
+            f"started a {size}-byte block with {remaining:.2f}s of the window "
+            f"left — at {rate_bps} B/s that runs {size / rate_bps:.1f}s, "
+            f"{size / rate_bps - remaining:.1f}s past the deadline"
+        )
+    # And the cap must actually have bitten: some request was shrunk by the
+    # window rather than by the one-second target.
+    assert any(rem < speedtest._UPLOAD_TARGET_SEC for rem, _ in started)
 
 
 def test_a_slow_upload_never_grows_past_a_second_of_its_own_rate(monkeypatch):

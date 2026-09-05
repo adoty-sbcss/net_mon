@@ -157,6 +157,24 @@ def test_the_cooldown_outlasts_a_short_configured_interval(monkeypatch, tmp_path
     assert calls["ran"] == 1, "the interval elapsed, but the cooldown must still hold"
 
 
+def test_the_status_reaches_the_dashboard_post(monkeypatch, tmp_path):
+    """The whole point of the third state is that the DASHBOARD can tell a
+    refusal from an outage. If `status` never makes it into the POST body, every
+    surface downstream is still guessing from `ok` alone."""
+    monkeypatch.setattr(checkin, "SPEEDTEST_LAST_FILE", tmp_path / "last")
+    monkeypatch.setattr(checkin, "SPEEDTEST_COOLDOWN_FILE", tmp_path / "cool")
+    sent: dict = {}
+    monkeypatch.setattr(
+        checkin, "_post_result", lambda _u, _t, path, body: sent.update(path=path, **body)
+    )
+
+    checkin._report_speedtest("https://dash", "tok", REFUSED, "scheduled")
+
+    assert sent["path"] == "/api/sensor/speedtest-result"
+    assert sent["status"] == "unavailable"
+    assert sent["ok"] is False
+
+
 def test_a_disabled_sensor_never_probes(monkeypatch, tmp_path):
     calls = _arrange(monkeypatch, tmp_path, MEASURED)
 
