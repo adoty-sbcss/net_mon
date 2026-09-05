@@ -342,3 +342,142 @@ def test_render_falls_back_to_the_embedded_baseline(monkeypatch):
     out = wan_path.render(rec)
     assert "198.51.100.7" in out
     assert "no baseline captured yet" not in out
+
+# ---------------------------------------------------------------------------
+# The marker's ordering assumption
+# ---------------------------------------------------------------------------
+
+
+def test_a_foreign_filename_cannot_strand_the_queue(monkeypatch, tmp_path):
+    """The marker is a filename compared with `>`, so a name outside the
+    `{ns:020d}.json` pattern breaks the ordering it depends on: `notes.json`
+    sorts ABOVE every numeric name, and once stepped over it would strand every
+    future capture below it, permanently and silently."""
+    calls = _stage(monkeypatch, tmp_path,
+                   ["00000000000000000001.json", "00000000000000000002.json"],
+                   [200, 200])
+    (tmp_path / "captures" / "notes.json").write_text(json.dumps(_capture()))
+    checkin._report_wan_path("https://dash", "tok")
+    assert len(calls) == 2
+    assert _marker(tmp_path) == "00000000000000000002.json"
+    # …and a capture written afterwards is still delivered.
+    calls.clear()
+    (tmp_path / "captures" / "00000000000000000003.json").write_text(json.dumps(_capture()))
+    checkin._report_wan_path("https://dash", "tok")
+    assert len(calls) == 1
+
+
+def test_only_conforming_names_are_treated_as_captures(monkeypatch, tmp_path):
+    calls = _stage(monkeypatch, tmp_path, ["00000000000000000001.json"], [200, 200])
+    for junk in ("baseline.json", "state.json", "1.json", "0000000000000000000a.json"):
+        (tmp_path / "captures" / junk).write_text(json.dumps(_capture()))
+    checkin._report_wan_path("https://dash", "tok")
+    assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Retention has to clear the incident this feature exists for
+# ---------------------------------------------------------------------------
+
+
+def test_capture_retention_outlasts_the_motivating_outage():
+    """Nothing is delivered DURING an outage — the dashboard is the unreachable
+    thing — so captures accumulate at the daily cap and the cap is what decides
+    whether the ONSET survives to be reported. The Cucamonga incident ran ~7
+    days; at 300 captures / 48 per day the first ~36 would have been evicted
+    before `_report_wan_path` ever saw them."""
+    daily_cap = 48  # config.py wan_path_daily_cap
+    days_covered = wan_path.CAPTURE_MAX / daily_cap
+    assert days_covered > 8, (
+        f"CAPTURE_MAX={wan_path.CAPTURE_MAX} only covers {days_covered:.1f} days "
+        f"of outage at {daily_cap}/day; the incident this exists for ran ~7"
+    )
+
+
+# ---------------------------------------------------------------------------
+# A break is never attached to a verdict that did not find one
+# ---------------------------------------------------------------------------
+
+
+def _stub_probes(monkeypatch, *, controls_ok: bool, icmp_hops: list, tcp_hops: list,
+                 icmp_internet: bool = True):
+    # The gateway always answers; whether ICMP reaches the INTERNET is what
+    # separates tcp_blocked from wan_down, so it is a separate knob.
+    def fake_ping(host, count=3, timeout=2):
+        alive = True if host == "10.8.3.254" else icmp_internet
+        return {"target": host, "alive": alive, "rtt_ms": 0.4 if alive else None,
+                "loss_pct": 0.0 if alive else 100.0,
+                "error": None if alive else "no reply"}
+
+    monkeypatch.setattr(wan_path, "ping", fake_ping)
+    monkeypatch.setattr(wan_path, "tcp_connect",
+                        lambda h, p=443, timeout=5.0: {"target": h, "port": p,
+                                                       "ok": controls_ok, "ms": 1.0,
+                                                       "error": None if controls_ok else "timed out"})
+    monkeypatch.setattr(wan_path, "dns_resolves",
+                        lambda n, timeout=5.0: {"name": n, "ok": True, "ms": 1.0, "error": None})
+
+    def fake_trace(dest, mode="icmp", **k):
+        hops = icmp_hops if mode == "icmp" else tcp_hops
+        last = max((h["hop"] for h in hops if h["ip"]), default=None)
+        return {"mode": mode, "dest": dest, "hops": hops, "reached_at": None,
+                "last_responding_hop": last, "error": None}
+
+    monkeypatch.setattr(wan_path, "trace", fake_trace)
+
+
+_DEEP_BASELINE = {
+    "updated_at": "2026-09-05T17:56:33+00:00",
+    "sample_count": 8,
+    "modes": {
+        m: {"dest": "192.0.2.1",
+            "hop_ips": {str(n): [f"198.51.100.{n}"] for n in range(1, 12)},
+            "deepest_responding_hop": 11}
+        for m in ("icmp", "tcp443")
+    },
+}
+# A trace that stops at hop 4 — 7 hops short of the baseline, so `compare()`
+# genuinely establishes a break.
+_SHORT_HOPS = [{"hop": n, "ip": f"198.51.100.{n}", "rtt_ms": 1.0} for n in range(1, 5)]
+
+
+def test_a_healthy_verdict_never_carries_a_break(monkeypatch):
+    """The case that would print "VERDICT: ok" above "the path stops after hop 4".
+
+    Every TCP control succeeds, so the internet is demonstrably reachable — but
+    the ICMP trace was policed short, which `compare()` reports as a shortfall.
+    Traceroute corroborates and never concludes, so the verdict must not grow a
+    break out of it."""
+    _stub_probes(monkeypatch, controls_ok=True, icmp_hops=_SHORT_HOPS, tcp_hops=_SHORT_HOPS)
+    rec = wan_path.capture(reason="manual", controls=["192.0.2.1"],
+                           gateway_ip="10.8.3.254", baseline=_DEEP_BASELINE)
+    assert rec["verdict"]["code"] == "ok"
+    # The diff still RECORDS the shortfall — the evidence is not discarded…
+    assert any(d.get("break_after_ip") for d in rec["diffs"])
+    # …it is simply not promoted to a conclusion.
+    assert "breakAfterIp" not in rec["verdict"]
+    assert "breakAfterHop" not in rec["verdict"]
+    assert "stops after hop" not in wan_path.render(rec, _DEEP_BASELINE)
+
+
+def test_a_wan_down_verdict_does_carry_its_break(monkeypatch):
+    """The control: the gate must not have silenced the case this feature is for."""
+    _stub_probes(monkeypatch, controls_ok=False, icmp_hops=_SHORT_HOPS,
+                 tcp_hops=_SHORT_HOPS, icmp_internet=False)
+    rec = wan_path.capture(reason="outage", controls=["192.0.2.1"],
+                           gateway_ip="10.8.3.254", baseline=_DEEP_BASELINE)
+    assert rec["verdict"]["code"] == "wan_down"
+    assert rec["verdict"]["breakAfterHop"] == 4
+    assert rec["verdict"]["breakAfterIp"] == "198.51.100.4"
+    assert "the path stops after hop 4" in wan_path.render(rec, _DEEP_BASELINE)
+
+
+def test_a_tcp_blocked_verdict_also_carries_its_break(monkeypatch):
+    """The stateful-firewall case: ICMP crosses, no new TCP session completes.
+    The path IS broken for users, so the hop bracket is licensed here too."""
+    _stub_probes(monkeypatch, controls_ok=False, icmp_hops=_SHORT_HOPS,
+                 tcp_hops=_SHORT_HOPS, icmp_internet=True)
+    rec = wan_path.capture(reason="outage", controls=["192.0.2.1"],
+                           gateway_ip="10.8.3.254", baseline=_DEEP_BASELINE)
+    assert rec["verdict"]["code"] == "tcp_blocked"
+    assert rec["verdict"]["breakAfterIp"] == "198.51.100.4"
