@@ -657,6 +657,17 @@ def capture(
             if baseline:
                 rec["diffs"].append(compare(baseline, tr))
 
+    # Embed the baseline the diffs were computed against. A capture is an
+    # EVIDENCE RECORD, and "the baseline gets further" is only readable next to
+    # the baseline it refers to — the reader is usually somewhere else entirely
+    # (the dashboard), long after the fact, by which time the live baseline has
+    # merged more samples and may describe a different path. Storing it here
+    # freezes the comparison the verdict was actually made against, so a later
+    # refresh cannot quietly rewrite the history of an incident. It is ~1.5 KB
+    # against a 2-6 KB capture, and `render()` still prefers an explicit argument
+    # so nothing about the on-box output changes.
+    rec["baseline"] = baseline or None
+
     rec["verdict"] = decide(
         rec["gateway"], rec["controls"], rec["dashboardControl"],
         rec["dns"], icmp_ok,
@@ -740,7 +751,14 @@ def recent_captures(limit: int = 5) -> list[dict[str, Any]]:
 
 
 def render(rec: dict[str, Any], baseline: dict[str, Any] | None = None) -> str:
-    """Render one capture as a hop table with a verdict and a baseline diff."""
+    """Render one capture as a hop table with a verdict and a baseline diff.
+
+    `baseline` defaults to the one EMBEDDED in the capture, which is the baseline
+    the diffs were actually computed against. Passing one explicitly still wins,
+    so `--report` keeps showing the box's current known-good path.
+    """
+    if baseline is None:
+        baseline = rec.get("baseline") or None
     lines: list[str] = []
     v = rec.get("verdict") or {}
     lines.append(f"WAN PATH  {rec.get('startedAt')}  (reason: {rec.get('reason')})")

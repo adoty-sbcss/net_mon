@@ -1975,6 +1975,107 @@ def _maybe_latency(url: str, token: str | None, settings, *, offline: bool = Fal
 # investigate, and the investigation, both happen here on the box.
 
 
+# --- PERF-7 capture delivery -------------------------------------------------
+# A capture is written by a DETACHED child during an outage, so the parent that
+# reports it is a later check-in — one that, by definition, succeeded. That is
+# the whole reason this does not go through the result spool:
+#
+#   * The captures ARE the durable queue. wan_path.save_capture keeps 300 of them
+#     on disk, atomically written and evicted oldest-first. Copying each one into
+#     the spool would duplicate a durable store that already exists.
+#   * _drain_result_spool stops at the FIRST payload the dashboard will not take
+#     and returns, and a payload rejected 4xx is never unlinked — so one bad
+#     capture at the head of the oldest-first queue would stall redelivery of the
+#     LATENCY rows behind it, indefinitely. Those rows are the record of the
+#     outage itself. A 6 KB document with a shape the route dislikes is not worth
+#     that risk, and keeping captures out of the shared spool removes it entirely.
+#
+# So: report only from the success path, where the dashboard is known reachable
+# (no burning 25s urllib timeouts against a box we already know is unreachable),
+# track delivery with a marker file of our own, and bound the work per run.
+WAN_PATH_REPORTED_FILE = Path("/var/lib/netmon/wan-path/reported.json")
+# Captures are rare (an outage, a recovery, one daily baseline), so a small cap
+# still drains a multi-day backlog within a few check-ins.
+WAN_PATH_REPORT_PER_RUN = 5
+# Statuses that mean "the dashboard will NEVER accept this record". Advancing
+# past those is deliberate: otherwise one malformed capture wedges every later
+# one forever, which is exactly the spool's failure mode we are avoiding.
+# 401/403 are NOT here — a bad token is a fact about our credential, and skipping
+# on it would silently discard the whole backlog during a rotation.
+_WAN_PATH_PERMANENT_REJECT = {400, 413, 422}
+
+
+def _report_wan_path(url: str, token: str | None) -> None:
+    """POST WAN-path captures the dashboard has not seen yet (PERF-7).
+
+    Delivery state is a marker file holding the newest capture FILENAME already
+    accepted. Names are `{time.time_ns():020d}.json`, zero-padded, so a string
+    compare is a chronological one and a single scalar orders the whole queue.
+
+    The marker lives in its own file rather than in wan_path's `state.json`
+    because that file is read-modify-written by BOTH this process and the
+    detached capture child; a lost update there would re-send the backlog. It is
+    also why the dashboard route dedups on (sensor, startedAt) — the two
+    protections are independent, and either alone would do.
+    """
+    from . import wan_path as wan_path_mod
+
+    try:
+        pending = sorted(wan_path_mod.CAPTURE_DIR.glob("*.json"))
+    except Exception:  # noqa: BLE001 — no capture dir yet is the normal case
+        return
+    if not pending:
+        return
+
+    try:
+        marker = json.loads(WAN_PATH_REPORTED_FILE.read_text())
+        last = str(marker.get("last_reported") or "")
+    except Exception:  # noqa: BLE001 — missing/corrupt marker: start from the top
+        last = ""
+
+    fresh = [p for p in pending if p.name > last]
+    if not fresh:
+        return
+
+    sent = 0
+    for path in fresh[:WAN_PATH_REPORT_PER_RUN]:
+        try:
+            rec = json.loads(path.read_text())
+        except Exception:  # noqa: BLE001 — unreadable capture: step over it
+            log.warning("wan-path capture unreadable; skipping", path=str(path))
+            last = path.name
+            continue
+        _payload, status = _post_status(
+            f"{url}/api/sensor/wan-path-result", token, rec
+        )
+        if status is not None and 200 <= status < 300:
+            last = path.name
+            sent += 1
+            continue
+        if status in _WAN_PATH_PERMANENT_REJECT:
+            # Record the loss rather than retrying it forever behind the queue.
+            log.warning(
+                "dashboard rejected a wan-path capture; skipping it",
+                path=str(path), status=status,
+            )
+            last = path.name
+            continue
+        # Network failure, 5xx, or an auth problem: stop and retry next check-in.
+        # The capture stays on disk, so nothing is lost by waiting.
+        log.info("wan-path delivery paused", status=status, remaining=len(fresh))
+        break
+
+    try:
+        _write_file_atomic(
+            WAN_PATH_REPORTED_FILE, json.dumps({"last_reported": last}), 0o644
+        )
+    except Exception as exc:  # noqa: BLE001 — a lost marker costs a re-send the
+        # dashboard dedups away, not data. Never fatal to a check-in.
+        log.warning("could not record wan-path delivery marker", error=str(exc))
+    if sent:
+        log.info("wan-path captures reported", count=sent)
+
+
 def _spawn_wan_path(reason: str) -> bool:
     """Start the WAN-path ladder DETACHED, and don't wait for it.
 
@@ -2382,6 +2483,11 @@ def run_checkin() -> int:
     # Redeliver any perf results that failed to POST on an earlier cycle (e.g. a
     # dashboard deploy restart) before running this cycle's scheduled probes.
     _drain_result_spool(url, token)
+    # PERF-7: ship any WAN-path captures the box took while it could not reach us.
+    # This is the ONLY place they are sent, and it is on the success path on
+    # purpose — the capture exists precisely because the dashboard was
+    # unreachable, so there is no point attempting delivery until it isn't.
+    _report_wan_path(url, token)
 
     # Scheduled iperf + public speedtests + latency + web-performance probes piggyback
     # on check-in.
