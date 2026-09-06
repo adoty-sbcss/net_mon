@@ -20,7 +20,10 @@ from the check-in loop using pushed config (NETMON_SPEEDTEST_*).
 
 A run ends in one of THREE states — ok / failed / unavailable — because the
 provider refusing us (HTTP 429) and the district's link being broken are
-different facts that looked identical for a week. See STATUS_* below.
+different facts that looked identical for a week. A slot that was never attempted
+(the check-in it was scheduled behind got no reply at all) is a fourth, recorded
+state — not_attempted — because silence on this channel was being read as a
+sensor problem. See STATUS_* below.
 """
 from __future__ import annotations
 
@@ -28,9 +31,10 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-# --- the three outcomes of a speed test ------------------------------------
+# --- the outcomes of a speed test ------------------------------------------
 # A probe has THREE possible endings, not two, and collapsing the third is what
-# produced a week of false diagnosis at Cucamonga (2026-08/09):
+# produced a week of false diagnosis at Cucamonga (2026-08/09) (a fourth state,
+# for the slot that was never probed at all, follows them):
 #
 #   ok           we measured the link.
 #   failed       we tried and the transfer genuinely broke (reset, timeout,
@@ -56,6 +60,50 @@ log = structlog.get_logger(__name__)
 STATUS_OK = "ok"
 STATUS_FAILED = "failed"
 STATUS_UNAVAILABLE = "unavailable"
+
+# ...and a FOURTH, for the slot that was never attempted at all.
+#
+#   not_attempted  the scheduled slot came due during a check-in that got no
+#                  reply at all, so no probe was made. Not a measurement, not a
+#                  refusal, and deliberately NOT a claim about the link either —
+#                  the latency probe is what measures that.
+#
+# This exists because the outage case produced SILENCE on this channel. The
+# scheduler lives below run_checkin's failure early-return, so during a WAN outage
+# the day's speed samples went 4 -> 3 -> 0 with nothing recorded, and zero rows is
+# the one thing a reader cannot interpret: the dashboard's nightly prompt reads
+# "no samples and no refusals" as "nothing arrived at all — a sensor or upload
+# question, not a bandwidth one", and points the tech at a perfectly healthy box.
+# The same GAP-not-a-ROW mistake the latency probe already fixed (checkin.py's
+# _maybe_latency(offline=True)), one channel over.
+#
+# Why it is not one of the three above:
+#   * `ok`          — obviously not; nothing was measured.
+#   * `failed`      — that means "we TRIED and the transfer broke", which is
+#                     evidence about the link. We did not try. Asserting a
+#                     measurement we never took is the house rule's exact
+#                     prohibition, even when the conclusion would be right.
+#   * `unavailable` — that means the PROVIDER refused us, so the row says nothing
+#                     about the district's link. Here the provider was never
+#                     contacted, and reusing it would put "Cloudflare rate-limited
+#                     us" in front of a tech whose WAN is down — the wrong thing to
+#                     point at, which is what the third state was invented to stop.
+#
+# What this row does NOT establish is the link. A check-in that got no reply has two
+# causes — this box has no path off the site, or the DASHBOARD is down — and they are
+# indistinguishable from here. The latency probe running alongside it is what says
+# which. The same caveat `_wan_path_on_failure` already carries.
+#
+# ⚠️ ORDERING: this must NOT reach the fleet before the dashboard understands the
+# value. `/api/sensor/speedtest-result` coerces an unrecognised `status` to NULL and
+# stores the row (it does not 4xx, so the result spool cannot wedge) — but a NULL
+# status with `ok = false` is the shape every reader scores as a GENUINE speed-test
+# failure, feeding `speedtestFailPct` and `rule:wan-edge`. A dashboard outage would
+# then make every district in the fleet record correlated "failures" at once, which
+# is exactly that rule's firing shape, from an outage in our own control plane. The
+# dashboard must exclude `not_attempted` from both halves of that ratio — as it
+# already does for refusals — before the collector ships.
+STATUS_NOT_ATTEMPTED = "not_attempted"
 
 # Cloudflare's speed.cloudflare.com edge now blocks the stdlib's default
 # `Python-urllib/<ver>` User-Agent (returns 403/404), which silently broke the
@@ -96,6 +144,17 @@ def _empty(provider: str, error: str, status: str = STATUS_FAILED, **raw: object
         "error": error[:500],
         "raw": dict(raw) or None,
     }
+
+
+def not_attempted(message: str, provider: str = "cloudflare", **raw: object) -> dict:
+    """A recorded NON-ATTEMPT: the scheduled slot came due and no probe was made.
+
+    Deliberately built from the same `_empty` shape every other non-ok outcome
+    uses, so the wire payload checkin.py:_report_speedtest assembles is identical
+    to a failed run's apart from `status` — there is no second payload builder to
+    drift, and no field an older dashboard has never seen in this position.
+    """
+    return _empty(provider, message, status=STATUS_NOT_ATTEMPTED, not_attempted=True, **raw)
 
 
 def _describe(exc: BaseException) -> str:

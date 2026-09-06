@@ -1081,10 +1081,40 @@ def _request_host_action(action: str, command_id) -> tuple[str, dict]:
     """
     if action not in _HOST_ACTIONS:
         return "failed", {"error": f"unknown host action {action!r}"}
+    # `command_id` is dashboard-supplied and lands in a TAB-separated, newline-
+    # terminated record that scripts/host-action.sh drains with
+    # `while IFS=$'\t' read -r cid action`. A NEWLINE inside the id therefore
+    # forges an extra record whose ACTION the pusher chose. Verified against that
+    # script rather than assumed: an id that ENDS in one — "1\nx\treboot\n" with
+    # action "host-restart" — writes the lines "1", "x<TAB>reboot" and
+    # "<TAB>host-restart", and the middle line parses as cid="x", action="reboot".
+    # So one approved `host-restart` also runs a reboot, skipping the per-action
+    # operator confirm + approval + audit the dashboard gates these behind.
+    #
+    # Bounded, and less far than it first looks: host-action.sh has its own
+    # allow-list, so a forged action can only be another already-allow-listed one
+    # and nothing arbitrary reaches a shell. A TAB alone forges NOTHING — with two
+    # read targets bash puts every trailing field, separators included, into
+    # `action`, so "1\threboot" yields action="reboot<TAB>host-restart", which
+    # matches no case arm and is refused. Screened anyway, and by category: a
+    # fail-closed record field must not depend on how a downstream parser happens
+    # to fold its extra fields. `sid` was hardened for this same record shape
+    # (_spawn_console_session); this is its unscreened sibling.
+    #
+    # By CATEGORY, not with a "\n\r\t" blocklist: _reject_control_chars refuses
+    # every C0 control, DEL and the three non-ASCII line breaks — a superset of
+    # both separators and of str.splitlines()' ten. Fail closed: a bad id is
+    # REFUSED, never sanitized into some other command's id.
+    cid = str(command_id)
+    try:
+        _reject_control_chars("host action command id", cid)
+    except ValueError as exc:
+        log.warning("refusing a host action with an unusable command id", action=action)
+        return "failed", {"error": str(exc)}
     try:
         HOST_ACTION_FILE.parent.mkdir(parents=True, exist_ok=True)
         with HOST_ACTION_FILE.open("a", encoding="utf-8") as fh:
-            fh.write(f"{command_id}\t{action}\n")
+            fh.write(f"{cid}\t{action}\n")
         log.info("host action queued for host wrapper", action=action, id=command_id)
         return "scheduled", {
             "note": f"host will run '{action}' after this check-in",
@@ -1526,6 +1556,11 @@ SPEEDTEST_LAST_FILE = Path("/var/lib/netmon/speedtest-last-run")
 # link is broken, and that is precisely the signal we must keep measuring.
 SPEEDTEST_COOLDOWN_FILE = Path("/var/lib/netmon/speedtest-cooldown-until")
 SPEEDTEST_REFUSED_COOLDOWN_SEC = 3600
+# ...and a third ledger, for slots the box could not ATTEMPT (see
+# _missed_speedtest_on_failure). It is deliberately NOT SPEEDTEST_LAST_FILE: the
+# real slot must stay unconsumed so the genuine test runs the moment the link
+# returns, while this one caps the recorded non-attempts at one per interval.
+SPEEDTEST_MISSED_FILE = Path("/var/lib/netmon/speedtest-missed-slot")
 # PERF-5 website performance: the URL list (a real list → JSON file, not env) + the
 # scheduler's last-run ledger. The list is pushed from the dashboard's district-
 # managed website config; the dashboard always sends a non-empty list (its defaults
@@ -1534,37 +1569,58 @@ WEBPERF_URLS_FILE = Path("/var/lib/netmon/webperf-urls.json")
 WEBPERF_LAST_FILE = Path("/var/lib/netmon/webperf-last-run")
 
 
-def _report_speedtest(url: str, token: str | None, res: dict, trigger: str) -> None:
-    """POST a public-speedtest result to the dashboard (best-effort)."""
+def _report_speedtest(
+    url: str,
+    token: str | None,
+    res: dict,
+    trigger: str,
+    *,
+    spool_only: bool = False,
+) -> None:
+    """POST a public-speedtest result to the dashboard (best-effort).
+
+    spool_only: mirrors _report_latency's flag of the same name. The check-in POST
+    for this cycle has already failed, so the dashboard is KNOWN unreachable and an
+    attempt would only burn the full urllib timeout on a path whose whole purpose
+    is to exit fast. Write it straight to the spool and let a later check-in drain
+    it. `startedAt` is stamped here, at record time, so a row delivered hours later
+    still lands in the bucket where the slot actually fell.
+
+    One builder either way, on purpose: a second copy of this payload is exactly
+    how a field name drifts between the healthy and the outage path, and a shape
+    that only the failure path emits is the shape nobody notices is wrong.
+    """
     from datetime import UTC, datetime
 
-    _post_result(
-        url,
-        token,
-        "/api/sensor/speedtest-result",
-        {
-            "trigger": trigger,
-            "provider": res.get("provider"),
-            "downloadMbps": res.get("download_mbps"),
-            "uploadMbps": res.get("upload_mbps"),
-            "latencyMs": res.get("latency_ms"),
-            "jitterMs": res.get("jitter_ms"),
-            "lossPct": res.get("loss_pct"),
-            "server": res.get("server"),
-            "isp": res.get("isp"),
-            "resultUrl": res.get("result_url"),
-            "externalIp": res.get("external_ip"),
-            "ok": res.get("ok", False),
-            # THREE states, not two: "ok" | "failed" | "unavailable". `ok` keeps
-            # its old meaning; `status` is what tells the dashboard whether a
-            # non-ok row is evidence about the link or just the provider
-            # refusing us. See collector/speedtest.py.
-            "status": res.get("status"),
-            "error": res.get("error"),
-            "raw": res.get("raw"),
-            "startedAt": datetime.now(UTC).isoformat(),
-        },
-    )
+    payload = {
+        "trigger": trigger,
+        "provider": res.get("provider"),
+        "downloadMbps": res.get("download_mbps"),
+        "uploadMbps": res.get("upload_mbps"),
+        "latencyMs": res.get("latency_ms"),
+        "jitterMs": res.get("jitter_ms"),
+        "lossPct": res.get("loss_pct"),
+        "server": res.get("server"),
+        "isp": res.get("isp"),
+        "resultUrl": res.get("result_url"),
+        "externalIp": res.get("external_ip"),
+        "ok": res.get("ok", False),
+        # More states than `ok` has room for: "ok" | "failed" | "unavailable"
+        # | "not_attempted". `ok` keeps its old meaning; `status` is what tells
+        # the dashboard whether a non-ok row is evidence about the link, just the
+        # provider refusing us, or a slot the box never got to attempt. Additive
+        # and optional — an older dashboard that knows only the first three still
+        # sees ok=false, null measurements and a plain-language `error`. See
+        # collector/speedtest.py.
+        "status": res.get("status"),
+        "error": res.get("error"),
+        "raw": res.get("raw"),
+        "startedAt": datetime.now(UTC).isoformat(),
+    }
+    if spool_only:
+        _spool_result("/api/sensor/speedtest-result", payload)
+        return
+    _post_result(url, token, "/api/sensor/speedtest-result", payload)
 
 
 def _run_speedtest_command(url: str, token: str | None, args: dict, trigger: str) -> tuple[str, dict]:
@@ -1597,11 +1653,7 @@ def _maybe_scheduled_speedtest(url: str, token: str | None, settings) -> None:
     now = time.time()
     if _speedtest_cooling_off(now):
         return
-    try:
-        last = float(SPEEDTEST_LAST_FILE.read_text().strip())
-    except Exception:
-        last = 0.0
-    if now - last < max(900, settings.speedtest_schedule_sec):  # 15-min floor (bandwidth)
+    if now - _read_epoch_file(SPEEDTEST_LAST_FILE) < _speedtest_interval_sec(settings):
         return
     from .speedtest import run_speedtest
 
@@ -1613,6 +1665,28 @@ def _maybe_scheduled_speedtest(url: str, token: str | None, settings) -> None:
     except Exception as exc:  # noqa: BLE001
         log.warning("could not persist speedtest last-run", error=str(exc))
     _record_speedtest_cooldown(res, now)
+
+
+def _read_epoch_file(path: Path) -> float:
+    """The epoch seconds held in a one-line ledger file, or 0.0 if unreadable.
+
+    0.0 means "never" — which is the right answer for a missing file (a box that
+    has never run the probe is due now) and the safe one for a corrupt file
+    (record/measure again rather than stay silent forever)."""
+    try:
+        return float(path.read_text().strip())
+    except Exception:  # noqa: BLE001 — missing or garbage ledger: treat as never
+        return 0.0
+
+
+def _speedtest_interval_sec(settings) -> float:
+    """The effective speed-test interval, including the 15-minute bandwidth floor.
+
+    Read by BOTH the scheduler and the missed-slot recorder below. If the two ever
+    disagreed, the recorder would either invent non-attempts on cycles the real
+    test would have skipped anyway, or stay silent through slots that genuinely
+    were missed — so they share one expression rather than two copies of it."""
+    return float(max(900, settings.speedtest_schedule_sec))
 
 
 def _speedtest_cooling_off(now: float) -> bool:
@@ -1651,6 +1725,90 @@ def _record_speedtest_cooldown(res: dict, now: float) -> None:
             SPEEDTEST_COOLDOWN_FILE.unlink(missing_ok=True)
     except Exception as exc:  # noqa: BLE001
         log.warning("could not persist speedtest cooldown", error=str(exc))
+
+
+def _missed_speedtest_on_failure(
+    url: str, token: str | None, settings, http_status: int | None
+) -> None:
+    """RECORD — never run — a scheduled speed slot that a dead check-in preempted.
+
+    The defect this closes is silence. `_maybe_scheduled_speedtest` sits below
+    run_checkin's failure early-return, so during a WAN outage the slot was simply
+    skipped: a day's speedtest_samples went 4 -> 3 -> 0 with not one failure on
+    file. Zero rows is the one result a reader cannot interpret, and downstream it
+    is read backwards — the dashboard's nightly prompt treats "no samples, no
+    refusals" as "nothing arrived at all, a sensor or upload question, not a
+    bandwidth one". So a three-day WAN outage on a perfectly healthy sensor sent
+    the tech to the sensor. Same GAP-not-a-ROW mistake the latency probe fixed
+    above (_maybe_latency(offline=True)), one channel over.
+
+    What is NOT done here, deliberately: run the probe. On a box whose check-in
+    just died in the network, a speed test is 16 parallel streams each free to burn
+    their full 60s timeout — many seconds on the one code path that exists to exit
+    fast — for a result that is very likely undeliverable anyway, and that the
+    latency probe two lines up already covers properly. What we can state without
+    touching the network is that the slot came due and no probe was made, so that
+    is what this records — no more (see the message below).
+    """
+    import time
+
+    # Same gate as _wan_path_on_failure, for the same reason. A dashboard that
+    # ANSWERED (a 502 mid-deploy, a 401 on a rotated token) says nothing about this
+    # box's path to the internet: the link is fine, the real speed test would
+    # succeed, and the slot just waits for the next check-in a few minutes later.
+    # Only a request that never completed (DNS, TCP, TLS, timeout) means the box
+    # had no path — the one case where "not attempted" is the honest record rather
+    # than a guess dressed as one.
+    if http_status is not None:
+        return
+    if not settings.speedtest_enabled:
+        return
+    now = time.time()
+    # A provider cooldown means no probe was going to be attempted this cycle
+    # anyway, so blaming the absent sample on the outage would misattribute it. The
+    # refusal is already on record as its own `unavailable` row, and the cooldown
+    # is bounded at an hour.
+    if _speedtest_cooling_off(now):
+        return
+    interval = _speedtest_interval_sec(settings)
+    # Nothing has been missed until the slot actually comes due. Note this READS
+    # the real scheduler's ledger and never writes it: consuming the slot here
+    # would make the box wait a further full interval after the link returns before
+    # taking the measurement the outage was preventing.
+    if now - _read_epoch_file(SPEEDTEST_LAST_FILE) < interval:
+        return
+    # ...and its own ledger caps the record at one row per interval. Check-in runs
+    # every few minutes, so without this a three-day outage would spool ~1,400
+    # identical rows — on its own enough to evict that outage's ONSET from the
+    # file-capped result spool, which is precisely what the spool's per-cycle
+    # batching exists to prevent. One row per interval reproduces the cadence of
+    # the test it stands in for: a day of outage reads as 4 recorded non-attempts,
+    # not 0 samples and not 1,400 of them.
+    if now - _read_epoch_file(SPEEDTEST_MISSED_FILE) < interval:
+        return
+    from .speedtest import not_attempted
+
+    # Says only what is known. "The box had no path off the site" would be a
+    # verdict we did not measure: a dashboard that is itself down produces the
+    # same `http_status is None` (the caveat _wan_path_on_failure already carries),
+    # and in that case the district's link is fine. What IS established is the
+    # narrow fact this row exists to record — the slot came due, the check-in got
+    # no reply at all, and so no probe was made. The latency probe running two
+    # lines above is what says whether the link itself is up.
+    res = not_attempted(
+        "not attempted — the scheduled speed test came due during a check-in that "
+        "got no reply at all from the dashboard, so no probe was made",
+        reason="checkin_unreachable",
+        schedule_sec=int(interval),
+    )
+    # Spool, never POST: the dashboard is known unreachable this cycle. One small
+    # JSON write, no network, so the early return stays fast.
+    _report_speedtest(url, token, res, "scheduled", spool_only=True)
+    try:
+        SPEEDTEST_MISSED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SPEEDTEST_MISSED_FILE.write_text(str(now))
+    except Exception as exc:  # noqa: BLE001 — best-effort, like the other ledgers
+        log.warning("could not persist speedtest missed-slot ledger", error=str(exc))
 
 
 def _report_latency(
@@ -2428,6 +2586,19 @@ def run_checkin() -> int:
         # the result for delivery on recovery. Bounded: `ping -w` deadlines each
         # target, and it only runs when latency probing is enabled.
         _maybe_latency(url, token, settings, offline=True)
+        # ...and the same treatment for the SPEED channel, which had the identical
+        # bug: _maybe_scheduled_speedtest lives below this return, so an outage
+        # skipped the slot silently and zero speed samples read as a sensor fault.
+        # This records the non-attempt (it does not run a probe — see the function)
+        # and spools it, so the day shows recorded non-attempts instead of nothing.
+        # Belt and braces, like _maybe_latency's own guard: bookkeeping about a
+        # missing measurement must never be able to suppress the PERF-7 capture
+        # below it, which is the one piece of evidence that can only be collected
+        # while the outage is happening.
+        try:
+            _missed_speedtest_on_failure(url, token, settings, http_status)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not record the missed speed slot", error=str(exc))
         # PERF-7: the latency probe above records THAT the path is broken; this
         # records WHERE. It only fires when the request never completed (see
         # _wan_path_on_failure) and runs detached, so it neither delays this exit
