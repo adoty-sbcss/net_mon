@@ -20,9 +20,12 @@ The distinction under test is whether ping COUNTED, not whether it succeeded:
   * partial loss and clean runs are untouched;
   * no statistics block → NO `loss_pct` KEY AT ALL, so the column is NULL.
 
-Every `ping` output below is copied from the real thing (iputils on Ubuntu),
-including the stderr wording, so a fixture cannot certify a parser that no real
-output would satisfy.
+Every `ping` output below is copied from real iputils output (Debian bookworm,
+what the image ships), including the stderr wording and the packet counts THIS
+module's argv actually produces — a fixture cannot certify a parser that no real
+output would satisfy. The one exception is flagged where it sits:
+`test_silent_failure_still_carries_a_diagnosis` uses a shape iputils is not known
+to produce, and says so.
 
 Pure unit tests: `subprocess.run` is monkeypatched, so there is no network.
 """
@@ -50,12 +53,27 @@ PARTIAL = """PING 8.8.8.8 (8.8.8.8) 56(84) bytes of data.
 rtt min/avg/max/mdev = 14.002/15.771/18.330/1.402 ms
 """
 
-# Unreachable host: ping COUNTED, and lost everything. There is no rtt line, but
-# there IS a statistics block — this is the case that must keep reporting 100.
+# Unreachable host, silent drop: ping COUNTED and lost everything. No rtt line,
+# but there IS a statistics block — this is the case that must keep reporting 100.
+#
+# ⚠️ ~40 packets, not 10. `-w` keeps ping sending past `-c` (pinger()'s guard is
+# `&& !rts->deadline`), so under this module's own argv — `-c 10 -i 0.3 -w 12` —
+# a black hole transmits for the full 12s. A `-c 10`-shaped fixture would be
+# output this collector cannot actually produce.
 TOTAL_LOSS = """PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
 
 --- 1.1.1.1 ping statistics ---
-10 packets transmitted, 0 received, 100% packet loss, time 9210ms
+40 packets transmitted, 0 received, 100% packet loss, time 11702ms
+"""
+
+# THE "WAN ROUTER DEAD" SHAPE, and the most common real outage on this fleet: the
+# next hop answers ICMP unreachable rather than dropping silently. ping counts an
+# error, `-w` exits at the first one, and the loss line still says 100%.
+HOST_UNREACHABLE = """PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
+From 10.8.2.1 icmp_seq=1 Destination Host Unreachable
+
+--- 1.1.1.1 ping statistics ---
+1 packets transmitted, 0 received, +1 errors, 100% packet loss, time 0ms
 """
 
 
@@ -93,6 +111,16 @@ def test_a_real_total_loss_still_reports_100(monkeypatch):
 
 
 # --- the branches that must NOT invent a loss figure ------------------------
+
+
+def test_router_dead_still_reports_100(monkeypatch):
+    """THE most common real outage shape, and the one this change could most
+    plausibly have broken: `+N errors` sits between the received count and the
+    loss percentage, so a parser that anchored on the wrong field would drop it."""
+    monkeypatch.setattr(subprocess, "run", _run(HOST_UNREACHABLE, returncode=1))
+    r = _ping("1.1.1.1")
+    assert r["ok"] is False
+    assert r["loss_pct"] == 100.0, "the router answered; ping counted; that is a measurement"
 
 
 def test_missing_binary_reports_no_loss(monkeypatch):
@@ -134,7 +162,7 @@ def test_no_cap_net_raw_reports_no_loss(monkeypatch):
 
 def test_no_route_reports_no_loss(monkeypatch):
     monkeypatch.setattr(
-        subprocess, "run", _run(stderr="connect: Network is unreachable", returncode=2)
+        subprocess, "run", _run(stderr="ping: connect: Network is unreachable", returncode=2)
     )
     r = _ping("1.1.1.1")
     assert "loss_pct" not in r
@@ -155,8 +183,10 @@ def test_unresolvable_name_reports_no_loss(monkeypatch):
 
 
 def test_silent_failure_still_carries_a_diagnosis(monkeypatch):
-    """No stdout, no stderr. The loss is unmeasured, but the row must not be blank."""
-    monkeypatch.setattr(subprocess, "run", _run(returncode=1))
+    """Neither stream said anything. Not a shape iputils is known to produce —
+    rc=1 normally prints statistics — so this is a defensive guard, not a copied
+    fixture: whatever happened, the row must not arrive blank AND unexplained."""
+    monkeypatch.setattr(subprocess, "run", _run(returncode=2))
     r = _ping("1.1.1.1")
     assert "loss_pct" not in r
     assert r["error"] == "host unreachable"
