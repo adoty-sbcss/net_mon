@@ -38,6 +38,11 @@ def _settings(**over):
         "update_channel": "stable",
         "latency_enabled": True,
         "latency_targets": "1.1.1.1",
+        # Off: this file is about the LATENCY channel. The speed channel's own
+        # failure-path record is test_speedtest_outage_slot.py's subject, and a
+        # spooled row from it would break the "one file per cycle" assertion below.
+        "speedtest_enabled": False,
+        "speedtest_schedule_sec": 6 * 3600,
         "snmp_enabled": False,
         "snmp_communities": "",
         "snmp_exclude": "",

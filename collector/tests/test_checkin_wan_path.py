@@ -35,6 +35,11 @@ def _settings(**over):
         "update_channel": "stable",
         "latency_enabled": False,
         "latency_targets": "",
+        # Off: the missed-speed-slot record on the failure path is
+        # test_speedtest_outage_slot.py's subject, and a spooled row here would be
+        # noise. Present because run_checkin reads it on the very path under test.
+        "speedtest_enabled": False,
+        "speedtest_schedule_sec": 6 * 3600,
         "snmp_enabled": False,
         "snmp_communities": "",
         "snmp_exclude": "",

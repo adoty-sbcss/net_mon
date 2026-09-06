@@ -353,6 +353,54 @@ def test_console_sid_record_injection_is_refused(tmp_path, monkeypatch) -> None:
     assert spawned == []      # and no session process was started
 
 
+def test_host_action_command_id_record_injection_is_refused(tmp_path, monkeypatch) -> None:
+    """`sid`'s unscreened sibling: the host-action record's FIRST field.
+
+    _request_host_action appends "<command_id>\t<action>\n" and
+    scripts/host-action.sh drains it with `while IFS=$'\t' read -r cid action`.
+    A NEWLINE in a dashboard-supplied id forges a whole extra record whose ACTION
+    the pusher chose: an id ending in one — "1\nx\treboot\n" with action
+    "host-restart" — writes the lines "1", "x<TAB>reboot" and "<TAB>host-restart",
+    and the middle line parses as cid="x", action="reboot". That script's own
+    allow-list bounds it (nothing arbitrary reaches a shell), but it converts one
+    approved `host-restart` into any other allow-listed action too, bypassing the
+    per-action operator confirm the dashboard gates these behind.
+
+    A TAB alone forges nothing — `read -r cid action` folds every trailing field,
+    separators and all, into `action`, so "1\treboot" yields
+    action="reboot<TAB>host-restart", which matches no case arm. Refused anyway:
+    a fail-closed record field must not depend on how a downstream parser happens
+    to fold its extras. Screened by CATEGORY, like the env writer: every C0
+    control, DEL, and the three non-ASCII line breaks — a superset of both
+    separators.
+    """
+    req = tmp_path / "host-action-request"
+    monkeypatch.setattr(checkin, "HOST_ACTION_FILE", req)
+
+    for bad_id in (
+        "1\nx\treboot\n",    # the real forgery: a whole middle record, action and all
+        "1\nhost-reboot",    # a bare newline: an extra record, id under the pusher's control
+        "1\threboot",        # a tab alone forges nothing, but is refused all the same
+        "1\r\nx",
+        "1\x0bx",            # str.splitlines() splits here; \n\r\x00 blocklists do not
+        "1\x85x",
+        "1\u2028x",  # written as an ESCAPE: a raw one would split this source line
+        "1\x00x",
+    ):
+        status, result = checkin._request_host_action("host-restart", bad_id)
+        assert status == "failed", bad_id
+        assert "host action command id" in result["error"], bad_id
+
+    assert not req.exists(), "a refused id must append NOTHING"
+
+    # Positive control: an ordinary id still queues, as one well-formed record.
+    status, result = checkin._request_host_action(
+        "host-restart", "3f9a1c2e-7b4d-4a11-9f00-1a2b3c4d5e6f"
+    )
+    assert status == "scheduled"
+    assert req.read_text() == "3f9a1c2e-7b4d-4a11-9f00-1a2b3c4d5e6f\thost-restart\n"
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
