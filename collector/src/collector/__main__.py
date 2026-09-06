@@ -415,9 +415,17 @@ def cmd_wan_path(reason: str, report: bool, limit: int) -> None:
         caps = wan_path_mod.recent_captures(max(1, limit))
         if not caps:
             click.echo("No WAN-path captures stored yet.")
+            # Say plainly that this is the EXPECTED state, and do not imply a
+            # daily row: `--reason baseline` refreshes the known-good path and
+            # returns before `capture()`, so it writes no capture at all. The
+            # old wording ("plus a daily known-good baseline") read as though a
+            # healthy box should accumulate one a day, which made a normal empty
+            # store look like a broken feature to whoever came looking.
             click.echo(
-                "One is taken automatically when a check-in fails at the network "
-                "level, plus a daily known-good baseline."
+                "That is the NORMAL state for a box whose check-in has never "
+                "failed at the network level. A capture is written only on such "
+                "a failure, on the recovery after it, or by hand -- the daily "
+                "baseline refresh writes none."
             )
             return
         for rec in caps:
