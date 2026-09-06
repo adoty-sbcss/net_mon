@@ -4,6 +4,25 @@ Cheap, continuous `ping` measurements to a few fixed targets — the internet
 (1.1.1.1 / 8.8.8.8), the default gateway, and the DNS resolver — so the dashboard
 can trend round-trip latency, jitter (mdev), and packet loss over time. Uses the
 `ping` binary already in the image; runs each check-in when enabled.
+
+⚠️ `loss_pct` IS A MEASUREMENT, NEVER A FABRICATION.
+A missing `loss_pct` means "we sent no packets and counted none", and readers
+depend on that: the dashboard's `latencyRowUnavailable` (lib/rules/wan-edge-core.ts)
+treats `ok = false` with a NULL loss as UNMEASURED rather than as a degraded WAN
+link, precisely so a broken instrument cannot be read as a broken circuit.
+
+This module used to report 100.0 whenever `ping` produced no packet-loss line —
+which is every case where the instrument failed rather than the path: no
+CAP_NET_RAW after a container restart (`socket: Operation not permitted`), no
+route (`connect: Network is unreachable`), a name that would not resolve, or a
+`ping` process that hung past its own deadline. Each of those was reported as
+total packet loss, i.e. as a WAN fault, and correlated across a fleet on the same
+image it is exactly the shape `rule:wan-edge` reports as a shared edge failure.
+
+A genuine outage is unaffected: an unreachable host still prints
+"10 packets transmitted, 0 received, 100% packet loss", so the figure is parsed
+and reported as the real 100.0 it is. The distinction is whether `ping` COUNTED,
+not whether it succeeded.
 """
 from __future__ import annotations
 
@@ -17,6 +36,10 @@ log = structlog.get_logger(__name__)
 _LOSS_RE = re.compile(r"(\d+(?:\.\d+)?)%\s*packet loss")
 _RTT_RE = re.compile(r"=\s*([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)\s*ms")
 
+# host -> the unmeasured-loss reasons already logged for it, so a standing
+# condition is reported once rather than every check-in. Process-lifetime only.
+_UNMEASURED_SEEN: dict[str, set[str]] = {}
+
 
 def _ping(host: str, count: int = 10, deadline: int = 12) -> dict:
     """Run `ping -c <count>` and parse loss% + rtt min/avg/max/mdev."""
@@ -29,9 +52,21 @@ def _ping(host: str, count: int = 10, deadline: int = 12) -> dict:
             timeout=deadline + 5,
         )
     except FileNotFoundError:
+        # No binary, so no packets. No `loss_pct` key at all — see the header.
         return {"host": host, "ok": False, "error": "ping not installed"}
     except subprocess.TimeoutExpired:
-        return {"host": host, "ok": False, "error": "ping timed out", "loss_pct": 100.0}
+        # `-w <deadline>` makes ping terminate itself and PRINT a summary, so for
+        # an IP target reaching the subprocess timeout (deadline + 5) means the
+        # process hung rather than that the network was slow.
+        #
+        # For a HOSTNAME target it can also mean the resolver blocked: iputils
+        # calls getaddrinfo in main(), BEFORE setup() arms the deadline, so a slow
+        # resolver is not bounded by `-w` at all. Either way we are killing the
+        # process, and its summary dies with it (a piped stdout is fully buffered
+        # until exit), so nothing was counted here either. Only operator-supplied
+        # hostname targets are exposed — the defaults are IP literals and `-n`
+        # suppresses reverse lookups.
+        return {"host": host, "ok": False, "error": "ping timed out"}
 
     out = proc.stdout or ""
     loss_m = _LOSS_RE.search(out)
@@ -45,15 +80,40 @@ def _ping(host: str, count: int = 10, deadline: int = 12) -> dict:
             "jitter_ms": round(float(rtt_m.group(4)), 3),  # mdev
             "loss_pct": loss,
         }
-    # No RTT line → total loss / unreachable.
-    return {
+
+    # No RTT line. Two very different cases, and conflating them is the bug this
+    # module carried: ping COUNTED and lost everything (a real unreachable host
+    # still prints its statistics block), versus ping never got to count at all.
+    err: str = (proc.stderr or "host unreachable").strip()[:200] or "host unreachable"
+    result: dict = {
         "host": host,
         "ok": False,
         "latency_ms": None,
         "jitter_ms": None,
-        "loss_pct": loss if loss is not None else 100.0,
-        "error": (proc.stderr or "host unreachable").strip()[:200] or "host unreachable",
+        "error": err,
     }
+    if loss is not None:
+        # A parsed figure is a real measurement — usually the genuine 100.0.
+        result["loss_pct"] = loss
+    else:
+        # No statistics block: the instrument failed, not the path. Omit the key
+        # so the row reaches the dashboard with a NULL loss and is read as
+        # UNMEASURED. `error` still carries the diagnosis for whoever looks.
+        #
+        # Latched per (host, reason): this runs every check-in against every
+        # target, so a standing condition would otherwise write ~1,400 identical
+        # lines a day. checkin.py latches the analogous dns-target log for the
+        # same reason.
+        seen = _UNMEASURED_SEEN.setdefault(host, set())
+        if err not in seen:
+            seen.add(err)
+            log.warning(
+                "ping produced no packet-loss line — reporting loss as unmeasured",
+                host=host,
+                returncode=proc.returncode,
+                error=err,
+            )
+    return result
 
 
 def default_gateway() -> str | None:
