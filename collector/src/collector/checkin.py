@@ -1870,40 +1870,34 @@ def _load_webperf_urls() -> list[str]:
         return []
 
 
-def _report_webperf(url: str, token: str | None, results: list[dict], trigger: str) -> None:
-    """POST each website-performance result to the dashboard (best-effort)."""
+def _report_webperf(
+    url: str, token: str | None, results: list[dict], trigger: str,
+    *, started_at: str | None = None, spool_only: bool = False,
+) -> None:
+    """Preserve the measurement cycle identity through delivery and replay."""
     from datetime import UTC, datetime
 
-    ts = datetime.now(UTC).isoformat()
-    for r in results:
-        _post_result(
-            url,
-            token,
-            "/api/sensor/webperf-result",
-            {
-                "trigger": trigger,
-                "url": r.get("url"),
-                "dnsMs": r.get("dns_ms"),
-                "tcpMs": r.get("tcp_ms"),
-                "tlsMs": r.get("tls_ms"),
-                "ttfbMs": r.get("ttfb_ms"),
-                "totalMs": r.get("total_ms"),
-                "httpStatus": r.get("http_status"),
-                "sizeBytes": r.get("size_bytes"),
-                "speedMbps": r.get("speed_mbps"),
-                "ok": r.get("ok", False),
-                "error": r.get("error"),
-                "startedAt": ts,
-            },
-        )
+    ts = started_at or datetime.now(UTC).isoformat()
+    payloads = [{
+        "trigger": trigger, "url": r.get("url"),
+        "dnsMs": r.get("dns_ms"), "tcpMs": r.get("tcp_ms"),
+        "tlsMs": r.get("tls_ms"), "ttfbMs": r.get("ttfb_ms"),
+        "totalMs": r.get("total_ms"), "httpStatus": r.get("http_status"),
+        "sizeBytes": r.get("size_bytes"), "speedMbps": r.get("speed_mbps"),
+        "ok": r.get("ok", False), "error": r.get("error"), "startedAt": ts,
+    } for r in results]
+    if spool_only:
+        _spool_results("/api/sensor/webperf-result", payloads)
+    else:
+        for payload in payloads:
+            _post_result(url, token, "/api/sensor/webperf-result", payload)
 
 
-def _maybe_webperf(url: str, token: str | None, settings) -> None:
-    """Run the website-performance probes if enabled + the interval elapsed (5-min
-    floor; the URLs are the dashboard-pushed district list)."""
+def _maybe_webperf(url: str, token: str | None, settings, *, offline: bool = False) -> None:
+    """Run bounded website probes on either check-in path, with a 3-minute floor."""
     import time
 
-    if not settings.webperf_enabled:
+    if not getattr(settings, "webperf_enabled", False):
         return
     urls = _load_webperf_urls()
     if not urls:
@@ -1913,12 +1907,17 @@ def _maybe_webperf(url: str, token: str | None, settings) -> None:
         last = float(WEBPERF_LAST_FILE.read_text().strip())
     except Exception:
         last = 0.0
-    if now - last < max(300, settings.webperf_schedule_sec):
+    # Tolerate timer jitter; otherwise a 179.9-second wake skips a whole cycle.
+    if now - last < max(180, settings.webperf_schedule_sec) - 5:
         return
-    from .webperf import probe_urls
+    from datetime import UTC, datetime
 
-    results = probe_urls(urls)
-    _report_webperf(url, token, results, "scheduled")
+    from .webperf import probe_urls
+    started_at = datetime.fromtimestamp(now, UTC).isoformat()
+    # Eight destinations at ten seconds each keeps this below a check-in cycle.
+    # Extra configured targets remain missing coverage, never fabricated success.
+    results = probe_urls(urls[:8], timeout=10)
+    _report_webperf(url, token, results, "scheduled", started_at=started_at, spool_only=offline)
     try:
         WEBPERF_LAST_FILE.parent.mkdir(parents=True, exist_ok=True)
         WEBPERF_LAST_FILE.write_text(str(now))
@@ -2604,6 +2603,10 @@ def run_checkin() -> int:
         # _wan_path_on_failure) and runs detached, so it neither delays this exit
         # nor dies with it.
         _wan_path_on_failure(settings, http_status)
+        try:
+            _maybe_webperf(url, token, settings, offline=True)
+        except Exception as exc:  # noqa: BLE001 — preserve the original failed check-in
+            log.warning("offline website probes failed", error=str(exc))
         return 1
 
     config_changed = False
@@ -2673,10 +2676,10 @@ def run_checkin() -> int:
 
     # Scheduled iperf + public speedtests + latency + web-performance probes piggyback
     # on check-in.
+    _maybe_webperf(url, token, settings)
     _maybe_scheduled_iperf(url, token, settings)
     _maybe_scheduled_speedtest(url, token, settings)
     _maybe_latency(url, token, settings)
-    _maybe_webperf(url, token, settings)
     # PERF-7: capture the healed path after an outage, and keep the known-good
     # baseline fresh. The baseline is what makes an outage capture readable at
     # all, and it cannot be collected retrospectively.

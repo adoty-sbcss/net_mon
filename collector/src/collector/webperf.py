@@ -68,7 +68,7 @@ def probe_url(url: str, timeout: int = 15, srcip: str | None = None) -> dict:
 
     ns, con, app, ttfb, tot, code, size, speed = parts[:8]
     http = int(code) if code.isdigit() else 0
-    ok = 200 <= http < 400
+    ok = proc.returncode == 0 and 200 <= http < 400
     tls = _ms(app)
     return {
         "url": url,
@@ -82,7 +82,7 @@ def probe_url(url: str, timeout: int = 15, srcip: str | None = None) -> dict:
         "http_status": http,
         "size_bytes": int(float(size)) if size.replace(".", "", 1).isdigit() else None,
         "speed_mbps": round(float(speed) * 8 / 1_000_000, 2) if speed.replace(".", "", 1).isdigit() else None,
-        "error": None if ok else (f"HTTP {http}" if http else "no response"),
+        "error": None if ok else ("transfer failed" if proc.returncode else f"HTTP {http}" if http else "no response"),
     }
 
 

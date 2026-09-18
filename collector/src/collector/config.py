@@ -411,10 +411,11 @@ class Settings(BaseSettings):
     # Website / end-user experience probes (PERF-5). Per configured URL, one curl
     # captures the DNS/TCP/TLS/TTFB/total waterfall + status + speed. The URL LIST
     # rides a JSON file (checkin.WEBPERF_URLS_FILE), pushed from the dashboard's
-    # district-managed website list; run on a cadence (default 15m) like speedtest.
+    # district-managed website list; run on a 3-minute default cadence so two
+    # independent failed cycles can support the dashboard's 5-10 minute target.
     webperf_enabled: bool = Field(default=False, alias="NETMON_WEBPERF_ENABLED")
     webperf_schedule_sec: int = Field(
-        default=900, ge=60, le=30 * 24 * 3600, alias="NETMON_WEBPERF_SCHEDULE_SEC"
+        default=180, ge=60, le=30 * 24 * 3600, alias="NETMON_WEBPERF_SCHEDULE_SEC"
     )
 
     # Box identity (set by the first-boot wizard; empty on pre-wizard installs).
