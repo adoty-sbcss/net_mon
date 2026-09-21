@@ -213,7 +213,7 @@ def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
     # The poller starts one listener per interface at the TOP of its tick and hands
     # it in, so every interface's window runs concurrently: a trunk with eight VLANs
     # waits ~150 s once per tick, not eight times over, sequentially, under the scan
-    # lock. A scan started any other way (manual `scan`, link-up) starts its own.
+    # lock. A scan started any other way (a manual `scan`) starts its own.
     owns_listener = False
     if igmp_listener is None and not light and settings.igmp_enabled:
         owns_listener = True

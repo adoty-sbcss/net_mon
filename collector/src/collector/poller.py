@@ -202,7 +202,7 @@ def tick() -> None:
     # IGMP listeners (PERF-9) for every full scan start TOGETHER below: each needs
     # ~150 s of listening, and run one after another under the scan lock that
     # multiplied across a trunk's VLANs.
-    plan: list[tuple[Any, str, str, bool, bool]] = []  # (state, trigger, reason, primary, light)
+    plan: list[tuple[Any, str, str, bool, bool, str | None]] = []  # (+ net_id)
     for st in states:
         if not st.has_usable_ip:
             continue
@@ -217,7 +217,7 @@ def tick() -> None:
 
         # No stable network id yet (e.g. just linked up, no gateway) -> full scan.
         if net_id is None:
-            plan.append((st, "link_up", "link_up", is_primary, False))
+            plan.append((st, "link_up", "link_up", is_primary, False, None))
             continue
 
         # Due for a FULL scan if this network has NOT had a full scan within the
@@ -227,7 +227,7 @@ def tick() -> None:
         # and starve the full scan forever once light passes are enabled.
         if recent_network_scan(
                 net_id, settings.rescan_interval, exclude_capture=True) is None:
-            plan.append((st, "periodic", "due_for_scan", is_primary, False))
+            plan.append((st, "periodic", "due_for_scan", is_primary, False, net_id))
             continue
 
         # Not due for a full scan. Run a LIGHT capture-only pass if the network
@@ -236,12 +236,18 @@ def tick() -> None:
         # full scan also resets this clock.
         if settings.capture_interval > 0 and (
                 recent_network_scan(net_id, settings.capture_interval) is None):
-            plan.append((st, "capture", "capture_due", is_primary, True))
+            plan.append((st, "capture", "capture_due", is_primary, True, net_id))
 
     listeners: dict[str, igmp_mod.IgmpListener] = {}
     if getattr(settings, "igmp_enabled", False):
-        for st, _trigger, _reason, _primary, light in plan:
+        for st, _trigger, _reason, _primary, light, net_id in plan:
             if light:
+                continue
+            # The scan will refuse to run inside the cooldown floor (it counts
+            # failed attempts too, unlike the gate above), so a listener started
+            # for it would only join and leave a group for nothing, every tick.
+            if net_id is not None and recent_network_scan(
+                    net_id, settings.cooldown_seconds, require_success=False):
                 continue
             try:
                 listener = igmp_mod.IgmpListener(st.name, settings.igmp_listen_seconds)
@@ -251,7 +257,7 @@ def tick() -> None:
                 log.warning("igmp listener failed to start", interface=st.name,
                             error=str(exc))
     try:
-        for st, trigger, reason, is_primary, light in plan:
+        for st, trigger, reason, is_primary, light, _net_id in plan:
             if light:
                 log.info("triggering light capture", interface=st.name,
                          cidr=st.primary_cidr, is_primary=is_primary, reason=reason)

@@ -43,6 +43,7 @@ def test_full_scans_share_one_concurrent_listening_window(monkeypatch):
         local_retention_days=0, snmp_bulk_retention_days=0, exclude_prefixes=(),
         exclude_vlan_set=set(), capture_interval=900, capture_seconds=60,
         rescan_interval=3600, igmp_enabled=True, igmp_listen_seconds=150,
+        cooldown_seconds=300,
     )
     monkeypatch.setattr(poller, "get_settings", lambda: settings)
     monkeypatch.setattr(poller.dhcp_server, "collect_and_store", lambda s: None)
@@ -85,6 +86,7 @@ def test_igmp_off_starts_nothing(monkeypatch):
         local_retention_days=0, snmp_bulk_retention_days=0, exclude_prefixes=(),
         exclude_vlan_set=set(), capture_interval=900, capture_seconds=60,
         rescan_interval=3600, igmp_enabled=False, igmp_listen_seconds=150,
+        cooldown_seconds=300,
     )
     monkeypatch.setattr(poller, "get_settings", lambda: settings)
     monkeypatch.setattr(poller.dhcp_server, "collect_and_store", lambda s: None)
@@ -97,3 +99,30 @@ def test_igmp_off_starts_nothing(monkeypatch):
     monkeypatch.setattr(poller, "run_scan", lambda **kw: seen.append(kw["igmp_listener"]))
     poller.tick()
     assert seen == [None] and _FakeListener.made == []
+
+
+def test_no_listener_for_a_scan_the_cooldown_will_refuse(monkeypatch):
+    _FakeListener.made = []
+    settings = SimpleNamespace(
+        local_retention_days=0, snmp_bulk_retention_days=0, exclude_prefixes=(),
+        exclude_vlan_set=set(), capture_interval=900, capture_seconds=60,
+        rescan_interval=3600, igmp_enabled=True, igmp_listen_seconds=150,
+        cooldown_seconds=300,
+    )
+    monkeypatch.setattr(poller, "get_settings", lambda: settings)
+    monkeypatch.setattr(poller.dhcp_server, "collect_and_store", lambda s: None)
+    monkeypatch.setattr(poller.device_config, "collect_and_store", lambda s: None)
+    monkeypatch.setattr(poller.iface_mod, "snapshot", lambda exclude_prefixes: [_state("eth0.20")])
+    monkeypatch.setattr(poller.iface_mod, "primary_interface", lambda: "eth0.20")
+
+    # No successful full scan in the rescan window, but a FAILED attempt a minute
+    # ago: the poller still plans the scan, and the scan's cooldown will refuse it.
+    def recent(net_id, window, exclude_capture=False, require_success=True):
+        return {"id": 9} if (window == 300 and require_success is False) else None
+    monkeypatch.setattr(poller, "recent_network_scan", recent)
+    monkeypatch.setattr(poller.igmp_mod, "IgmpListener", _FakeListener)
+    seen = []
+    monkeypatch.setattr(poller, "run_scan", lambda **kw: seen.append(kw["igmp_listener"]))
+    poller.tick()
+    assert seen == [None], "the scan is still attempted (and will skip itself)"
+    assert _FakeListener.made == [], "but no group is joined for it"
