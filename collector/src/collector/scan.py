@@ -26,7 +26,9 @@ from .db import (
     upsert_inventory_devices,
 )
 from .discovery import arp as arp_mod
+from .discovery import dhcp_probe as dhcp_probe_mod
 from .discovery import dns_health as dns_mod
+from .discovery import igmp as igmp_mod
 from .discovery import interfaces as iface_mod
 from .discovery import lldp as lldp_mod
 from .discovery import mdns_ssdp as mdns_mod
@@ -200,6 +202,19 @@ def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
 
     error: str | None = None
     section_errors: dict[str, str] = {}
+    # PERF-9: the IGMP listener needs longer than one query interval (~2 min), so
+    # it starts first and listens in the background while the rest of the scan
+    # runs; its result is collected just before persisting. Full scans only — a
+    # light pass is too short for "none heard" to mean anything.
+    igmp_listener: igmp_mod.IgmpListener | None = None
+    if not light and settings.igmp_enabled:
+        try:
+            igmp_listener = igmp_mod.IgmpListener(state.name, settings.igmp_listen_seconds)
+            igmp_listener.start()
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("igmp listener failed to start", error=str(exc))
+            section_errors["igmp"] = str(exc)
+            igmp_listener = None
     try:
         # 1. Counter snapshot pre-capture
         pre_counters = iface_mod.read_counters(state.name)
@@ -214,6 +229,21 @@ def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
 
         # 3. Counter snapshot post-capture for delta
         post_counters = iface_mod.read_counters(state.name)
+
+        # 3b. DHCP-6 active rogue-DHCP probe: one DISCOVER, every answering server
+        # recorded. AFTER the passive capture on purpose, so the probe's own
+        # DISCOVER/OFFER exchange never lands in dhcp_observations (where an
+        # unanswered DISCOVER would read as a client failing to get a lease).
+        dhcp_probe: dict[str, Any] | None = None
+        if not light and settings.dhcp_probe_enabled:
+            try:
+                dhcp_probe = dhcp_probe_mod.probe(state.name, settings.dhcp_probe_wait_sec)
+                ctx.raw_outputs["dhcp_probe"] = dhcp_probe
+                if dhcp_probe.get("status") == "error":
+                    section_errors["dhcp_probe"] = str(dhcp_probe.get("error"))
+            except Exception as exc:  # pragma: no cover — probe() never raises
+                log.warning("dhcp probe failed", error=str(exc))
+                section_errors["dhcp_probe"] = str(exc)
 
         # 4. LLDP / CDP neighbors (skipped on a light capture-only pass)
         lldp_neighbors = [] if light else lldp_mod.fetch_neighbors()
@@ -360,6 +390,18 @@ def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
                 log.warning("service discovery failed", error=str(exc))
                 section_errors["service_discovery"] = str(exc)
 
+        # 7f. Collect the IGMP listener (waits out the rest of its window).
+        igmp_result: dict[str, Any] | None = None
+        if igmp_listener is not None:
+            try:
+                igmp_result = igmp_listener.result()
+                ctx.raw_outputs["igmp"] = igmp_result
+                if igmp_result.get("status") == "unavailable":
+                    section_errors["igmp"] = str(igmp_result.get("reason"))
+            except Exception as exc:  # pragma: no cover — defensive
+                log.warning("igmp listener failed", error=str(exc))
+                section_errors["igmp"] = str(exc)
+
         # 8. Persist everything
         with connect() as connection:
             _persist(
@@ -376,6 +418,8 @@ def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
                 dns_results=dns_results,
                 reachability=reachability,
                 services=services,
+                dhcp_probe=dhcp_probe,
+                igmp_result=igmp_result,
             )
 
     except Exception as exc:
@@ -383,6 +427,8 @@ def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
         audit("scan_failed", scan_id=scan_id, error=str(exc))
         error = str(exc)
     finally:
+        if igmp_listener is not None:
+            igmp_listener.stop()
         duration = int(time.monotonic() - ctx.started_monotonic)
         notes = (
             dumps_jsonb({"section_errors": section_errors}, sort_keys=True)
@@ -575,6 +621,8 @@ def _persist(
     dns_results: list[dns_mod.DnsProbeResult] | None = None,
     reachability: list[dict[str, Any]] | None = None,
     services: list[dict[str, Any]] | None = None,
+    dhcp_probe: dict[str, Any] | None = None,
+    igmp_result: dict[str, Any] | None = None,
 ) -> None:
     # Devices: merge unique by (ip, mac), recording the discovery source.
     seen: dict[tuple[str | None, str | None], dict[str, Any]] = {}
@@ -819,6 +867,36 @@ def _persist(
             }
             for r in reachability
         ], connection=connection)
+
+    # DHCP-6 active probe: one row per (scan, interface), offers as JSONB.
+    if dhcp_probe:
+        insert_many("dhcp_probes", [{
+            "scan_run_id": ctx.scan_id,
+            "interface": dhcp_probe.get("interface") or ctx.interface,
+            "probed_at": dhcp_probe.get("probed_at"),
+            "status": dhcp_probe.get("status") or "error",
+            "error": dhcp_probe.get("error"),
+            "client_mac": dhcp_probe.get("client_mac"),
+            "wait_ms": dhcp_probe.get("wait_ms"),
+            "self_test_seen": dhcp_probe.get("self_test_seen"),
+            "offers": dumps_jsonb(dhcp_probe.get("offers") or []),
+        }], connection=connection)
+
+    # PERF-9 IGMP listener: one row per (scan, interface).
+    if igmp_result:
+        insert_many("igmp_observations", [{
+            "scan_run_id": ctx.scan_id,
+            "interface": igmp_result.get("interface") or ctx.interface,
+            "status": igmp_result.get("status") or "unavailable",
+            "reason": igmp_result.get("reason"),
+            "window_sec": igmp_result.get("window_sec"),
+            "listened_sec": igmp_result.get("listened_sec"),
+            "self_test_seen": igmp_result.get("self_test_seen"),
+            "queriers": dumps_jsonb(igmp_result.get("queriers") or []),
+            "groups": dumps_jsonb(igmp_result.get("groups") or []),
+            "reports_seen": igmp_result.get("reports_seen"),
+            "leaves_seen": igmp_result.get("leaves_seen"),
+        }], connection=connection)
 
     # mDNS/SSDP service-discovery rows (one per responder IP + protocol).
     if services:

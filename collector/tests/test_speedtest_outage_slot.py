@@ -289,6 +289,7 @@ def _checkin_harness(monkeypatch, tmp_path):
             update_channel="stable",
             speedtest_enabled=True,
             speedtest_schedule_sec=6 * 3600,
+            voice_enabled=False,
             snmp_enabled=False,
             snmp_communities="",
             snmp_exclude="",
