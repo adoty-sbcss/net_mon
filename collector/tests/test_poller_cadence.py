@@ -36,7 +36,9 @@ def _setup(monkeypatch, *, rows):
     monkeypatch.setattr(poller.iface_mod, "primary_interface", lambda: "eno1")
     monkeypatch.setattr(poller, "_maybe_purge", lambda s: None)
 
-    def _recent(net_id, window, exclude_capture=False):
+    # require_success mirrors the real signature; the cooldown check the poller
+    # makes before starting IGMP listeners passes it. Every fake row is a success.
+    def _recent(net_id, window, exclude_capture=False, require_success=True):
         best = None
         for r in rows:
             if r["age"] > window:
@@ -49,6 +51,10 @@ def _setup(monkeypatch, *, rows):
 
     monkeypatch.setattr(poller, "recent_network_scan", _recent)
     monkeypatch.setattr(poller, "run_scan", lambda **kw: calls.append(kw) or 1)
+    # No real raw sockets or threads from a cadence test.
+    monkeypatch.setattr(poller.igmp_mod, "IgmpListener",
+                        lambda iface, window: type("L", (), {"start": lambda self: None,
+                                                              "stop": lambda self: None})())
     return calls
 
 

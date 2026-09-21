@@ -226,6 +226,8 @@ def _scan_payload(scan_id: int) -> dict[str, str]:
     dns = fetch_table_for_scan("dns_probes", scan_id)
     reachability = fetch_table_for_scan("network_reachability", scan_id)
     services = fetch_table_for_scan("service_discovery", scan_id)
+    dhcp_probes = fetch_table_for_scan("dhcp_probes", scan_id)
+    igmp = fetch_table_for_scan("igmp_observations", scan_id)
 
     return {
         "summary.md": _build_summary_md(scan, devices, neighbors, arp, dhcp, stp,
@@ -268,6 +270,12 @@ def _scan_payload(scan_id: int) -> dict[str, str]:
         "raw/snmp-topology-edges.json": _jsonify(topo_edges),
         "raw/traffic-stats.json": _jsonify(traffic),
         "raw/dns-probes.json": _jsonify(dns),
+        # DHCP-6 active rogue-DHCP probe and PERF-9 IGMP listener: one row per
+        # (scan, interface) each, absent on light passes and when switched off.
+        # An EMPTY list means "not run", never "ran and found nothing" — the
+        # rows carry their own three-state status for that.
+        "raw/dhcp-probe.json": _jsonify(dhcp_probes),
+        "raw/igmp.json": _jsonify(igmp),
     }
 
 

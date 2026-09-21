@@ -412,6 +412,7 @@ _CONFIG_STR_KEYS: tuple[str, ...] = (
     "iperf_protocol",
     "iperf_timezone",
     "latency_targets",
+    "voice_targets",
     "trunk_parent",
     "trunk_statics",
     "wifi_district_ssids",
@@ -437,7 +438,7 @@ _CONFIG_HOST_KEYS = frozenset(
 
 # Comma-separated host lists: every token must be a literal IPv4 or hostname, and
 # the list is capped so one push can't turn the box into a fan-out probe source.
-_CONFIG_HOST_LIST_CAPS: dict[str, int] = {"latency_targets": 8}
+_CONFIG_HOST_LIST_CAPS: dict[str, int] = {"latency_targets": 8, "voice_targets": 4}
 
 # RFC-1123 hostname: dot-separated labels of letters/digits/hyphens, no leading or
 # trailing hyphen in a label, each label <= 63 chars.
@@ -662,6 +663,17 @@ def _apply_config(data: dict) -> None:
         mapping["NETMON_LATENCY_ENABLED"] = "true" if data.get("latency_enabled") else "false"
     if "latency_targets" in data:
         mapping["NETMON_LATENCY_TARGETS"] = str(data.get("latency_targets") or "1.1.1.1,8.8.8.8")
+    # Call-quality probe (PERF-9): enable + the district's voice servers. The
+    # gateway and internet targets are always probed; this list only adds to them.
+    if "voice_enabled" in data:
+        mapping["NETMON_VOICE_ENABLED"] = "true" if data.get("voice_enabled") else "false"
+    if "voice_targets" in data:
+        mapping["NETMON_VOICE_TARGETS"] = str(data.get("voice_targets") or "")
+    # DHCP-6 active probe and the PERF-9 IGMP listener: per-sensor off switches.
+    if "dhcp_probe_enabled" in data:
+        mapping["NETMON_DHCP_PROBE_ENABLED"] = "true" if data.get("dhcp_probe_enabled") else "false"
+    if "igmp_enabled" in data:
+        mapping["NETMON_IGMP_ENABLED"] = "true" if data.get("igmp_enabled") else "false"
     # Website performance (PERF-5): enable + cadence are env; the URL list rides a
     # 0644 JSON file (a real list — quotes/slashes don't belong in EnvironmentFile).
     if "webperf_enabled" in data:
@@ -2124,6 +2136,96 @@ def _maybe_latency(url: str, token: str | None, settings, *, offline: bool = Fal
     _report_latency(url, token, results, "scheduled", spool_only=offline)
 
 
+def _report_voice(
+    url: str,
+    token: str | None,
+    results: list[dict],
+    *,
+    spool_only: bool = False,
+) -> None:
+    """POST each call-quality result (PERF-9). Same delivery contract as
+    _report_latency: spooled for redelivery when the dashboard is unreachable, and
+    stamped at measurement time so late rows land in the right bucket."""
+    from datetime import UTC, datetime
+
+    ts = datetime.now(UTC).isoformat()
+    payloads = [
+        {
+            "label": r.get("label"),
+            "target": r.get("host"),
+            "status": r.get("status"),
+            "sent": r.get("sent"),
+            "received": r.get("received"),
+            "lossPct": r.get("loss_pct"),
+            "maxLossBurst": r.get("max_loss_burst"),
+            "rttAvgMs": r.get("rtt_avg_ms"),
+            "rttP95Ms": r.get("rtt_p95_ms"),
+            "rttMaxMs": r.get("rtt_max_ms"),
+            "jitterMs": r.get("jitter_ms"),
+            "rFactor": r.get("r_factor"),
+            "mos": r.get("mos"),
+            "grade": r.get("grade"),
+            "dscp": r.get("dscp"),
+            "error": r.get("error"),
+            "startedAt": ts,
+        }
+        for r in results
+    ]
+    if spool_only:
+        _spool_results("/api/sensor/voice-result", payloads)
+        return
+    for payload in payloads:
+        _post_result(url, token, "/api/sensor/voice-result", payload)
+
+
+def _voice_targets(settings) -> list[tuple[str, str]]:
+    """(label, host) for the call-quality probe: the gateway (local path), the
+    first internet latency target (internet path), then the district's voice
+    servers. Labels are what the dashboard groups and judges by — the gateway row
+    is informational, because a router answering from its CPU adds jitter a
+    forwarded call never sees."""
+    from . import latency as latency_mod
+
+    targets: list[tuple[str, str]] = []
+    gw = latency_mod.default_gateway()
+    if gw:
+        targets.append(("gateway", gw))
+    internet = [h.strip() for h in str(settings.latency_targets or "").split(",") if h.strip()]
+    if internet:
+        targets.append(("internet", internet[0]))
+    for host in str(settings.voice_targets or "").split(","):
+        host = host.strip()
+        # Re-screened here as well as at push time: a hand-edited env file must
+        # not be able to put an option in front of ping's host operand.
+        if host and not host.startswith("-") and _is_host_token(host):
+            targets.append(("voice", host))
+    return targets
+
+
+def _maybe_voice(url: str, token: str | None, settings, *, offline: bool = False) -> None:
+    """Run the call-quality probe (PERF-9) each check-in when enabled.
+
+    Runs in the offline path too, like _maybe_latency: the cycles where the
+    dashboard is unreachable are the ones most worth measuring, so the results
+    are spooled for delivery on recovery rather than skipped. Contained: nothing
+    here may break the check-in, which is the box's only control plane.
+    """
+    if not settings.voice_enabled:
+        return
+    try:
+        from . import voice as voice_mod
+
+        targets = _voice_targets(settings)
+        if not targets:
+            return
+        results = voice_mod.probe_voice(targets)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("voice probe failed", error=str(exc))
+        return
+    if results:
+        _report_voice(url, token, results, spool_only=offline)
+
+
 # --- WAN-path evidence (PERF-7) --------------------------------------------
 # A district lost its internet for a week and the product could not say what
 # broke. The measurement that would have named it can only be taken DURING the
@@ -2603,6 +2705,9 @@ def run_checkin() -> int:
         # _wan_path_on_failure) and runs detached, so it neither delays this exit
         # nor dies with it.
         _wan_path_on_failure(settings, http_status)
+        # PERF-9 call quality, spooled like latency — the outage is the sample.
+        # After the PERF-7 trigger so its ~5 s stream never delays that capture.
+        _maybe_voice(url, token, settings, offline=True)
         try:
             _maybe_webperf(url, token, settings, offline=True)
         except Exception as exc:  # noqa: BLE001 — preserve the original failed check-in
@@ -2680,6 +2785,7 @@ def run_checkin() -> int:
     _maybe_scheduled_iperf(url, token, settings)
     _maybe_scheduled_speedtest(url, token, settings)
     _maybe_latency(url, token, settings)
+    _maybe_voice(url, token, settings)
     # PERF-7: capture the healed path after an outage, and keep the known-good
     # baseline fresh. The baseline is what makes an outage capture readable at
     # all, and it cannot be collected retrospectively.

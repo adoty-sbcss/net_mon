@@ -35,6 +35,7 @@ def _settings(**over):
         "update_channel": "stable",
         "latency_enabled": False,
         "latency_targets": "",
+        "voice_enabled": False,
         # Off: the missed-speed-slot record on the failure path is
         # test_speedtest_outage_slot.py's subject, and a spooled row here would be
         # noise. Present because run_checkin reads it on the very path under test.

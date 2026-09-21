@@ -163,7 +163,7 @@ def test_the_effective_window_is_reported_back(monkeypatch, tmp_path):
     """
     settings = _settings(
         dashboard_url="https://dash", enroll_token="tok", update_channel="stable",
-        latency_enabled=False, snmp_enabled=False, snmp_communities="",
+        latency_enabled=False, voice_enabled=False, snmp_enabled=False, snmp_communities="",
         snmp_exclude="", snmp_topology_enabled=False, snmp_topology_scope="",
         snmp_topology_max_depth=2, snmp_topology_interval=3600,
         bundle_transport="blob",

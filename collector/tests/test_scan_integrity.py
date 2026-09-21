@@ -203,6 +203,7 @@ def test_nmap_failure_does_not_fail_the_scan(monkeypatch) -> None:
             capture_seconds=1, snmp_enabled=False, snmp_poll_all_hosts=False,
             snmp_topology_enabled=False, dns_enabled=False,
             reachability_enabled=False, mdns_enabled=False,
+            dhcp_probe_enabled=False, igmp_enabled=False,
         ),
     )
 

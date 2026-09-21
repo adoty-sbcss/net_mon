@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import signal
 import time
+from typing import Any
 
 import structlog
 
 from .config import get_settings
 from .db import purge_heavy_snmp_polls, purge_old_scans, recent_network_scan
 from .discovery import device_config, dhcp_server
+from .discovery import igmp as igmp_mod
 from .discovery import interfaces as iface_mod
 from .scan import _vlan_of, run_scan
 
@@ -196,6 +198,11 @@ def tick() -> None:
             if st.has_usable_ip and not _is_excluded_vlan(st.name, settings)),
     )
 
+    # Decide the whole tick first, then run it. Deciding first is what lets the
+    # IGMP listeners (PERF-9) for every full scan start TOGETHER below: each needs
+    # ~150 s of listening, and run one after another under the scan lock that
+    # multiplied across a trunk's VLANs.
+    plan: list[tuple[Any, str, str, bool, bool, str | None]] = []  # (+ net_id)
     for st in states:
         if not st.has_usable_ip:
             continue
@@ -210,10 +217,7 @@ def tick() -> None:
 
         # No stable network id yet (e.g. just linked up, no gateway) -> full scan.
         if net_id is None:
-            log.info("triggering scan", interface=st.name, cidr=st.primary_cidr,
-                     gateway=st.gateway_ip, is_primary=is_primary, reason="link_up")
-            run_scan(interface=st.name, trigger_reason="link_up",
-                     force=False, is_primary=is_primary)
+            plan.append((st, "link_up", "link_up", is_primary, False, None))
             continue
 
         # Due for a FULL scan if this network has NOT had a full scan within the
@@ -223,19 +227,47 @@ def tick() -> None:
         # and starve the full scan forever once light passes are enabled.
         if recent_network_scan(
                 net_id, settings.rescan_interval, exclude_capture=True) is None:
-            log.info("triggering scan", interface=st.name, cidr=st.primary_cidr,
-                     gateway=st.gateway_ip, is_primary=is_primary, reason="due_for_scan")
-            run_scan(interface=st.name, trigger_reason="periodic",
-                     force=False, is_primary=is_primary)
+            plan.append((st, "periodic", "due_for_scan", is_primary, False, net_id))
             continue
 
         # Not due for a full scan. Run a LIGHT capture-only pass if the network
         # hasn't had ANY scan within capture_interval -> samples DHCP/STP far more
         # often than the hourly full scan without paying for full discovery. A
-        # full scan also captures, so it resets this clock too.
+        # full scan also resets this clock.
         if settings.capture_interval > 0 and (
                 recent_network_scan(net_id, settings.capture_interval) is None):
-            log.info("triggering light capture", interface=st.name,
-                     cidr=st.primary_cidr, is_primary=is_primary, reason="capture_due")
-            run_scan(interface=st.name, trigger_reason="capture",
-                     force=False, is_primary=is_primary, light=True)
+            plan.append((st, "capture", "capture_due", is_primary, True, net_id))
+
+    listeners: dict[str, igmp_mod.IgmpListener] = {}
+    if getattr(settings, "igmp_enabled", False):
+        for st, _trigger, _reason, _primary, light, net_id in plan:
+            if light:
+                continue
+            # The scan will refuse to run inside the cooldown floor (it counts
+            # failed attempts too, unlike the gate above), so a listener started
+            # for it would only join and leave a group for nothing, every tick.
+            if net_id is not None and recent_network_scan(
+                    net_id, settings.cooldown_seconds, require_success=False):
+                continue
+            try:
+                listener = igmp_mod.IgmpListener(st.name, settings.igmp_listen_seconds)
+                listener.start()
+                listeners[st.name] = listener
+            except Exception as exc:  # pragma: no cover — the scan starts its own
+                log.warning("igmp listener failed to start", interface=st.name,
+                            error=str(exc))
+    try:
+        for st, trigger, reason, is_primary, light, _net_id in plan:
+            if light:
+                log.info("triggering light capture", interface=st.name,
+                         cidr=st.primary_cidr, is_primary=is_primary, reason=reason)
+            else:
+                log.info("triggering scan", interface=st.name, cidr=st.primary_cidr,
+                         gateway=st.gateway_ip, is_primary=is_primary, reason=reason)
+            run_scan(interface=st.name, trigger_reason=trigger, force=False,
+                     is_primary=is_primary, light=light,
+                     igmp_listener=listeners.get(st.name))
+    finally:
+        # A scan that skipped (cooldown, lock busy) never collected its listener.
+        for listener in listeners.values():
+            listener.stop()

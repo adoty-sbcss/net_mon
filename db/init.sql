@@ -292,3 +292,35 @@ CREATE TABLE IF NOT EXISTS service_discovery (
 );
 CREATE INDEX IF NOT EXISTS idx_service_discovery_scan ON service_discovery(scan_run_id);
 CREATE INDEX IF NOT EXISTS idx_service_discovery_ip   ON service_discovery(ip);
+
+-- DHCP-6 active rogue-DHCP probe + PERF-9 IGMP listener, per scan (see migration 0014).
+CREATE TABLE IF NOT EXISTS dhcp_probes (
+    id              SERIAL PRIMARY KEY,
+    scan_run_id     INTEGER NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
+    interface       TEXT NOT NULL,
+    probed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status          TEXT NOT NULL,
+    error           TEXT,
+    client_mac      TEXT,
+    wait_ms         INTEGER,
+    self_test_seen  BOOLEAN,
+    offers          JSONB NOT NULL DEFAULT '[]'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_dhcp_probes_scan ON dhcp_probes(scan_run_id);
+
+CREATE TABLE IF NOT EXISTS igmp_observations (
+    id              SERIAL PRIMARY KEY,
+    scan_run_id     INTEGER NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
+    interface       TEXT NOT NULL,
+    observed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status          TEXT NOT NULL,
+    reason          TEXT,
+    window_sec      INTEGER,
+    listened_sec    DOUBLE PRECISION,
+    self_test_seen  BOOLEAN,
+    queriers        JSONB NOT NULL DEFAULT '[]'::jsonb,
+    groups          JSONB NOT NULL DEFAULT '[]'::jsonb,
+    reports_seen    INTEGER,
+    leaves_seen     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_igmp_observations_scan ON igmp_observations(scan_run_id);

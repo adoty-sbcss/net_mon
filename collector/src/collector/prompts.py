@@ -25,6 +25,13 @@ files into a Claude conversation, then send the prompt below.
   rewrite bogus names to an ad/filter page.
 - **raw/** — Underlying tool outputs (lldp neighbors, arp table, dhcp
   observations, stp events, snmp polls, dns probes, interface state).
+- **raw/dhcp-probe.json** — The sensor's own DHCPDISCOVER and every DHCP
+  server that answered it (`offers`). `status` is `answered`, `no_answer`
+  (nothing answered — NOT proof of no rogue: an infrastructure VLAN with no
+  DHCP looks the same) or `error` (not measured).
+- **raw/igmp.json** — IGMP queriers heard on the segment (`querier_seen`),
+  `none_heard` (listened past one query interval with a passing self-test —
+  multicast paging/bells will cut out if snooping is on), or `unavailable`.
 
 ## Prompt — paste this into Claude
 
@@ -118,6 +125,10 @@ to the configured SFTP server at the top of the hour.
     `service_discovery.json`
   - `raw/` — underlying tool outputs (LLDP, ARP, DHCP, STP, SNMP,
     nmap, DNS probes, mDNS/SSDP service discovery, interface state)
+  - `raw/dhcp-probe.json` — every DHCP server that answered the sensor's
+    own DISCOVER (compare against the servers you expect; `no_answer` is not
+    "clean"); `raw/igmp.json` — IGMP queriers heard, or `none_heard` /
+    `unavailable`
 
 ## Prompt — paste this into Claude
 

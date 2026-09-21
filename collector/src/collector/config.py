@@ -378,6 +378,29 @@ class Settings(BaseSettings):
     # CSV of internet targets to ping; gateway + DNS resolver are added automatically.
     latency_targets: str = Field(default="1.1.1.1,8.8.8.8", alias="NETMON_LATENCY_TARGETS")
 
+    # Call-quality probe (PERF-9, voice.py): a 5-second, 50-packet/s, EF-marked
+    # stream to the gateway + the first latency target + any district voice
+    # servers, scored as MOS. ON by default — ~50 KB per target per check-in.
+    voice_enabled: bool = Field(default=True, alias="NETMON_VOICE_ENABLED")
+    # CSV of extra voice targets (a district's PBX / call manager / SBC), pushed
+    # from the district settings. Gateway + internet are always included.
+    voice_targets: str = Field(default="", alias="NETMON_VOICE_TARGETS")
+
+    # Active rogue-DHCP probe (DHCP-6, discovery/dhcp_probe.py): one DHCPDISCOVER
+    # per full scan per interface, from the interface's own MAC, never a REQUEST.
+    dhcp_probe_enabled: bool = Field(default=True, alias="NETMON_DHCP_PROBE_ENABLED")
+    dhcp_probe_wait_sec: float = Field(default=4.0, ge=1.0, le=15.0,
+                                       alias="NETMON_DHCP_PROBE_WAIT_SEC")
+
+    # IGMP querier listener (PERF-9, discovery/igmp.py): passive, on full scans.
+    # The window must exceed one query interval (125 s by default) for a "none
+    # heard" to mean anything; below igmp.MIN_WINDOW_SEC it can only report
+    # querier_seen or unavailable. It runs alongside the scan, so it only adds
+    # time when the rest of the scan finishes sooner.
+    igmp_enabled: bool = Field(default=True, alias="NETMON_IGMP_ENABLED")
+    igmp_listen_seconds: int = Field(default=150, ge=30, le=900,
+                                     alias="NETMON_IGMP_LISTEN_SECONDS")
+
     # WAN-path evidence (PERF-7). When a check-in fails at the NETWORK level, the
     # sensor runs a bounded traceroute/TCP ladder on its own and stores the result
     # locally and read back via the `diag-wan-path` diagnostic — the outage
