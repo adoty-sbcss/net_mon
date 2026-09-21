@@ -221,6 +221,7 @@ def parse_reply(frame: bytes, xid: int) -> dict[str, Any] | None:
     lease = opts.get(51)
     mask = opts.get(1)
     domain = opts.get(15)
+    vendor = opts.get(60)
     return {
         "message_type": kind,
         # Option 54 is the server's own identity and survives relaying; it is the
@@ -237,6 +238,10 @@ def parse_reply(frame: bytes, xid: int) -> dict[str, Any] | None:
         "dns_servers": _ip_list(opts.get(6)),
         "lease_sec": struct.unpack("!I", lease)[0] if lease and len(lease) == 4 else None,
         "domain": domain.decode("ascii", "replace").strip("\x00") if domain else None,
+        # Option 60 in a SERVER reply: "PXEClient" marks a PXE / proxyDHCP boot
+        # server (SCCM/WDS/FOG), which answers with no address at all. The
+        # dashboard must not read "no gateway" there as misdirecting clients.
+        "vendor_class": vendor.decode("ascii", "replace").strip("\x00") if vendor else None,
     }
 
 
@@ -314,7 +319,9 @@ def probe(interface: str, wait_sec: float = DEFAULT_WAIT_SEC) -> dict[str, Any]:
         rx.bind((interface, 0))
         rx.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         result["kernel_filter"] = bpf.attach(rx, bpf.DHCP_SERVER_PORT)
-        tx = socket.socket(af_packet, socket.SOCK_RAW, socket.htons(ETH_P_IP))
+        # Protocol 0: a send-only packet socket. Created with ETH_P_IP it would also
+        # queue every IPv4 frame on the VLAN, unread, for the whole wait.
+        tx = socket.socket(af_packet, socket.SOCK_RAW, 0)
         tx.bind((interface, 0))
         # The listener is bound before sending, so a fast local server's OFFER
         # cannot arrive before we are listening.

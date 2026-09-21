@@ -102,6 +102,8 @@ def test_probe_argv_is_voice_shaped(monkeypatch):
     assert cmd[cmd.index("-i") + 1] == "0.02"
     assert cmd[cmd.index("-s") + 1] == "172"
     assert cmd[cmd.index("-Q") + 1] == str(46 << 2), "DSCP EF in the TOS byte"
+    assert "-w" not in cmd, (
+        "-w keeps ping sending past -c under loss and exits at the first ICMP error")
     assert cmd[-1] == "1.1.1.1", "the host is the last operand"
 
 

@@ -179,11 +179,16 @@ def parse_ping(stdout: str) -> tuple[int | None, dict[int, float]]:
 def _probe_one(label: str, host: str) -> dict[str, Any]:
     base: dict[str, Any] = {"label": label, "host": host, "dscp": DSCP_EF,
                             "payload_bytes": PAYLOAD_BYTES, "error": None}
-    deadline = int(PACKETS * INTERVAL_SEC) + 4
+    # No `-w`, deliberately. iputils keeps SENDING past `-c` while `-w` has time
+    # left (pinger()'s guard is `&& !deadline`), so under loss the stream would run
+    # to the deadline and `sent` would stop meaning "one 5-second call"; and `-w`
+    # makes ping exit at the FIRST ICMP error, truncating the sample mid-stream.
+    # `-W 1` bounds the wait for the last reply; the subprocess timeout bounds a hang.
     cmd = ["ping", "-n", "-c", str(PACKETS), "-i", str(INTERVAL_SEC), "-s", str(PAYLOAD_BYTES),
-           "-Q", str(TOS_EF), "-W", "1", "-w", str(deadline), host]
+           "-Q", str(TOS_EF), "-W", "1", host]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=deadline + 5)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=int(PACKETS * INTERVAL_SEC) + 15)
     except FileNotFoundError:
         return {**base, "status": "unavailable", "error": "ping not installed", **score(0, {}),
                 "sent": None, "loss_pct": None}

@@ -26,8 +26,9 @@ POSITIVE CONTROL. A kernel filter with a wrong jump offset, or a socket that
 hears nothing, would report `none_heard` on every VLAN of the fleet. So at start
 the listener joins a random administratively-scoped group (239.255.x.y) on the
 interface; the kernel then sends an unsolicited membership report, which the
-listener must see leaving. It leaves the group at the end. That one membership
-report per full scan is the only packet this module ever causes.
+listener must see leaving. It leaves the group at the end. The kernel's join
+report (plus its standard retransmission) and the leave are the only packets
+this module ever causes.
 
 Groups: membership reports are sent towards routers, so with snooping on they
 are usually NOT flooded to the sensor's port. `groups` is therefore a partial,

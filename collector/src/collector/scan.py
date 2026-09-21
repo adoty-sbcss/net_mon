@@ -112,7 +112,8 @@ def _dns_due(interval_sec: int) -> bool:
 
 
 def run_scan(*, interface: str, trigger_reason: str, force: bool,
-             is_primary: bool = False, light: bool = False) -> int | None:
+             is_primary: bool = False, light: bool = False,
+             igmp_listener: igmp_mod.IgmpListener | None = None) -> int | None:
     """Run a single scan against `interface`. Returns the scan id on success.
 
     When `light` is True this is a capture-only pass: it runs the passive
@@ -135,11 +136,13 @@ def run_scan(*, interface: str, trigger_reason: str, force: bool,
             force=force,
             is_primary=is_primary,
             light=light,
+            igmp_listener=igmp_listener,
         )
 
 
 def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
-                     is_primary: bool = False, light: bool = False) -> int | None:
+                     is_primary: bool = False, light: bool = False,
+                     igmp_listener: igmp_mod.IgmpListener | None = None) -> int | None:
     settings = get_settings()
 
     state = iface_mod.get_one(interface)
@@ -203,11 +206,17 @@ def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
     error: str | None = None
     section_errors: dict[str, str] = {}
     # PERF-9: the IGMP listener needs longer than one query interval (~2 min), so
-    # it starts first and listens in the background while the rest of the scan
-    # runs; its result is collected just before persisting. Full scans only — a
-    # light pass is too short for "none heard" to mean anything.
-    igmp_listener: igmp_mod.IgmpListener | None = None
-    if not light and settings.igmp_enabled:
+    # it listens in the background while the rest of the scan runs; its result is
+    # collected just before persisting. Full scans only — a light pass is too short
+    # for "none heard" to mean anything.
+    #
+    # The poller starts one listener per interface at the TOP of its tick and hands
+    # it in, so every interface's window runs concurrently: a trunk with eight VLANs
+    # waits ~150 s once per tick, not eight times over, sequentially, under the scan
+    # lock. A scan started any other way (manual `scan`, link-up) starts its own.
+    owns_listener = False
+    if igmp_listener is None and not light and settings.igmp_enabled:
+        owns_listener = True
         try:
             igmp_listener = igmp_mod.IgmpListener(state.name, settings.igmp_listen_seconds)
             igmp_listener.start()
@@ -427,7 +436,7 @@ def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
         audit("scan_failed", scan_id=scan_id, error=str(exc))
         error = str(exc)
     finally:
-        if igmp_listener is not None:
+        if igmp_listener is not None and owns_listener:
             igmp_listener.stop()
         duration = int(time.monotonic() - ctx.started_monotonic)
         notes = (

@@ -45,8 +45,10 @@ def _reply(
     opts = bytes([53, 1, msg_type])
     opts += bytes([54, 4]) + real_socket.inet_aton(server_id)
     opts += bytes([1, 4]) + real_socket.inet_aton("255.255.255.0")
-    opts += bytes([3, 4 * len(routers)]) + b"".join(real_socket.inet_aton(r) for r in routers)
-    opts += bytes([6, 4 * len(dns)]) + b"".join(real_socket.inet_aton(d) for d in dns)
+    if routers:
+        opts += bytes([3, 4 * len(routers)]) + b"".join(real_socket.inet_aton(r) for r in routers)
+    if dns:
+        opts += bytes([6, 4 * len(dns)]) + b"".join(real_socket.inet_aton(d) for d in dns)
     opts += bytes([51, 4]) + struct.pack("!I", lease)
     opts += bytes([15, 7]) + b"k12.org"
     opts += bytes([255])
@@ -116,7 +118,23 @@ def test_parse_direct_offer():
         "dns_servers": ["10.0.0.10", "10.0.0.11"],
         "lease_sec": 28800,
         "domain": "k12.org",
+        "vendor_class": None,
     }
+
+
+def test_parse_pxe_proxydhcp_offer():
+    # A PXE / proxyDHCP boot server (SCCM/WDS/FOG) answers every DISCOVER with no
+    # address, no router, no DNS, and option 60 "PXEClient". The dashboard must be
+    # able to tell it apart from a server handing clients a wrong gateway.
+    frame = _reply(yiaddr="0.0.0.0", routers=(), dns=(), server_id="10.1.1.40",
+                   src_ip="10.1.1.40")
+    # splice option 60 in before the end option
+    idx = frame.rindex(bytes([255]))
+    frame = frame[:idx] + bytes([60, 9]) + b"PXEClient" + frame[idx:]
+    r = dhcp_probe.parse_reply(frame, XID)
+    assert r is not None
+    assert r["offered_ip"] is None and r["routers"] == [] and r["dns_servers"] == []
+    assert r["vendor_class"] == "PXEClient"
 
 
 def test_parse_relayed_offer_keeps_server_identity_separate_from_the_relay():
