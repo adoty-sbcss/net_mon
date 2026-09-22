@@ -20,6 +20,10 @@ class CaptureResult:
     multicast_packets: int = 0
     dhcp: list[dict[str, Any]] = field(default_factory=list)
     stp: list[dict[str, Any]] = field(default_factory=list)
+    # Every CDP frame heard (see _parse_cdp). NOT bounded by RAW_FRAME_CAP: a busy
+    # VLAN can fill `raw` long before the switch's once-a-minute CDP frame arrives.
+    # PACKET_CAP still bounds it.
+    cdp: list[dict[str, Any]] = field(default_factory=list)
     raw: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -130,6 +134,12 @@ def run_capture(*, interface: str, seconds: int) -> CaptureResult:
             if evt:
                 evt["seen_at"] = observed_at or started_at
                 result.stp.append(evt)
+
+        cdp_body = layers.get("cdp")
+        if isinstance(cdp_body, dict):
+            evt = _parse_cdp(cdp_body, eth)
+            evt["seen_at"] = observed_at or started_at
+            result.cdp.append(evt)
 
         # Bounded evidence: keep the control-plane frames that matter, skip the
         # bare broadcast/multicast ones (they summarize to {} — they only ever
@@ -391,6 +401,86 @@ def _parse_stp(body: dict[str, Any]) -> dict[str, Any] | None:
         "root_path_cost": cost,
         "topology_change": tc,
     }
+
+
+# ---------------------------------------------------------------------------
+# CDP parsing
+# ---------------------------------------------------------------------------
+
+# CDP TLV types that carry a voice VLAN. The switch sends the REPLY on a port
+# with `switchport voice vlan` configured; a phone sends the QUERY. tshark files
+# both under the same `cdp.voice_vlan` field, so the TLV type list decides which
+# one a value came from.
+_CDP_TLV_VOIP_VLAN_REPLY = 0x000E
+_CDP_TLV_VOIP_VLAN_QUERY = 0x000F
+
+
+def _parse_cdp(body: dict[str, Any], eth: dict[str, Any]) -> dict[str, Any]:
+    """One CDP frame, from tshark's ek `cdp` layer (field names pinned against
+    tshark 4.4's dissector: cdp_cdp_deviceid, cdp_cdp_portid,
+    cdp_cdp_native_vlan, cdp_cdp_voice_vlan, cdp_cdp_tlv_type).
+
+    A VLAN that is absent or not a VLAN id is None. tshark dissects both VLAN
+    fields as uint16, so "present but not a VLAN id" means a malformed frame; it
+    reads as "not advertised" downstream, which is the one imprecision accepted.
+    """
+    return {
+        "device_id": _cdp_text(body.get("cdp_cdp_deviceid")),
+        "port_id": _cdp_text(body.get("cdp_cdp_portid")),
+        "native_vlan": _cdp_vlan(_scalar(body.get("cdp_cdp_native_vlan"))),
+        "voice_vlan": _cdp_voice_vlan(body),
+        "src_mac": (str(_scalar(eth.get("eth_eth_src")) or "").strip().lower() or None),
+    }
+
+
+def _cdp_voice_vlan(body: dict[str, Any]) -> int | None:
+    values = _as_list(body.get("cdp_cdp_voice_vlan"))
+    if not values:
+        return None
+    types = [_parse_int_loose(t) for t in _as_list(body.get("cdp_cdp_tlv_type"))]
+    if types:
+        voip = [t for t in types
+                if t in (_CDP_TLV_VOIP_VLAN_REPLY, _CDP_TLV_VOIP_VLAN_QUERY)]
+        if _CDP_TLV_VOIP_VLAN_REPLY not in voip:
+            return None  # a Query's value: a phone asking, not a switch advertising
+        if len(voip) == len(values):
+            return _cdp_vlan(values[voip.index(_CDP_TLV_VOIP_VLAN_REPLY)])
+    return _cdp_vlan(values[0])
+
+
+def _cdp_text(v: Any) -> str | None:
+    s = _scalar(v)
+    if s is None or isinstance(s, (bool, dict, list)):
+        return None
+    return str(s).strip() or None
+
+
+def _cdp_vlan(v: Any) -> int | None:
+    """A VLAN id from CDP, or None on anything that is not one.
+
+    0..4095, not 1..4094, on purpose: `switchport voice vlan dot1p` tells the
+    phone to priority-tag on VLAN 0, and `... untagged` is carried as the
+    reserved 4095 (the dashboard should render both as modes, not VLAN numbers).
+    Both ARE a voice-VLAN configuration; dropping them would report "none".
+    """
+    if v is None or isinstance(v, bool):
+        return None
+    s = str(v).strip()
+    n: int | None
+    try:
+        n = int(s, 10)
+    except ValueError:
+        n = _parse_int_loose(s)  # "0x0064"
+    if n is None or not 0 <= n <= 4095:
+        return None
+    return n
+
+
+def _as_list(v: Any) -> list[Any]:
+    """ek gives a list when a field repeats in a frame and a bare scalar when it
+    does not; normalize to a list without the None/empty entries."""
+    items = v if isinstance(v, list) else [v]
+    return [x for x in items if x not in (None, "")]
 
 
 def _format_bridge_id(prio: Any, ext: Any, hw: Any) -> str | None:

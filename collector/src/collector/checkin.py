@@ -2167,6 +2167,17 @@ def _report_voice(
             "grade": r.get("grade"),
             "dscp": r.get("dscp"),
             "error": r.get("error"),
+            # The internet target's best-effort QoS twin (voice.py docstring):
+            # None on every other target. Compared against the EF figures
+            # above; equal means inconclusive, never "QoS broken".
+            "beStatus": r.get("be_status"),
+            "beSent": r.get("be_sent"),
+            "beReceived": r.get("be_received"),
+            "beLossPct": r.get("be_loss_pct"),
+            "beMaxLossBurst": r.get("be_max_loss_burst"),
+            "beRttAvgMs": r.get("be_rtt_avg_ms"),
+            "beRttP95Ms": r.get("be_rtt_p95_ms"),
+            "beJitterMs": r.get("be_jitter_ms"),
             "startedAt": ts,
         }
         for r in results

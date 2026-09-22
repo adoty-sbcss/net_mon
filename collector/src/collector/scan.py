@@ -256,6 +256,16 @@ def _run_scan_locked(*, interface: str, trigger_reason: str, force: bool,
 
         # 4. LLDP / CDP neighbors (skipped on a light capture-only pass)
         lldp_neighbors = [] if light else lldp_mod.fetch_neighbors()
+        # 4a. The voice VLAN each CDP neighbor advertises to this port, from the
+        # CDP frames the capture above kept (lldpd drops that TLV). Enrichment
+        # only: a failure here is a section error, never a failed scan.
+        try:
+            from .discovery import cdp_voice as cdp_voice_mod
+
+            cdp_voice_mod.annotate_neighbors(lldp_neighbors, cap_results.cdp)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("cdp voice-vlan annotation failed", error=str(exc))
+            section_errors["cdp_voice"] = str(exc)
         ctx.raw_outputs["lldp"] = lldp_neighbors
 
         # 5. ARP sweep
@@ -779,9 +789,18 @@ def _persist(
             log.info("inventory updated", scan_id=ctx.scan_id,
                      upserted=upserted, new=new)
 
+    # Explicit columns, not **n: a neighbor dict carries keys that are not
+    # columns (annotations land in `extra`), and insert_many takes its column
+    # list from the first row, so one stray key would fail the whole persist.
     insert_many("neighbors", [
-        {**n, "scan_run_id": ctx.scan_id, "extra": "{}",
-         "capabilities": n.get("capabilities") or None}
+        {
+            **{c: n.get(c) for c in (
+                "local_port", "protocol", "chassis_id", "port_id", "system_name",
+                "system_description", "port_description", "vlan_id", "mgmt_ip")},
+            "capabilities": n.get("capabilities") or None,
+            "scan_run_id": ctx.scan_id,
+            "extra": dumps_jsonb(n.get("extra") or {}),
+        }
         for n in lldp_neighbors
     ], connection=connection)
 

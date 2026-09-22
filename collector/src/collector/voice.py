@@ -32,12 +32,27 @@ Three outcomes per target (`status`), mirroring latency.py's honesty rule:
   100; latency, jitter and MOS are None, not zero.
 * `unavailable`— ping could not measure (no binary, no permission, DNS failure,
   hung). Every figure is None, loss included.
+
+The QoS twin (internet target only). Alongside the EF stream to the internet
+target runs a second, otherwise identical stream sent best effort (TOS 0), at
+the SAME time, so both cross the same congestion. Its figures ride on the
+internet result as `be_*` (`be_status` carries the same three outcomes); it is a
+comparison baseline, not a call, so it gets no R/MOS/grade. The point is the
+difference: EF clearly beating BE while the path is loaded is evidence that
+priority queueing works. Equal results are INCONCLUSIVE, never "QoS broken" —
+no congestion during those five seconds, the marking stripped at the sensor's
+own switch port (normal: a data port does not trust DSCP), and a path with no
+priority queue all look exactly alike. The twin doubles the probe rate to that
+one target for five seconds, so a target that rate-limits ICMP drops from both
+streams at once — which reads as equal, i.e. still inconclusive — AND lowers the
+EF stream's own score, the number the call-quality verdicts judge by. That is
+why the rollout compares the internet row's EF loss before and after the twin.
 """
 from __future__ import annotations
 
 import re
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import structlog
@@ -51,6 +66,13 @@ PACKETS = 250  # 5 s of audio at 50 packets/s
 INTERVAL_SEC = 0.02
 DSCP_EF = 46
 TOS_EF = DSCP_EF << 2  # 0xB8
+TOS_BE = 0  # best effort: the QoS twin's marking
+
+# The label that gets a best-effort twin, and the twin's figures as they ride on
+# that label's result (prefixed `be_`). Deliberately no r_factor/mos/grade.
+TWIN_LABEL = "internet"
+_TWIN_FIELDS = ("sent", "received", "loss_pct", "max_loss_burst",
+                "rtt_avg_ms", "rtt_p95_ms", "jitter_ms")
 
 # ITU-T G.107 defaults / G.113 Appendix I for G.711 with packet-loss concealment.
 _R0_MINUS_IS = 93.2
@@ -176,8 +198,11 @@ def parse_ping(stdout: str) -> tuple[int | None, dict[int, float]]:
     return (int(tm.group(1)) if tm else None), rtts
 
 
-def _probe_one(label: str, host: str) -> dict[str, Any]:
-    base: dict[str, Any] = {"label": label, "host": host, "dscp": DSCP_EF,
+def _probe_one(label: str, host: str, tos: int = TOS_EF) -> dict[str, Any]:
+    """One voice-shaped stream to `host`. `tos` is the whole TOS byte (DSCP << 2):
+    TOS_EF for the call itself, TOS_BE for the internet target's QoS twin — the
+    only thing the twin changes."""
+    base: dict[str, Any] = {"label": label, "host": host, "dscp": tos >> 2,
                             "payload_bytes": PAYLOAD_BYTES, "error": None}
     # No `-w`, deliberately. iputils keeps SENDING past `-c` while `-w` has time
     # left (pinger()'s guard is `&& !deadline`), so under loss the stream would run
@@ -185,7 +210,7 @@ def _probe_one(label: str, host: str) -> dict[str, Any]:
     # makes ping exit at the FIRST ICMP error, truncating the sample mid-stream.
     # `-W 1` bounds the wait for the last reply; the subprocess timeout bounds a hang.
     cmd = ["ping", "-n", "-c", str(PACKETS), "-i", str(INTERVAL_SEC), "-s", str(PAYLOAD_BYTES),
-           "-Q", str(TOS_EF), "-W", "1", host]
+           "-Q", str(tos), "-W", "1", host]
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=int(PACKETS * INTERVAL_SEC) + 15)
@@ -205,10 +230,26 @@ def _probe_one(label: str, host: str) -> dict[str, Any]:
     return {**base, "status": status, **scored}
 
 
+def twin_fields(twin: dict[str, Any] | None) -> dict[str, Any]:
+    """The best-effort twin's figures as the `be_*` keys. Exported for the tests.
+
+    `unavailable` — including a twin that raised, passed as None — carries NO
+    figures, not even the zero received/burst an unscored stream reports, so
+    "could not measure" can never read as "measured, nothing lost"."""
+    status = (twin or {}).get("status")
+    if status not in ("ok", "no_reply"):
+        status = "unavailable"
+    out: dict[str, Any] = {"be_status": status}
+    for k in _TWIN_FIELDS:
+        out[f"be_{k}"] = (twin or {}).get(k) if status != "unavailable" else None
+    return out
+
+
 def probe_voice(targets: list[tuple[str, str]]) -> list[dict[str, Any]]:
     """Probe each (label, host) concurrently — all targets finish in ~one stream's
     time, so the check-in grows by seconds, not by seconds x targets. De-dupes by
-    host (first label wins)."""
+    host (first label wins). The internet target also gets its best-effort twin
+    (module docstring), reported on its result as `be_*`."""
     unique: list[tuple[str, str]] = []
     seen: set[str] = set()
     for label, host in targets:
@@ -217,9 +258,40 @@ def probe_voice(targets: list[tuple[str, str]]) -> list[dict[str, Any]]:
             unique.append((label, host))
     if not unique:
         return []
-    with ThreadPoolExecutor(max_workers=min(4, len(unique))) as pool:
-        results = list(pool.map(lambda t: _probe_one(*t), unique))
+    # One worker per stream, so every stream STARTS together: the twin has to
+    # overlap its EF sibling in time (the comparison means nothing unless both saw
+    # the same congestion), and nothing may queue behind a worker cap and run a
+    # second five seconds. At most gateway + internet + 4 voice + 1 twin = 7.
+    # Each twin is submitted straight after its sibling to keep the start skew to
+    # a thread spawn.
+    twin_hosts = [host for label, host in unique if label == TWIN_LABEL]
+    with ThreadPoolExecutor(max_workers=len(unique) + len(twin_hosts)) as pool:
+        ef_futures: list[Future[dict[str, Any]]] = []
+        twin_futures: dict[str, Future[dict[str, Any]]] = {}
+        for label, host in unique:
+            ef_futures.append(pool.submit(_probe_one, label, host))
+            if label == TWIN_LABEL:
+                twin_futures[host] = pool.submit(_probe_one, label, host, tos=TOS_BE)
+        results = [f.result() for f in ef_futures]
+        twins: dict[str, dict[str, Any] | None] = {}
+        for host, fut in twin_futures.items():
+            # The twin is an add-on: nothing it does may cost the EF measurement.
+            try:
+                twins[host] = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("voice probe best-effort twin failed", host=host, error=str(exc))
+                twins[host] = None
     for r in results:
+        be: dict[str, Any] = {}
+        if r.get("label") == TWIN_LABEL and r.get("host") in twins:
+            twin = twins[r["host"]]
+            be = twin_fields(twin)
+            r.update(be)
+            if be["be_status"] == "unavailable" and twin is not None:
+                log.info("voice probe best-effort twin unavailable", host=r["host"],
+                         error=twin.get("error"))
         log.info("voice probe", label=r["label"], host=r["host"], status=r["status"],
-                 mos=r.get("mos"), loss_pct=r.get("loss_pct"), jitter_ms=r.get("jitter_ms"))
+                 mos=r.get("mos"), loss_pct=r.get("loss_pct"), jitter_ms=r.get("jitter_ms"),
+                 **({"be_status": be["be_status"], "be_loss_pct": be["be_loss_pct"],
+                     "be_jitter_ms": be["be_jitter_ms"]} if be else {}))
     return results

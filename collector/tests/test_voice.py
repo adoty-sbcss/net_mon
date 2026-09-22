@@ -132,12 +132,15 @@ def test_hung_ping_is_unavailable(monkeypatch):
 
 def test_probe_voice_dedupes_hosts(monkeypatch):
     calls = []
-    def fake(label, host):
-        calls.append((label, host))
+    def fake(label, host, tos=voice.TOS_EF):
+        calls.append((label, host, tos))
         return {"label": label, "host": host, "status": "ok"}
     monkeypatch.setattr(voice, "_probe_one", fake)
     out = voice.probe_voice([("gateway", "10.0.0.1"), ("voice", "10.0.0.1"), ("internet", "1.1.1.1")])
-    assert sorted(calls) == [("gateway", "10.0.0.1"), ("internet", "1.1.1.1")]
+    ef = sorted((label, host) for label, host, tos in calls if tos == voice.TOS_EF)
+    assert ef == [("gateway", "10.0.0.1"), ("internet", "1.1.1.1")]
+    # Plus the internet target's best-effort twin (test_voice_qos_twin.py).
+    assert [(label, host) for label, host, tos in calls if tos == voice.TOS_BE] == [("internet", "1.1.1.1")]
     assert len(out) == 2
 
 
