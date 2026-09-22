@@ -34,8 +34,8 @@ Honesty rules, the same shape as speedtest.py's:
   a family `ok` (when it answered in that family) but its failures say nothing
   about either family — they are appended to the error text as `hostname: …`
   and never change the status.
-* Measured at most every REFRESH_SEC (RETRY_SEC after an unsuccessful attempt)
-  and cached on disk, so a three-minute check-in does not become a three-minute
+* Measured at most every REFRESH_SEC (RETRY_SEC after an unsuccessful IPv4
+  attempt — IPv6 trouble alone does not shorten the cache) and cached on disk, so a three-minute check-in does not become a three-minute
   poll of someone else's endpoint. The cached `observedAt` travels with the
   value, so the dashboard knows how old the reading is.
 
@@ -153,8 +153,13 @@ def measure_family(family: int, sources: tuple[str, ...], fetch: Fetcher) -> dic
     failed: list[str] = []
     hostname_notes: list[str] = []
     no_route = 0
+    literals = [u for u in sources if u != _HOSTNAME_TRACE]
     for url in sources:
         pinned = url != _HOSTNAME_TRACE
+        if not pinned and family == 6 and literals and no_route >= len(literals):
+            # Every pinned v6 literal said "no route": the hostname would connect
+            # over IPv4 and could never yield IPv6 evidence. Skip the request.
+            break
         refusals = refused if pinned else hostname_notes
         failures = failed if pinned else hostname_notes
         try:
@@ -164,9 +169,13 @@ def measure_family(family: int, sources: tuple[str, ...], fetch: Fetcher) -> dic
             continue
         except Exception as exc:  # noqa: BLE001 — every transport failure is data here
             reason: Any = getattr(exc, "reason", exc)
-            if isinstance(reason, ssl.SSLError):
-                # Something answered with a certificate that isn't the source's —
-                # a decrypting filter. A refusal, not a dead link.
+            if isinstance(reason, ssl.SSLError) and not isinstance(
+                reason, (ssl.SSLEOFError, ssl.SSLZeroReturnError)
+            ):
+                # Something spoke TLS back with a certificate (or protocol) that
+                # isn't the source's — a decrypting filter or a portal. A refusal,
+                # not a dead link. A peer that merely CLOSED mid-handshake proves
+                # nothing answered, so it stays `failed`, like a reset.
                 refusals.append(f"TLS: {type(reason).__name__}")
                 continue
             if pinned and _is_no_route(exc):
@@ -186,7 +195,6 @@ def measure_family(family: int, sources: tuple[str, ...], fetch: Fetcher) -> dic
             continue
         return {"ip": ip, "status": STATUS_OK}
     notes = f"; hostname: {', '.join(hostname_notes)}" if hostname_notes else ""
-    literals = [u for u in sources if u != _HOSTNAME_TRACE]
     if family == 6 and literals and no_route >= len(literals):
         return {"ip": None, "status": STATUS_NONE}
     if refused:

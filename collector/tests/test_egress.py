@@ -267,6 +267,21 @@ def test_v4_only_box_is_none_even_when_the_hostname_is_filtered():
         assert measure_family(6, V6_SOURCES, fetch)["status"] == STATUS_NONE, hostname_answer
 
 
+def test_tls_close_mid_handshake_is_failed_like_a_reset():
+    # A filter that just closes the connection answered nothing — same as an RST.
+    closed = urllib.error.URLError(ssl.SSLEOFError("EOF occurred in violation of protocol"))
+    fetch, _ = _fetcher({u: closed for u in V4_SOURCES})
+    assert measure_family(4, V4_SOURCES, fetch)["status"] == STATUS_FAILED
+
+
+def test_no_v6_route_skips_the_hostname_request():
+    table: dict[str, object] = {u: _no_route() for u in V6_SOURCES[:2]}
+    table[_HOSTNAME_TRACE] = (200, TRACE_V4)
+    fetch, calls = _fetcher(table)
+    assert measure_family(6, V6_SOURCES, fetch)["status"] == STATUS_NONE
+    assert _HOSTNAME_TRACE not in calls
+
+
 def test_tls_interception_is_refused_not_failed():
     # A decrypting K-12 web filter answers with its own certificate: the source
     # was reached and could not be trusted — not a dead link.
