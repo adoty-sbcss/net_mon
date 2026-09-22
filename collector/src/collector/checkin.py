@@ -37,6 +37,7 @@ from pathlib import Path
 import structlog
 
 from . import __version__
+from . import egress as egress_mod
 from . import host_metrics as host_metrics_mod
 from . import uploader as uploader_mod
 from .config import get_settings
@@ -2615,6 +2616,15 @@ def run_console_poll() -> int:
     return 0
 
 
+def _egress_report() -> dict | None:
+    """egress.observe(), but never able to cost the check-in it rides on."""
+    try:
+        return egress_mod.observe()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("egress report failed", error=str(exc))
+        return None
+
+
 def run_checkin() -> int:
     settings = get_settings()
     # Fall back to the baked-in default when the env var is unset OR blank, so a
@@ -2660,6 +2670,11 @@ def run_checkin() -> int:
             # Sensor self-health (CPU/RAM/disk/OS/uptime) for the dashboard's
             # per-box health view + heartbeat. Best-effort: {} if collection fails.
             "hostMetrics": host_metrics_mod.collect(),
+            # PUB-21: the public address this box reaches the internet from
+            # (cached, re-measured at most every 15 min — see egress.py). The
+            # dashboard keys its external-exposure lookup on it and logs every
+            # change, so a WAN failover shows up as an address change.
+            "egress": _egress_report(),
             # Actual config the box is running, so the dashboard can show ground
             # truth (not just what it pushed).
             "currentConfig": {
