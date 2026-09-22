@@ -44,7 +44,9 @@ no congestion during those five seconds, the marking stripped at the sensor's
 own switch port (normal: a data port does not trust DSCP), and a path with no
 priority queue all look exactly alike. The twin doubles the probe rate to that
 one target for five seconds, so a target that rate-limits ICMP drops from both
-streams at once — which reads as equal, i.e. still inconclusive.
+streams at once — which reads as equal, i.e. still inconclusive — AND lowers the
+EF stream's own score, the number the call-quality verdicts judge by. That is
+why the rollout compares the internet row's EF loss before and after the twin.
 """
 from __future__ import annotations
 
