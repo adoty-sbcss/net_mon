@@ -2625,6 +2625,44 @@ def _egress_report() -> dict | None:
         return None
 
 
+# --- NOTIF-8 active monitoring glue ---------------------------------------------
+# All of it contained: the check-in is the box's only control plane, so nothing
+# about watching core devices may ever break it.
+
+
+def _watch_pending_report() -> dict | None:
+    try:
+        from . import watch as watch_mod
+
+        return watch_mod.pending_report()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read the pending watch report", error=str(exc))
+        return None
+
+
+def _watch_after_checkin(report_was_sent: bool, watch: object) -> None:
+    try:
+        from . import watch as watch_mod
+
+        if report_was_sent:
+            watch_mod.clear_report()
+        watch_mod.accept_targets(watch)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("watch list handling failed", error=str(exc))
+
+
+def _maybe_watch() -> None:
+    try:
+        from . import latency as latency_mod
+        from . import watch as watch_mod
+
+        # The lookup is passed, not called: with no list, run_cycle returns before
+        # running even the `ip route` subprocess.
+        watch_mod.run_cycle(latency_mod.default_gateway)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("watch cycle failed", error=str(exc))
+
+
 def run_checkin() -> int:
     settings = get_settings()
     # Fall back to the baked-in default when the env var is unset OR blank, so a
@@ -2646,6 +2684,9 @@ def run_checkin() -> int:
     wait_for_db()
     applied = _read_applied_version()
     local_ip, iface, cidr = _local_net()
+    # NOTIF-8: what the watch cycles since the last successful check-in saw (edges +
+    # the latest summary). Cleared only after the dashboard took this POST.
+    watch_report = _watch_pending_report()
     resp, http_status = _post_status(
         f"{url}/api/sensor/checkin",
         token,
@@ -2675,6 +2716,10 @@ def run_checkin() -> int:
             # dashboard keys its external-exposure lookup on it and logs every
             # change, so a WAN failover shows up as an address change.
             "egress": _egress_report(),
+            # NOTIF-8 active monitoring: edges (down/up) and a per-cycle summary
+            # (probed / skipped / blind / never-reached / refused list). None when
+            # the dashboard has pushed no watch list.
+            "watch": watch_report,
             # Actual config the box is running, so the dashboard can show ground
             # truth (not just what it pushed).
             "currentConfig": {
@@ -2738,7 +2783,14 @@ def run_checkin() -> int:
             _maybe_webperf(url, token, settings, offline=True)
         except Exception as exc:  # noqa: BLE001 — preserve the original failed check-in
             log.warning("offline website probes failed", error=str(exc))
+        # NOTIF-8: keep watching while the dashboard is unreachable; the edges wait
+        # in the pending report for the next successful check-in.
+        _maybe_watch()
         return 1
+
+    # NOTIF-8: the dashboard took this POST, so the report it carried is delivered;
+    # then take the (possibly new) watch list from the response.
+    _watch_after_checkin(watch_report is not None, resp.get("watch"))
 
     config_changed = False
     cfg = resp.get("config")
@@ -2816,6 +2868,9 @@ def run_checkin() -> int:
     # baseline fresh. The baseline is what makes an outage capture readable at
     # all, and it cannot be collected retrospectively.
     _wan_path_on_success(settings)
+    # NOTIF-8: ping the watch list AFTER the control-plane work, within its own
+    # time budget, so it can never delay a command or a config apply.
+    _maybe_watch()
 
     # Exit precedence: update (11) already recreates + may host-reboot via the
     # update path, so it wins; then host actions (12); then a plain config
