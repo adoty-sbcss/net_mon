@@ -65,6 +65,9 @@ def test_database_password_never_rides_a_command_line() -> None:
             'PGPASSWORD="${POSTGRES_PASSWORD:-}"', ""
         )), path.name
         assert "PG_PW" not in code, path.name
+        # Stronger than the pattern above, which a command substitution would
+        # slip past: the name may appear ONLY inside the in-container script.
+        assert "PGPASSWORD" not in code.replace('\'PGPASSWORD="${POSTGRES_PASSWORD:-}" exec ', ""), path.name
 
 
 def test_password_is_supplied_inside_the_container() -> None:
@@ -86,6 +89,18 @@ def test_rollback_can_find_a_snapshot_it_cannot_read_directly() -> None:
     assert '[[ -e "$LATEST_SNAP" ]] || sudo -n test -e "$LATEST_SNAP"' in code
     assert 'sudo -n gunzip -c "$LATEST_SNAP"' in code
     assert code.count('gunzip -c "$LATEST_SNAP"') == 2  # direct + sudo, both in snap_cat
+
+
+def test_rollback_checks_the_snapshot_is_whole_before_dropping_anything() -> None:
+    # The DROP and the dump travel on one stream and psql commits at end of
+    # input, so a snapshot that cannot be read must be detected before the DROP
+    # is ever sent. Order is the whole point here.
+    code = _code(ROLLBACK)
+    gate = code.index("if ! snap_intact; then")
+    drop = code.index("printf 'DROP SCHEMA public CASCADE")
+    assert gate < drop
+    assert code.count("DROP SCHEMA") == 1
+    assert "elif { printf 'DROP SCHEMA public CASCADE" in code
 
 
 def test_wifi_artifacts_are_not_world_readable() -> None:
