@@ -87,8 +87,12 @@ def test_rollback_can_find_a_snapshot_it_cannot_read_directly() -> None:
     code = _code(ROLLBACK)
     assert "if snap_exists; then" in code
     assert '[[ -e "$LATEST_SNAP" ]] || sudo -n test -e "$LATEST_SNAP"' in code
-    assert 'sudo -n gunzip -c "$LATEST_SNAP"' in code
-    assert code.count('gunzip -c "$LATEST_SNAP"') == 2  # direct + sudo, both in snap_cat
+    assert 'sudo -n gunzip -c "$SNAP_FILE"' in code
+    assert code.count('gunzip -c "$SNAP_FILE"') == 2  # direct + sudo, both in snap_cat
+    # The symlink is resolved once, before the check, so the file that is checked
+    # is the file that is restored.
+    assert "gunzip -c \"$LATEST_SNAP\"" not in code
+    assert code.index("\n    snap_resolve\n") < code.index("if ! snap_intact; then")
 
 
 def test_rollback_checks_the_snapshot_is_whole_before_dropping_anything() -> None:

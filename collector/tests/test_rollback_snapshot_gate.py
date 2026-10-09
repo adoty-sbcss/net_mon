@@ -65,6 +65,30 @@ def _intact(tmp_path: Path, snapshot: Path | None) -> bool:
     return proc.stdout.strip() == "INTACT"
 
 
+def test_the_file_checked_is_the_file_restored_when_latest_is_repointed(tmp_path) -> None:
+    # db-snapshot.sh re-points latest.sql.gz. If that happens between the check
+    # and the restore, the restore must still read the file that was checked.
+    if sys.platform == "win32":
+        pytest.skip("needs real symlinks")
+    good = _gz(tmp_path / "netmon_1.sql.gz", DUMP)
+    bad = tmp_path / "netmon_2.sql.gz"
+    bad.write_bytes(b"not a gzip")
+    latest = tmp_path / "latest.sql.gz"
+    latest.symlink_to(good.name)
+    script = tmp_path / "race.sh"
+    script.write_text(
+        "set -euo pipefail\nsudo() { return 1; }\n"
+        f'LATEST_SNAP="{latest.as_posix()}"\n'
+        + _funcs()
+        + "\nsnap_resolve\nsnap_intact || { echo BAD; exit 0; }\n"
+        f'ln -sfn "{bad.name}" "$LATEST_SNAP"\n'  # the swap
+        "snap_cat | tail -n 3 | grep -q 'dump complete' && echo SAME_FILE || echo SWAPPED\n",
+        encoding="utf-8", newline="\n",
+    )
+    proc = subprocess.run([_bash(), script.as_posix()], capture_output=True, text=True)
+    assert proc.stdout.strip() == "SAME_FILE", proc.stdout + proc.stderr
+
+
 def _gz(path: Path, text: str) -> Path:
     with gzip.open(path, "wb") as fh:
         fh.write(text.encode())
