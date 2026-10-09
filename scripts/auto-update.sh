@@ -146,7 +146,14 @@ fi
 
 # Read a NETMON_* key from the env file (root-owned 0600). Empty if absent.
 read_env() {
-    sudo grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true
+    # Read directly when we can; sudo only when we must. Either way a failure
+    # yields "" — so callers that must not mistake "unreadable" for "unset"
+    # (the update channel) check channel_env_known first.
+    if [[ -r "$ENV_FILE" ]]; then
+        grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true
+    else
+        sudo -n grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true
+    fi
 }
 # Persist the live commit SHA so the dashboard can show exactly which release a
 # box is on (release-channel rollout view). Best-effort.
@@ -429,10 +436,12 @@ LOCAL=$(git rev-parse HEAD)
 #     channel means "follow main" — so without this an unreadable file would
 #     read as "no hold, no pin".
 channel_env_known() {
-    [[ -r "$ENV_FILE" ]] && return 0
-    sudo -n true 2>/dev/null && return 0    # read_env's sudo will work (or the file is absent)
+    [[ -r "$ENV_FILE" ]] && return 0                       # read_env reads it directly
+    sudo -n cat "$ENV_FILE" >/dev/null 2>&1 && return 0    # read_env's sudo read works
+    # Not readable either way: fine only if it is verifiably ABSENT (a box not
+    # set up yet), never merely invisible.
+    sudo -n test ! -e "$ENV_FILE" 2>/dev/null && return 0
     local dir; dir="$(dirname "$ENV_FILE")"
-    # No sudo: fine only if the file is verifiably absent (a box not set up yet).
     [[ ! -e "$ENV_FILE" ]] && { [[ ! -e "$dir" ]] || [[ -x "$dir" ]]; }
 }
 if ! channel_env_known; then
