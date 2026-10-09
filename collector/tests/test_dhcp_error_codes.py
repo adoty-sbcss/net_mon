@@ -232,3 +232,57 @@ def test_credential_rejection_code_agrees_with_the_fail_fast_decision() -> None:
     # because that decision is what stops the RPC fallback (AD lockout protection).
     for sign in dh._AUTH_FAILURE_SIGNS:
         assert dh._classify(f"x {sign} y timed out access denied", "collect_failed") == "auth_failed"
+
+
+def test_a_successful_reply_cannot_overwrite_sensor_fields_or_add_its_own(monkeypatch) -> None:
+    # The server's JSON is the server's text. A reply that says ok:true but also
+    # carries status/transport/server_ip, or a field nobody defined, must not be
+    # able to forge a failed entry (bypassing _fail) or relabel the target.
+    monkeypatch.setattr(dh, "_detect_transport", lambda e, t: "ntlm")
+    hostile = {
+        "ok": True, "status": "error", "transport": "forged", "server_ip": "203.0.113.9",
+        "label": "forged", "server_type": "forged", "code": "forged",
+        "error": LEAKY, "detail": LEAKY, "note": LEAKY,
+        "hostname": "DC01", "scopes": [{"scope_id": "10.1.0.0"}],
+    }
+    _fake_winrm(monkeypatch, result=_Result(std_out=json.dumps(hostile).encode()))
+
+    out = dh._collect_one(TARGET, winrm_timeout=30)
+
+    assert out["status"] == "ok"
+    assert out["transport"] == "ntlm"
+    assert (out["server_ip"], out["label"], out["server_type"]) == ("10.0.0.10", "Core DHCP", "windows")
+    assert out["hostname"] == "DC01" and out["scopes"] == [{"scope_id": "10.1.0.0"}]
+    assert set(out) <= set(dh._REPORT_FIELDS) | {"server_ip", "label", "server_type", "status", "transport"}
+    for needle in NEEDLES:
+        assert needle.lower() not in json.dumps(out).lower(), needle
+
+
+def test_rpc_success_goes_through_the_same_whitelist(monkeypatch) -> None:
+    monkeypatch.setattr(dh, "_kinit", lambda u, p, ip: "/tmp/cc")
+    monkeypatch.setattr(dh, "_cleanup_ccache", lambda c: None)
+    fake = types.ModuleType("collector.discovery.dhcp_rpc")
+    fake.collect = lambda *a, **k: {  # type: ignore[attr-defined]
+        "hostname": "DC01", "scopes": [], "transport_detail": "rpc", "status": "error", "detail": LEAKY,
+    }
+    import collector.discovery as discovery_pkg
+
+    monkeypatch.setitem(sys.modules, "collector.discovery.dhcp_rpc", fake)
+    monkeypatch.setattr(discovery_pkg, "dhcp_rpc", fake, raising=False)
+
+    out = dh._collect_one({**TARGET, "transport": "rpc"}, winrm_timeout=30)
+
+    assert (out["status"], out["transport"], out["hostname"]) == ("ok", "rpc", "DC01")
+    assert "transport_detail" not in out and "detail" not in out
+
+
+def test_unsupported_and_skipped_entries_carry_only_fixed_text() -> None:
+    out = dh._collect_one({"server_ip": "10.0.0.10", "server_type": "kea'; <x>"}, winrm_timeout=30)
+    assert out["status"] == "unsupported"
+    assert out["error"] == dh._ERROR_TEXT["unsupported_server_type"]
+
+    intel = dh.collect_all([TARGET], time_budget=-1)
+    assert intel["servers"][0] == {
+        "server_ip": "10.0.0.10", "label": "Core DHCP",
+        "status": "skipped", "error": "time budget exhausted",
+    }

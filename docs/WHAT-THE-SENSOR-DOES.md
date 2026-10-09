@@ -178,7 +178,7 @@ Dedicate a machine to the sensor. Do not install it on a box that does anything 
 | Per-sensor enrollment token | `/var/lib/netmon/enroll-token`, mode 0600 | Sent to the dashboard as the bearer token on each request |
 | Shared bootstrap key | `/etc/netmon/netmon.env`, mode 0600 | Sent at enrollment, and again if the sensor has to re-enroll |
 | SNMP read communities | `netmon.env` (0600) and the local database | **Yes.** The community that worked for each device is included in the hourly bundle, and the configured list is reported at check-in, so the dashboard can show which credential works where. Use read-only communities. |
-| DHCP-server (WinRM) account | `/var/lib/netmon/dhcp-targets.json`, 0600 | No. A failed collection is reported as a fixed error code and sentence; the underlying error text, which can name the account, stays in the sensor's local log. |
+| DHCP-server (WinRM) account | `/var/lib/netmon/dhcp-targets.json`, 0600 | Not in the bundle: a failed collection is reported there as a fixed error code and sentence. The underlying error text, which can name the account, is written to the sensor's log, and a dashboard operator can retrieve that log ("collect logs"). The password is in neither. |
 | Switch SSH credentials | `/var/lib/netmon/device-config-targets.json`, 0600 | No |
 | Wi-Fi PSK / 802.1X credentials | `netmon.env`, a 0600 profile file, and a 0600 NetworkManager keyfile | No |
 | Secrets inside backed-up switch configs | Replaced on the box by a keyed hash before storage; the key never leaves the box | No — only the redacted config is uploaded |
