@@ -36,7 +36,8 @@ ensure_paths() {
     $SUDO install -d -m 750 -o "$NETMON_OWNER_USER" -g "$NETMON_OWNER_USER" "$NETMON_ETC_DIR"
     $SUDO install -d -m 755 -o "$NETMON_OWNER_USER" -g "$NETMON_OWNER_USER" "$NETMON_VAR_DIR"
     $SUDO install -d -m 755 -o "$NETMON_OWNER_USER" -g "$NETMON_OWNER_USER" "$NETMON_BUNDLES_DIR"
-    $SUDO install -d -m 755 -o "$NETMON_OWNER_USER" -g "$NETMON_OWNER_USER" "$NETMON_DB_SNAPSHOTS_DIR"
+    # 0700: the dumps in here are full database copies, SNMP communities included.
+    $SUDO install -d -m 700 -o "$NETMON_OWNER_USER" -g "$NETMON_OWNER_USER" "$NETMON_DB_SNAPSHOTS_DIR"
     $SUDO install -d -m 755 -o "$NETMON_OWNER_USER" -g "$NETMON_OWNER_USER" "$NETMON_LOG_DIR"
 
     # Then sweep any legacy in-repo files into place.

@@ -620,7 +620,8 @@ main() {
     local tmp; tmp="$(mktemp)"
     printf '{"schema":1,"generated_at":"%s","interface":"%s","results":[%s]}\n' \
         "$(_ts)" "$iface" "$results" > "$tmp"
-    $SUDO install -m 0644 "$tmp" "$OUT"
+    # 0600: read only by the collector container (root).
+    $SUDO install -m 0600 "$tmp" "$OUT"
     rm -f "$tmp"
     echo "wrote $OUT (interface=$iface profiles=$n)"
 }

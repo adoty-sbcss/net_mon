@@ -54,6 +54,43 @@ ensure_env_readable() {
 }
 ensure_env_readable
 
+# The snapshot directory is 0700 and owned by the update user (the dumps hold the
+# SNMP communities). A rollback started by a different account must still find
+# the snapshot: a plain `[[ -e ]]` answers "no" for a directory it cannot search,
+# which would skip the DB restore and say only "no snapshot". So fall back to
+# sudo for both the test and the read.
+snap_exists() {
+    [[ -e "$LATEST_SNAP" ]] || sudo -n test -e "$LATEST_SNAP" 2>/dev/null
+}
+# latest.sql.gz is a symlink that db-snapshot.sh re-points. Resolve it ONCE to the
+# timestamped file it names and use that file for both the check and the restore:
+# otherwise a snapshot taken in between could swap the file after it was checked.
+# (The timestamped file itself is never rewritten, and the newest one is never
+# pruned.) Falls back to the symlink path if it cannot be resolved.
+SNAP_FILE=""
+snap_resolve() {
+    SNAP_FILE="$(readlink -f "$LATEST_SNAP" 2>/dev/null || sudo -n readlink -f "$LATEST_SNAP" 2>/dev/null || true)"
+    [[ -n "$SNAP_FILE" ]] || SNAP_FILE="$LATEST_SNAP"
+}
+snap_cat() {
+    [[ -n "$SNAP_FILE" ]] || snap_resolve
+    if [[ -r "$SNAP_FILE" ]]; then
+        gunzip -c "$SNAP_FILE"
+    else
+        sudo -n gunzip -c "$SNAP_FILE"
+    fi
+}
+# True only if the WHOLE snapshot decompresses and ends with pg_dump's own
+# trailer. The restore below sends "DROP SCHEMA …" ahead of the dump on one
+# stream, and psql commits whatever it has received when that stream ends — it
+# cannot see that the decompressor upstream failed. So an unreadable, truncated
+# or half-written snapshot must be caught HERE, before anything is dropped:
+# checked afterwards, the database is already empty. `tail` reads to the end, so
+# with pipefail a gunzip failure anywhere in the file fails this too.
+snap_intact() {
+    snap_cat 2>/dev/null | tail -n 20 | grep -q 'PostgreSQL database dump complete'
+}
+
 cd "$REPO_DIR"
 
 log "=== NetMon rollback starting ==="
@@ -111,7 +148,7 @@ git -C "$REPO_DIR" reset --hard "$TARGET_SHA" >/dev/null 2>&1 || {
 
 # --- 5. Start postgres only, restore from snapshot ---------------------
 
-if [[ -e "$LATEST_SNAP" ]]; then
+if snap_exists; then
     log "starting postgres for snapshot restore..."
     "${DC[@]}" up -d postgres >/dev/null
     # Wait for postgres health
@@ -122,21 +159,31 @@ if [[ -e "$LATEST_SNAP" ]]; then
         sleep 2
     done
 
-    log "restoring DB snapshot: $(readlink "$LATEST_SNAP")"
+    snap_resolve
+    log "restoring DB snapshot: $(basename "$SNAP_FILE")"
     # Reset the schema, then load, in ONE transaction. The plain pg_dump carries
     # no DROP statements, so loading it into the current (post-update) schema used
     # to collide on the first CREATE and abort under ON_ERROR_STOP — a silent
     # no-op restore that left old code running on the new schema. Prepending
     # "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" clears the target so the
-    # dump loads cleanly; --single-transaction makes the whole thing atomic, so a
-    # bad/truncated snapshot rolls back and leaves the DB exactly as it was (never
-    # half-restored, never emptied). netmon is the DB superuser/owner so the reset
-    # is permitted, and the collector is down (compose down, above) so nothing
-    # else is connected.
-    PG_PW="$(sudo grep -E '^POSTGRES_PASSWORD=' /etc/netmon/netmon.env 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/^"//; s/"$//')"
-    if { printf 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;\n'; gunzip -c "$LATEST_SNAP"; } \
-            | "${DC[@]}" exec -T -e "PGPASSWORD=$PG_PW" postgres \
-              psql -U netmon -d netmon --single-transaction -v ON_ERROR_STOP=1 >/dev/null; then
+    # dump loads cleanly; --single-transaction means a dump that fails to LOAD
+    # rolls back and leaves the DB exactly as it was. It does NOT protect against a
+    # dump that fails to ARRIVE (see snap_intact), which is why that is checked
+    # first and the restore is skipped outright if the snapshot is not whole.
+    # netmon is the DB superuser/owner so the reset is permitted, and the collector
+    # is down (compose down, above) so nothing else is connected.
+    # The password is handed to psql by the shell INSIDE the container, from the
+    # POSTGRES_PASSWORD the container already holds — never `exec -e PGPASSWORD=…`,
+    # which put it in the argv of docker compose (and sudo) for any local user to
+    # read with ps.
+    # shellcheck disable=SC2016  # expanded by the container's shell, not this one
+    if ! snap_intact; then
+        log "WARN: snapshot is unreadable, truncated or incomplete — NOT restoring it."
+        log "      DB left on the post-update schema unchanged; investigate $LATEST_SNAP"
+    elif { printf 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;\n'; snap_cat; } \
+            | "${DC[@]}" exec -T postgres sh -c \
+              'PGPASSWORD="${POSTGRES_PASSWORD:-}" exec psql -U netmon -d netmon --single-transaction -v ON_ERROR_STOP=1' \
+              >/dev/null; then
         log "snapshot restored (schema reset + reload, atomic)"
     else
         log "WARN: snapshot restore failed and was rolled back — DB left on the"
