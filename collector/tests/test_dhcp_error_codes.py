@@ -66,6 +66,12 @@ def _fake_rpc(monkeypatch, exc: Exception) -> None:
 
     fake.collect = collect  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "collector.discovery.dhcp_rpc", fake)
+    # `from . import dhcp_rpc` reads the PACKAGE ATTRIBUTE when another test has
+    # already imported the real module, and only falls back to sys.modules when
+    # it has not. Patch both, or this silently dials a real server.
+    import collector.discovery as discovery_pkg
+
+    monkeypatch.setattr(discovery_pkg, "dhcp_rpc", fake, raising=False)
     monkeypatch.setattr(dh, "_cleanup_ccache", lambda c: None)
 
 
