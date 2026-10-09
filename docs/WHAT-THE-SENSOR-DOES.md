@@ -26,7 +26,7 @@ Wi-Fi NIC, and any VLAN sub-interface you configure):
 | What | Detail | Code | Turn off with |
 |---|---|---|---|
 | Passive capture | `tshark` in promiscuous mode for 60 s per scan, plus a light pass every 15 min. Only STP, CDP, LLDP, DHCP, ARP, broadcast and multicast frames are parsed. Parsed fields are kept; **no pcap and no payload is stored or uploaded.** | `discovery/tshark.py` | `NETMON_CAPTURE_SECONDS`, `NETMON_CAPTURE_INTERVAL` |
-| LLDP / CDP transmit | `lldpd` advertises the sensor (hostname, port) to the switch. CDP is sent once a CDP neighbor is heard. | `collector/entrypoint.sh` | no setting |
+| LLDP / CDP transmit | `lldpd` advertises the sensor to the switch (hostname, port, OS description, management address). CDP and similar vendor protocols are sent only once a neighbor speaking them is heard. | `collector/entrypoint.sh` | no setting |
 | ARP sweep | `arp-scan --localnet` on each scan. | `discovery/arp.py` | no setting |
 | Ping sweep | `nmap -sn -PE -PR` — ICMP echo, ARP and reverse-DNS lookups. **No port scan.** | `discovery/nmap.py` | no setting |
 | DHCP probe | One DHCPDISCOVER per full scan from the interface's own MAC. It never sends a REQUEST, so no lease is taken. Visible in DHCP and NAC logs. | `discovery/dhcp_probe.py` | `NETMON_DHCP_PROBE_ENABLED` |
@@ -45,7 +45,8 @@ configured (locally or pushed from the dashboard). Once one is:
   tables, the ARP cache, the bridge forwarding (MAC) tables, spanning-tree state,
   and hardware inventory including serial numbers (`discovery/snmp.py`).
 - The **topology crawl** then follows LLDP/CDP neighbors from switch to switch.
-  It is bounded (5 hops, 600 devices, 300 s, once a week by default) and defaults
+  It is bounded (5 hops, 600 devices, a 60 s time budget on a standard install,
+  once a week by default) and defaults
   to the path toward the gateway, but it is **not confined to the sensor's own
   subnet or site**: it will query any management address a neighbor table
   reveals, wherever the community string is accepted
@@ -81,7 +82,7 @@ The sensor needs outbound access to these. Nothing else is contacted by default.
 | `ghcr.io` | The prebuilt collector image. | With each update |
 | Docker Hub, Debian mirrors, PyPI, `wireshark.org` | Base images and packages when the image is built locally — the weekly refresh, and the fallback when the prebuilt image cannot be pulled. | Weekly |
 | Ubuntu package mirrors | OS packages at install; unattended security updates afterwards. | Ongoing |
-| `1.1.1.1`, `8.8.8.8` (ICMP) | Internet latency and loss, and a 5-second voice-quality stream marked DSCP EF. | Every check-in |
+| `1.1.1.1`, `8.8.8.8` (ICMP) | Internet latency and loss. A 5-second voice-quality stream marked DSCP EF also goes to the gateway and `1.1.1.1`. | Every check-in |
 | `1.1.1.1`, `8.8.8.8`, `9.9.9.9` (DNS) | DNS health: a few public names and one deliberately non-existent name. | Every scan |
 | `1.1.1.1`, `1.0.0.1`, `www.cloudflare.com` (HTTPS) | Learns the site's public IP address and reports it to the dashboard, so a WAN failover shows up as an address change. The dashboard uses that address to look up the site's externally visible exposure in a third-party index (Shodan InternetDB). | Every 15 min |
 | `speed.cloudflare.com` (HTTPS) | Download/upload speed test. | Every 6 h |
@@ -97,8 +98,9 @@ public-IP report has no switch today.
 
 NetMon opens **no listening TCP or UDP port**. Postgres is bound to `127.0.0.1`
 only. The remote console is an outbound connection relayed to a local Unix
-socket. The host's own SSH daemon is untouched; the optional CIS hardening step
-firewalls everything inbound except SSH.
+socket. The host's own SSH daemon is untouched by default; the optional CIS hardening
+step firewalls everything inbound except SSH, and its separate opt-in key-only
+step adds an `sshd` configuration drop-in.
 
 ## 4. What the dashboard can make a sensor do
 
@@ -107,12 +109,13 @@ configuration, credentials and commands reach a box that accepts no inbound
 connections — and it means **the dashboard operator has administrative control
 of the sensor.**
 
-- **Push configuration.** Every setting in sections 1 and 2, including SNMP
+- **Push configuration.** Most settings in sections 1 and 2, including SNMP
   communities, DHCP-server and switch credentials, Wi-Fi profiles, probe targets,
   scan cadence, and the update channel. The dashboard rewrites the settings it
   manages whenever its configuration for the sensor changes, so a local edit to
   `/etc/netmon/netmon.env` for a managed setting is not durable — change it in
-  the dashboard.
+  the dashboard. A few switches are local-only and stay as you set them: mDNS,
+  reachability, reverse DNS, DNS health and WAN path.
 - **Queue commands.** Run a scan, upload now, run a speed or iperf test, collect
   logs, a fixed list of read-only diagnostics, flush the ARP cache, test a switch
   SSH login, back up switch configs, and update the sensor's code.
@@ -128,7 +131,9 @@ of the sensor.**
 What limits this, and where the limit is enforced:
 
 - *On the sensor:* every pushed value is validated (types, bounds, characters);
-  commands are a fixed allow-list, not free-form; a full-shell session is bound
+  commands are a fixed allow-list, not free-form — the iperf and speed-test
+  commands take a target host, port and duration from the dashboard, passed as
+  arguments and never through a shell; a full-shell session is bound
   to a one-time nonce and killed after at most 61 minutes.
 - *On the dashboard:* who may do any of the above — role checks, the one-time
   code required before a full shell, session recording, the kill switch. The
@@ -139,8 +144,11 @@ So: a compromise of the dashboard, or of an account with sufficient rights on
 it, is a compromise of every sensor enrolled to it. Ask your dashboard operator
 how those controls are configured and who holds those rights.
 
-A sensor with no dashboard URL configured has no control plane at all. It scans
-and bundles locally and sends nothing.
+A sensor with no dashboard URL configured has no control plane at all: it scans
+and bundles locally, uploads nothing, and skips the check-in probes (latency,
+voice, speed test, public-IP report, WAN path). It still makes the DNS-health
+queries to public resolvers on each scan, and the update and refresh timers
+still reach GitHub, the image registries and package mirrors.
 
 ## 5. Privileges on the box
 
@@ -150,9 +158,11 @@ and bundles locally and sends nothing.
   equivalent to root on the host.
 - The installer grants the installing user **passwordless sudo for all commands**
   (`/etc/sudoers.d/netmon-update`) so the scheduled update, watchdog and host
-  actions can run unattended. `setup.sh` asks first; the one-line installer does
-  not. `scripts/install-auto-update.sh --uninstall` removes it along with the
-  timers — the sensor then stops updating itself and ignores host actions.
+  actions can run unattended. `setup.sh` asks whether to install the scheduled
+  jobs (the grant comes with a yes); the one-line installer does not ask.
+  `scripts/install-auto-update.sh --uninstall` removes the grant together with
+  all seven timers — including check-in, so the sensor then stops reporting to
+  the dashboard, taking commands and updating itself. It keeps scanning.
 - That user is added to the `docker` group.
 - `setup.sh` enables Ubuntu `unattended-upgrades`, installs a login banner, and
   installs seven systemd timers: check-in (3 min), console poll (30 s), watchdog
@@ -166,9 +176,9 @@ Dedicate a machine to the sensor. Do not install it on a box that does anything 
 | Credential | Where it lives on the box | Leaves the box? |
 |---|---|---|
 | Per-sensor enrollment token | `/var/lib/netmon/enroll-token`, mode 0600 | Sent to the dashboard as the bearer token on each request |
-| Shared bootstrap key | `/etc/netmon/netmon.env`, mode 0600 | Sent once, at enrollment |
+| Shared bootstrap key | `/etc/netmon/netmon.env`, mode 0600 | Sent at enrollment, and again if the sensor has to re-enroll |
 | SNMP read communities | `netmon.env` (0600) and the local database | **Yes.** The community that worked for each device is included in the hourly bundle, and the configured list is reported at check-in, so the dashboard can show which credential works where. Use read-only communities. |
-| DHCP-server (WinRM) account | `/var/lib/netmon/dhcp-targets.json`, 0600 | No |
+| DHCP-server (WinRM) account | `/var/lib/netmon/dhcp-targets.json`, 0600 | The password never does. If a login fails, the error text in the bundle may name the account. |
 | Switch SSH credentials | `/var/lib/netmon/device-config-targets.json`, 0600 | No |
 | Wi-Fi PSK / 802.1X credentials | `netmon.env`, a 0600 profile file, and a 0600 NetworkManager keyfile | No |
 | Secrets inside backed-up switch configs | Replaced on the box by a keyed hash before storage; the key never leaves the box | No — only the redacted config is uploaded |
@@ -199,7 +209,7 @@ Each hourly bundle is a ZIP of that hour's scans. It contains:
 It contains **no packet payloads**, no browsing history, and no content of any
 user's traffic.
 
-Local retention: scans 14 days, bulk SNMP detail 3 days, bundles 7 days, nightly
+Local retention: scans 14 days, bulk SNMP detail 3 days, uploaded bundles 7 days, nightly
 database snapshots 7 days. Retention after upload is governed by the dashboard.
 
 Device names and MAC addresses can identify individuals. Check this list against
@@ -217,7 +227,10 @@ your own data-classification and student-privacy obligations.
 - To control it, set the update channel:
   - `NETMON_UPDATE_CHANNEL=hold` — pause updates.
   - `NETMON_UPDATE_CHANNEL=stable` with `NETMON_UPDATE_REF=<commit>` — stay on a
-    commit you have reviewed.
+    commit you have reviewed. The commit must be on `main`. **If the ref cannot
+    be resolved the box falls back to following `main`** and only logs a
+    warning (`journalctl -u netmon-update`), so use `hold` when you need a
+    guarantee.
 
   The channel is a dashboard-managed setting, so set it there; the dashboard
   operator can change it. The weekly refresh (`scripts/weekly-deep-refresh.sh`)

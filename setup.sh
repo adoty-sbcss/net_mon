@@ -205,7 +205,7 @@ echo "       sudo netmon-wizard               # full re-run"
 echo "       sudo netmon-wizard identity      # just district/school/device"
 echo "       sudo netmon-wizard snmp          # just SNMP communities"
 echo "       sudo netmon-wizard trunk         # VLAN trunk monitoring (many VLANs / box)"
-echo "       sudo netmon-wizard advanced      # scan mode / cadence / log level"
+echo "       sudo netmon-wizard advanced   # cadence / log level"
 echo ""
 
 [[ ${NETMON_NEEDS_REGROUP:-0} -eq 1 ]] && {

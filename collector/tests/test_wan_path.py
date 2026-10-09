@@ -30,7 +30,7 @@ _HEALTHY = """traceroute to 1.1.1.1 (1.1.1.1), 12 hops max, 60 byte packets
  1  10.8.3.254  0.429 ms
  2  10.1.251.134  0.319 ms
  3  10.2.20.254  0.377 ms
- 4  203.0.113.15.189  0.624 ms
+ 4  203.0.113.189  0.624 ms
  5  137.164.3.90  2.299 ms
  6  137.164.11.86  2.362 ms
  7  137.164.11.111  2.281 ms
@@ -47,7 +47,7 @@ _ICMP_INTERIOR_STAR = """traceroute to 1.1.1.1 (1.1.1.1), 12 hops max, 60 byte p
  1  10.8.3.254  0.464 ms
  2  10.1.251.134  0.329 ms
  3  10.2.20.254  0.421 ms
- 4  203.0.113.15.189  0.906 ms
+ 4  203.0.113.189  0.906 ms
  5  137.164.3.90  2.643 ms
  6  137.164.11.86  2.639 ms
  7  137.164.11.111  2.564 ms
@@ -277,7 +277,7 @@ def test_changing_the_destination_resets_that_mode_baseline():
     assert entry["deepest_responding_hop"] == 2, (
         "depth must describe the NEW path, not inherit the old one's 11 hops"
     )
-    assert "203.0.113.15.189" not in str(entry["hop_ips"]), "old route must be gone"
+    assert "203.0.113.189" not in str(entry["hop_ips"]), "old route must be gone"
 
 
 def test_baseline_ignores_failed_traces():

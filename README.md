@@ -274,7 +274,7 @@ journalctl -u netmon-update.service -n 50
 | **Collector container is in a weird state but data is fine** | `./netmon quick-rebuild` — wipes the image, rebuilds from current source, keeps DB + config. |
 | **Box is misconfigured beyond repair** | `./netmon factory-reset` — wipes DB + config + logs. Re-run the wizard to start over; the dashboard re-pushes this box's desired config on the next check-in. |
 | **Walked up to a factory-reset box** | 1) `./setup.sh` (installs deps + runs the wizard). 2) Re-enroll it against the dashboard — `/etc/netmon/netmon.env` is a materialization of the dashboard's `desired_config`, so a dead box is **redeployed, not restored**. |
-| **DB snapshots filling disk** | Watchdog prunes >7 days. Override with `NETMON_RETENTION_DAYS=N` env var on the watchdog service. |
+| **DB snapshots filling disk** | The nightly snapshot job prunes snapshots older than 7 days. Override with `NETMON_SNAPSHOT_RETENTION_DAYS=N`. |
 
 All three recovery levels are also in the operator menu: `./netmon` → **System ▶** → options 6 (rollback) / 7 (quick rebuild) / 8 (factory reset).
 

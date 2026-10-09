@@ -116,9 +116,10 @@ the installing user `NOPASSWD: ALL`. The update, watchdog, console-poll and
 host-action jobs run as that user and need root for `docker`, `systemctl`,
 `netplan` and file ownership repair. It is the usual posture for a
 single-purpose appliance whose admin account already has full control, and it is
-why the sensor should be a dedicated machine. If your policy forbids it, remove
-the drop-in and run the timers' service units as `User=root` instead;
-`--uninstall` removes the drop-in together with the timers.
+why the sensor should be a dedicated machine. `--uninstall` removes the drop-in
+together with all the timers, which also stops check-in and updates. Running the
+timers as root instead of granting sudo is not a supported configuration today:
+the installer regenerates the units and the drop-in whenever it re-runs.
 
 ## Scope / status
 
