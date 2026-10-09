@@ -69,6 +69,16 @@ snap_cat() {
         sudo -n gunzip -c "$LATEST_SNAP"
     fi
 }
+# True only if the WHOLE snapshot decompresses and ends with pg_dump's own
+# trailer. The restore below sends "DROP SCHEMA …" ahead of the dump on one
+# stream, and psql commits whatever it has received when that stream ends — it
+# cannot see that the decompressor upstream failed. So an unreadable, truncated
+# or half-written snapshot must be caught HERE, before anything is dropped:
+# checked afterwards, the database is already empty. `tail` reads to the end, so
+# with pipefail a gunzip failure anywhere in the file fails this too.
+snap_intact() {
+    snap_cat 2>/dev/null | tail -n 20 | grep -q 'PostgreSQL database dump complete'
+}
 
 cd "$REPO_DIR"
 
@@ -144,17 +154,21 @@ if snap_exists; then
     # to collide on the first CREATE and abort under ON_ERROR_STOP — a silent
     # no-op restore that left old code running on the new schema. Prepending
     # "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" clears the target so the
-    # dump loads cleanly; --single-transaction makes the whole thing atomic, so a
-    # bad/truncated snapshot rolls back and leaves the DB exactly as it was (never
-    # half-restored, never emptied). netmon is the DB superuser/owner so the reset
-    # is permitted, and the collector is down (compose down, above) so nothing
-    # else is connected.
+    # dump loads cleanly; --single-transaction means a dump that fails to LOAD
+    # rolls back and leaves the DB exactly as it was. It does NOT protect against a
+    # dump that fails to ARRIVE (see snap_intact), which is why that is checked
+    # first and the restore is skipped outright if the snapshot is not whole.
+    # netmon is the DB superuser/owner so the reset is permitted, and the collector
+    # is down (compose down, above) so nothing else is connected.
     # The password is handed to psql by the shell INSIDE the container, from the
     # POSTGRES_PASSWORD the container already holds — never `exec -e PGPASSWORD=…`,
     # which put it in the argv of docker compose (and sudo) for any local user to
     # read with ps.
     # shellcheck disable=SC2016  # expanded by the container's shell, not this one
-    if { printf 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;\n'; snap_cat; } \
+    if ! snap_intact; then
+        log "WARN: snapshot is unreadable, truncated or incomplete — NOT restoring it."
+        log "      DB left on the post-update schema unchanged; investigate $LATEST_SNAP"
+    elif { printf 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;\n'; snap_cat; } \
             | "${DC[@]}" exec -T postgres sh -c \
               'PGPASSWORD="${POSTGRES_PASSWORD:-}" exec psql -U netmon -d netmon --single-transaction -v ON_ERROR_STOP=1' \
               >/dev/null; then
