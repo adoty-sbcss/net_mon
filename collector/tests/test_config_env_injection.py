@@ -405,6 +405,16 @@ def test_host_action_command_id_record_injection_is_refused(tmp_path, monkeypatc
     ("field", "value"),
     [
         ("broker", "http://b.example"),      # not a websocket scheme
+        # Plain ws:// is refused: the session token rides the query string and a
+        # full-shell stream is a host-root terminal. No loopback exception either.
+        ("broker", "ws://b.example/ws"),
+        ("broker", "ws://localhost:8080/console"),
+        ("broker", "ws://127.0.0.1/console"),
+        ("broker", "WS://b.example/ws"),
+        ("broker", "ws://wss://b.example/ws"),
+        ("broker", "wss://"),                # TLS scheme but no host
+        ("broker", "wss:///console"),
+        ("broker", "wss://@b.example/ws"),
         ("broker", "wss://b.example/ws#x"),  # fragment truncates the query
         ("broker", "wss://b.example/ w"),
         ("token", "t&role=admin"),           # forges a following query parameter
@@ -452,3 +462,146 @@ def test_console_session_still_starts_for_a_normal_request(tmp_path, monkeypatch
     lines = req.read_text().splitlines()
     assert len(lines) == 3
     assert all(len(line.split("\t")) == 2 for line in lines)
+
+
+@pytest.mark.parametrize(
+    "broker",
+    ["ws://b.example/ws", "ws://localhost/console", "http://b.example", "wss://", "b.example/ws"],
+)
+def test_console_dial_itself_refuses_a_non_tls_broker(broker, monkeypatch) -> None:
+    # The intake check above is not the only way in: `collector console-session
+    # --broker …` reaches run_console_session directly, and that is the call that
+    # puts the token on the wire. It must refuse before it dials.
+    import sys
+    import types
+
+    from collector import remote_console
+
+    dialed: list = []
+    fake = types.ModuleType("websocket")
+    fake.create_connection = lambda url, **kw: dialed.append(url)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "websocket", fake)
+
+    assert remote_console.run_console_session(broker, "tok", "abc123") == 2
+    assert dialed == []
+
+
+def test_console_dial_proceeds_for_a_wss_broker(monkeypatch) -> None:
+    # Positive control for the test above: with wss:// the same stub IS dialed,
+    # so "not dialed" there means refused, not "the stub never runs".
+    import sys
+    import types
+
+    from collector import remote_console
+
+    dialed: list = []
+    seen_kwargs: dict = {}
+
+    def create_connection(url, **kw):
+        dialed.append(url)
+        seen_kwargs.update(kw)
+        raise OSError("stop after the dial")
+
+    fake = types.ModuleType("websocket")
+    fake.create_connection = create_connection  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "websocket", fake)
+
+    assert remote_console.run_console_session("wss://b.example/ws", "tok", "abc123") == 3
+    assert dialed == ["wss://b.example/ws?role=sensor&token=tok&sid=abc123"]
+    # The wss:// check covers the first hop only; this is what covers the rest.
+    assert seen_kwargs["redirect_limit"] == 0
+
+
+def _redirecting_server(location: str):
+    """A plain-HTTP listener that answers every request with a 302 to `location`."""
+    import socket
+    import threading
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    srv.settimeout(5)
+    hits: list[bytes] = []
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(2)
+                try:
+                    hits.append(conn.recv(4096))
+                    conn.sendall(
+                        f"HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n".encode()
+                    )
+                except OSError:
+                    pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv, hits
+
+
+@pytest.mark.parametrize("limit", [0, None])
+def test_redirect_limit_zero_really_stops_the_library_following_a_redirect(limit) -> None:
+    # Not a test of our code but of the premise it rests on: that the installed
+    # websocket-client follows a redirect by default (limit=None here, the
+    # positive control) and does not when redirect_limit=0. If a release changes
+    # either, this is where it shows.
+    websocket = pytest.importorskip("websocket")
+    second, second_hits = _redirecting_server("ws://127.0.0.1:1/unused")
+    port2 = second.getsockname()[1]
+    first, first_hits = _redirecting_server(f"ws://127.0.0.1:{port2}/next?token=SECRET")
+    port1 = first.getsockname()[1]
+    kwargs = {} if limit is None else {"redirect_limit": limit}
+    returned_status = None
+    try:
+        # Releases before 1.9.1 return a "connected" object holding the 3xx
+        # instead of raising; either is acceptable HERE, and run_console_session
+        # rejects the non-101 status itself (tested below).
+        returned_status = websocket.create_connection(
+            f"ws://127.0.0.1:{port1}/console?token=SECRET", timeout=5, **kwargs
+        ).getstatus()
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        first.close()
+        second.close()
+
+    assert len(first_hits) == 1
+    assert returned_status != 101
+    if limit == 0:
+        assert second_hits == []          # the redirect target was never dialed
+    else:
+        assert len(second_hits) >= 1      # by default it IS dialed, token and all
+        assert b"token=SECRET" in second_hits[0]
+
+
+@pytest.mark.parametrize(("status", "expected"), [(302, 3), (307, 3), (200, 3)])
+def test_console_refuses_a_connection_the_broker_did_not_upgrade(status, expected, monkeypatch) -> None:
+    # websocket-client < 1.9.1 with redirects off returns a "connected" object for
+    # a 3xx. run_console_session must not treat that as a session.
+    import sys
+    import types
+
+    from collector import remote_console
+
+    closed: list = []
+
+    class NotUpgraded:
+        def getstatus(self):
+            return status
+
+        def close(self):
+            closed.append(True)
+
+        def __getattr__(self, name):  # any use as a live socket is the bug
+            raise AssertionError(f"used a non-upgraded connection: {name}")
+
+    fake = types.ModuleType("websocket")
+    fake.create_connection = lambda url, **kw: NotUpgraded()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "websocket", fake)
+
+    assert remote_console.run_console_session("wss://b.example/ws", "tok", "abc123") == expected
+    assert closed == [True]

@@ -1000,6 +1000,21 @@ def _run_diag(command: str) -> tuple[str, dict]:
 _CONSOLE_SID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
 
+def is_tls_console_broker(broker: str) -> bool:
+    """True only for a `wss://<host>…` broker URL.
+
+    The one-time session token is sent in the URL's query string, and a full-shell
+    session carries a host-root terminal, so the transport must be TLS: a plain
+    `ws://` broker would put both on the wire in clear. Exact and lower-case on
+    purpose — this is matched against what the dashboard mints, not parsed
+    leniently. There is no localhost/dev exception: the broker never runs on the
+    sensor, so a loopback broker is not a real deployment, only a way around this.
+    """
+    prefix = "wss://"
+    host_start = broker[len(prefix):len(prefix) + 1]
+    return broker.startswith(prefix) and (host_start.isalnum() or host_start == "[")
+
+
 def _spawn_console_session(args: dict) -> tuple[str, dict]:
     """Kick off a DETACHED remote-console session process.
 
@@ -1036,11 +1051,11 @@ def _spawn_console_session(args: dict) -> tuple[str, dict]:
     if not _CONSOLE_SID_RE.fullmatch(sid) or ".." in sid:
         return "failed", {"error": "invalid sid"}
     # `broker` is interpolated into the dial URL (remote_console builds
-    # "<broker>?role=sensor&token=..&sid=..") and passed on the session argv. Pin the
-    # websocket scheme create_connection would require anyway, and reject anything
+    # "<broker>?role=sensor&token=..&sid=..") and passed on the session argv. Require
+    # TLS (see is_tls_console_broker — plain ws:// is refused), and reject anything
     # that could add a line, an argv word, or an extra query parameter.
     if (
-        not broker.startswith(("wss://", "ws://"))
+        not is_tls_console_broker(broker)
         or any(c.isspace() or c in "\x00#" for c in broker)
     ):
         return "failed", {"error": "invalid broker"}

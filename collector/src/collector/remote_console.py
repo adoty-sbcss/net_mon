@@ -55,6 +55,7 @@ from .checkin import (
     _QUEUED_ONLY_COMMANDS,
     _redact_secrets,
     _run_command,
+    is_tls_console_broker,
 )
 
 log = structlog.get_logger(__name__)
@@ -379,13 +380,40 @@ def run_console_session(broker: str, token: str, sid: str, mode: str = "restrict
     if not broker or not token or not sid:
         log.warning("remote console: missing broker/token/sid")
         return 2
+    # Re-checked at the dial itself, not only where the command is accepted
+    # (checkin._spawn_console_session): `collector console-session --broker …` is
+    # also a CLI entry point, and this is the line that puts the token on the wire.
+    if not is_tls_console_broker(broker):
+        log.warning("remote console: refusing a non-TLS broker (wss:// required)", sid=sid)
+        return 2
 
     url = f"{broker}?role=sensor&token={token}&sid={sid}"
     log.info("remote console: dialing broker", sid=sid)
     try:
-        ws = websocket.create_connection(url, timeout=20, enable_multithread=True)
+        # redirect_limit=0: websocket-client follows up to three HTTP redirects by
+        # default and dials whatever scheme the Location carries, re-sending this
+        # URL's query. A redirect to ws:// would undo the check above after it has
+        # passed, so no redirect is followed at all.
+        ws = websocket.create_connection(
+            url, timeout=20, enable_multithread=True, redirect_limit=0
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("remote console: connect failed", sid=sid, error=str(exc))
+        return 3
+    # With redirects off, websocket-client before 1.9.1 does not raise on a 3xx: it
+    # hands back an object marked connected whose "handshake" was the redirect. That
+    # is not a console session, so refuse anything but 101 Switching Protocols.
+    try:
+        handshake_status = ws.getstatus()
+    except Exception:  # noqa: BLE001 - a stub or odd build without it: nothing to judge
+        handshake_status = None
+    if handshake_status is not None and handshake_status != 101:
+        log.warning("remote console: broker did not upgrade the connection",
+                    sid=sid, status=handshake_status)
+        try:
+            ws.close()
+        except Exception:  # noqa: BLE001
+            pass
         return 3
 
     # Full-shell mode (CON-7): attach to the host-side PTY server now so the prompt

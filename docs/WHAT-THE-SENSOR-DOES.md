@@ -77,7 +77,7 @@ The sensor needs outbound access to these. Nothing else is contacted by default.
 |---|---|---|
 | Your NetMon dashboard (HTTPS) | Enrollment, check-in, command results, measurement results. Authenticated with a per-sensor bearer token. | Check-in every 3 min; console poll every 30 s |
 | Azure Blob Storage (HTTPS) | The hourly bundle is uploaded to a short-lived, write-only URL the dashboard issues for that one file. | Hourly |
-| The dashboard's console broker (WebSocket) | Only while a dashboard operator has a remote console session open. | On demand |
+| The dashboard's console broker (WebSocket over TLS — `wss://` only; a plain `ws://` broker is refused) | Only while a dashboard operator has a remote console session open. | On demand |
 | `github.com` | Nightly code update from this repository. | 03:00 nightly, plus a weekly refresh |
 | `ghcr.io` | The prebuilt collector image. | With each update |
 | Docker Hub, Debian mirrors, PyPI, `wireshark.org` | Base images and packages when the image is built locally — the weekly refresh, and the fallback when the prebuilt image cannot be pulled. | Weekly |
