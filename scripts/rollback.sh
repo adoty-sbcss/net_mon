@@ -54,6 +54,22 @@ ensure_env_readable() {
 }
 ensure_env_readable
 
+# The snapshot directory is 0700 and owned by the update user (the dumps hold the
+# SNMP communities). A rollback started by a different account must still find
+# the snapshot: a plain `[[ -e ]]` answers "no" for a directory it cannot search,
+# which would skip the DB restore and say only "no snapshot". So fall back to
+# sudo for both the test and the read.
+snap_exists() {
+    [[ -e "$LATEST_SNAP" ]] || sudo -n test -e "$LATEST_SNAP" 2>/dev/null
+}
+snap_cat() {
+    if [[ -r "$LATEST_SNAP" ]]; then
+        gunzip -c "$LATEST_SNAP"
+    else
+        sudo -n gunzip -c "$LATEST_SNAP"
+    fi
+}
+
 cd "$REPO_DIR"
 
 log "=== NetMon rollback starting ==="
@@ -111,7 +127,7 @@ git -C "$REPO_DIR" reset --hard "$TARGET_SHA" >/dev/null 2>&1 || {
 
 # --- 5. Start postgres only, restore from snapshot ---------------------
 
-if [[ -e "$LATEST_SNAP" ]]; then
+if snap_exists; then
     log "starting postgres for snapshot restore..."
     "${DC[@]}" up -d postgres >/dev/null
     # Wait for postgres health
@@ -122,7 +138,7 @@ if [[ -e "$LATEST_SNAP" ]]; then
         sleep 2
     done
 
-    log "restoring DB snapshot: $(readlink "$LATEST_SNAP")"
+    log "restoring DB snapshot: $(readlink "$LATEST_SNAP" 2>/dev/null || sudo -n readlink "$LATEST_SNAP" 2>/dev/null || echo latest.sql.gz)"
     # Reset the schema, then load, in ONE transaction. The plain pg_dump carries
     # no DROP statements, so loading it into the current (post-update) schema used
     # to collide on the first CREATE and abort under ON_ERROR_STOP — a silent
@@ -133,10 +149,15 @@ if [[ -e "$LATEST_SNAP" ]]; then
     # half-restored, never emptied). netmon is the DB superuser/owner so the reset
     # is permitted, and the collector is down (compose down, above) so nothing
     # else is connected.
-    PG_PW="$(sudo grep -E '^POSTGRES_PASSWORD=' /etc/netmon/netmon.env 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/^"//; s/"$//')"
-    if { printf 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;\n'; gunzip -c "$LATEST_SNAP"; } \
-            | "${DC[@]}" exec -T -e "PGPASSWORD=$PG_PW" postgres \
-              psql -U netmon -d netmon --single-transaction -v ON_ERROR_STOP=1 >/dev/null; then
+    # The password is handed to psql by the shell INSIDE the container, from the
+    # POSTGRES_PASSWORD the container already holds — never `exec -e PGPASSWORD=…`,
+    # which put it in the argv of docker compose (and sudo) for any local user to
+    # read with ps.
+    # shellcheck disable=SC2016  # expanded by the container's shell, not this one
+    if { printf 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;\n'; snap_cat; } \
+            | "${DC[@]}" exec -T postgres sh -c \
+              'PGPASSWORD="${POSTGRES_PASSWORD:-}" exec psql -U netmon -d netmon --single-transaction -v ON_ERROR_STOP=1' \
+              >/dev/null; then
         log "snapshot restored (schema reset + reload, atomic)"
     else
         log "WARN: snapshot restore failed and was rolled back — DB left on the"

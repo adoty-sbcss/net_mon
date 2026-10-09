@@ -32,8 +32,16 @@ fi
 
 cd "$REPO_DIR"
 
-# Ensure the snapshot directory exists with proper ownership.
-sudo install -d -m 755 -o "${SUDO_USER:-${USER:-root}}" -g "${SUDO_USER:-${USER:-root}}" "$SNAP_DIR"
+# A snapshot is a full copy of the database, which holds the SNMP communities,
+# so neither the directory nor the dumps may be readable by other local users.
+# install -d also tightens a directory an older release created 0755, and the
+# sweep tightens dumps an older release wrote 0644 — this script runs before
+# every update, so existing boxes are corrected on their next one.
+umask 077
+SNAP_OWNER="${SUDO_USER:-${USER:-root}}"
+sudo install -d -m 700 -o "$SNAP_OWNER" -g "$SNAP_OWNER" "$SNAP_DIR"
+sudo find "$SNAP_DIR" -maxdepth 1 -type f -name 'netmon_*.sql.gz' \
+    -exec chown "$SNAP_OWNER:$SNAP_OWNER" {} + -exec chmod 600 {} +
 
 # Container has to be up. If it's not, bail clean — no snapshot, no harm.
 if ! "${DC[@]}" ps --status running 2>/dev/null | grep -q netmon-postgres; then
@@ -41,24 +49,31 @@ if ! "${DC[@]}" ps --status running 2>/dev/null | grep -q netmon-postgres; then
     exit 0
 fi
 
-# Read credentials from netmon.env so pg_dump uses the same user/db the
-# collector does. POSTGRES_PASSWORD also goes in the env via PGPASSWORD.
+# Read the role and database name from netmon.env so pg_dump uses the same ones
+# the collector does. The password is deliberately NOT read here — see below.
 ENV_FILE="/etc/netmon/netmon.env"
 PG_USER="netmon"
 PG_DB="netmon"
-PG_PW=""
 if [[ -r "$ENV_FILE" ]] || sudo test -r "$ENV_FILE"; then
     PG_USER="$(sudo grep -E '^POSTGRES_USER=' "$ENV_FILE" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/^"//; s/"$//' || echo netmon)"
     PG_DB="$(sudo grep -E '^POSTGRES_DB=' "$ENV_FILE" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/^"//; s/"$//' || echo netmon)"
-    PG_PW="$(sudo grep -E '^POSTGRES_PASSWORD=' "$ENV_FILE" 2>/dev/null | head -1 | sed -E 's/^[^=]+=//; s/^"//; s/"$//')"
 fi
+[[ -n "$PG_USER" ]] || PG_USER="netmon"
+[[ -n "$PG_DB" ]] || PG_DB="netmon"
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 TARGET="$SNAP_DIR/netmon_${STAMP}.sql.gz"
 
 log "taking snapshot -> $TARGET"
-if ! "${DC[@]}" exec -T -e "PGPASSWORD=$PG_PW" postgres \
-        pg_dump --no-owner --no-privileges -U "$PG_USER" -d "$PG_DB" \
+# The password never appears on a command line: `exec -e PGPASSWORD=<value>`
+# put it in the argv of docker compose (and of sudo), readable by every local
+# user via ps. The postgres container already holds it as POSTGRES_PASSWORD, so
+# the shell INSIDE the container hands it to pg_dump through the environment;
+# the single-quoted script below is all that any argv ever carries.
+# shellcheck disable=SC2016  # expanded by the container's shell, not this one
+if ! "${DC[@]}" exec -T postgres sh -c \
+        'PGPASSWORD="${POSTGRES_PASSWORD:-}" exec pg_dump --no-owner --no-privileges -U "$1" -d "$2"' \
+        pg_dump "$PG_USER" "$PG_DB" \
         | gzip > "$TARGET"; then
     log "ERROR: pg_dump failed"
     rm -f "$TARGET"

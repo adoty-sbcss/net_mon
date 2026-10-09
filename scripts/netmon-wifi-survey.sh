@@ -147,6 +147,7 @@ fi
 printf '{"schema":1,"generated_at":"%s","host":"%s","backend":"%s","regdom":"%s","interfaces":[%s]}\n' \
     "$ts" "$host" "$backend" "$regdom" "$ifaces_json" > "$TMP"
 
-# Atomic publish, world-readable (a passive survey carries no secrets).
-$SUDO install -m 0644 "$TMP" "$OUT"
+# Atomic publish. 0600: the only reader is the collector container (root), and a
+# survey lists every neighbouring network, which no other local account needs.
+$SUDO install -m 0600 "$TMP" "$OUT"
 echo "wrote $OUT (backend=$backend, ifaces=${#wifi_ifaces[@]}, regdom=$regdom)"
