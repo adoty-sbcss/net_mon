@@ -117,7 +117,7 @@ run_action() {
             log "ACTION wifi-join: join NETMON_WIFI_JOIN_* on the analysis radio (lib/wifi.sh, routes-off)"
             # Subshell so the sourced libs' log/ok/warn/SUDO don't clobber this script's.
             # lib/wifi.sh joins with never-default + a default-route guard (auto-revert),
-            # so the analysis radio can never steal the box's uplink/SFTP path.
+            # so the analysis radio can never steal the box's uplink/upload path.
             (
                 for lib in common.sh paths.sh envfile.sh wifi.sh; do
                     # shellcheck source=/dev/null

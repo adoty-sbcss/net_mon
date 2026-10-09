@@ -5,7 +5,7 @@
 # lib/trunk.sh (VLAN trunk): backend-aware (nmcli on NetworkManager, wpa_supplicant
 # +netplan on systemd-networkd) and — crucially — the joined connection takes NO
 # default route (ipv4.never-default + ipv4.ignore-auto-routes), so the analysis
-# radio can NEVER hijack the box's real uplink / SFTP path. Same routes-off guard
+# radio can NEVER hijack the box's real uplink / upload path. Same routes-off guard
 # the VLAN apply uses, with the same auto-revert-on-default-route-loss safety.
 #
 # Supported auth (v1): open, WPA2-PSK, WPA2-Enterprise PEAP/TTLS (username+password).

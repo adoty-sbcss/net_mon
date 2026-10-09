@@ -197,7 +197,7 @@ def _check_control_plane() -> CheckResult:
     The dashboard control plane needs BOTH a URL and a credential (shared
     bootstrap key for auto-enroll, or a per-sensor enroll token). The failure
     we're guarding against is a half-configured box: one set, the other blank.
-    A box with NEITHER is treated as an intentional SFTP-only deployment and
+    A box with NEITHER is treated as an intentional standalone deployment and
     passes — so this never false-alarms a box that isn't meant to phone home.
     """
     settings = get_settings()
@@ -210,7 +210,7 @@ def _check_control_plane() -> CheckResult:
                            "configured (dashboard URL + enrollment credential present)")
     if not has_url and not has_cred:
         return CheckResult("control_plane", True,
-                           "not configured — SFTP-only box (no dashboard URL or key)")
+                           "not configured — standalone box, uploads nothing (no dashboard URL or key)")
     if has_cred and not has_url:
         return CheckResult("control_plane", False,
                            "enrollment key/token set but NETMON_DASHBOARD_URL is blank — "

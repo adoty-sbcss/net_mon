@@ -16,7 +16,7 @@
 #
 # DELIBERATELY APPLIED (safe):
 #   - ufw: allow 22/tcp FIRST, then default-deny INBOUND + allow-ALL-OUTBOUND,
-#     enable. (No egress filtering — that would kill scanning + check-in + SFTP.)
+#     enable. (No egress filtering — that would kill scanning + check-in + upload.)
 #   - unattended-upgrades: install + enable, with auto-REBOOT OFF.
 #   - time sync (systemd-timesyncd), auditd, AppArmor (docker-default only),
 #     core-dump restriction, libpam-pwquality (installed, not strict-enforced).
@@ -203,7 +203,7 @@ c_firewall() {
   have ufw || { log "ufw: not available, skipping firewall"; return; }
   log "ufw: allow 22/tcp (SSH) BEFORE enabling, so we can't lock out"
   run "ufw allow 22/tcp >/dev/null 2>&1 || true"
-  log "ufw: default deny INCOMING, allow OUTGOING (no egress filtering — scanning + check-in + SFTP must work)"
+  log "ufw: default deny INCOMING, allow OUTGOING (no egress filtering — scanning + check-in + upload must work)"
   run "ufw default deny incoming >/dev/null 2>&1 || true"
   run "ufw default allow outgoing >/dev/null 2>&1 || true"
   log "ufw: enable"
@@ -281,7 +281,7 @@ c_pwquality() {
 
 # Self-healing guard for an UNATTENDED apply (e.g. the fleet host-cis-apply action):
 # after the safe subset lands, confirm we didn't break the two things that matter for
-# a remote box — SSH reachability + OUTBOUND connectivity (its check-in/SFTP path). If
+# a remote box — SSH reachability + OUTBOUND connectivity (its check-in/upload path). If
 # either is gone, auto-revert so a box can never strand itself. The safe subset only
 # denies INBOUND + allows ALL outbound (and allows 22 before enabling ufw), so this
 # should always pass — it's the backstop that makes a hands-off rollout safe.
