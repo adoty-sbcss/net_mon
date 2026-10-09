@@ -4,7 +4,7 @@ The collector runs `network_mode: host`, so its /etc/resolv.conf is literally th
 host's — and on these Ubuntu boxes that file names systemd-resolved's stub,
 127.0.0.53. The probe therefore pinged the sensor's own loopback and could not
 report anything but a perfect DNS path. Confirmed live 2026-09-05 on three
-districts at once (Cucamonga SD, Trona USD, SBCSS), every one of them reading
+districts at once (District A, District B, District C), every one of them reading
 `Dns | 127.0.0.53 | 0.1 ms | 0.0 ms | 0.0%`. One of three latency signals was
 inert fleet-wide while rendering as measured health — the failure mode this
 product explicitly forbids.
@@ -29,7 +29,7 @@ import collector as collector_pkg
 import collector.latency  # noqa: F401  — so the package attribute exists to patch
 from collector import checkin
 
-# Verbatim from Monitor1, 2026-09-05 — copied off the box, not typed from memory.
+# Verbatim from the verification sensor, 2026-09-05 — copied off the box, not typed from memory.
 # The comment banner matters: it is what a naive "first nameserver" reader trips
 # over, and the trailing `search` line must not be mistaken for a nameserver.
 _STUB_RESOLV = """\
@@ -41,7 +41,7 @@ _STUB_RESOLV = """\
 
 nameserver 127.0.0.53
 options edns0 trust-ad
-search sbcss.org
+search example.org
 """
 
 _UPSTREAM_RESOLV = """\
@@ -50,7 +50,7 @@ _UPSTREAM_RESOLV = """\
 
 nameserver 163.150.1.36
 nameserver 163.150.1.32
-search sbcss.org
+search example.org
 """
 
 
@@ -69,7 +69,7 @@ def _paths(monkeypatch, tmp_path, *, systemd=None, host=None, own=None):
 
 
 def test_upstream_is_preferred_over_the_stub(monkeypatch, tmp_path):
-    """The exact Monitor1 layout: the stub file is present and readable, and the
+    """The exact verification-sensor layout: the stub file is present and readable, and the
     upstream file must still win."""
     _paths(monkeypatch, tmp_path, systemd=_UPSTREAM_RESOLV, own=_STUB_RESOLV)
     assert checkin._dns_latency_target() == ("163.150.1.36", None)

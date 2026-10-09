@@ -241,7 +241,7 @@ def _match_owner_to_parent_dir(path: Path) -> None:
     env_file while building its project model, and the update timer runs
     compose unprivileged) failed with "permission denied". The nightly update
     failed, its rollback ran compose and failed the same way, and the box
-    stayed down (Monitor1, 2026-07-21, ~1.3 days). Re-owning each write to the
+    stayed down (the verification sensor, 2026-07-21, ~1.3 days). Re-owning each write to the
     directory's owner keeps host-side readers working AND heals a file that
     already drifted to root — the parent dir still carries the correct owner
     even when the file lost it.
@@ -351,7 +351,7 @@ def _update_env_file(path: Path, mapping: dict[str, str]) -> None:
     # writers — a temp created 0600 from the start (so the mode never flips) and
     # fsynced before the rename — and afterwards re-owns the file to the host service
     # user (the parent dir's owner): a root-owned 0600 netmon.env breaks every
-    # host-side `docker compose` read, which is what kept Monitor1 down for ~1.3 days.
+    # host-side `docker compose` read, which is what kept the verification sensor down for ~1.3 days.
     data = "\n".join(out) + "\n"
     _write_file_atomic(path, data, 0o600)
 
@@ -2667,7 +2667,7 @@ def run_checkin() -> int:
     settings = get_settings()
     # Fall back to the baked-in default when the env var is unset OR blank, so a
     # provisioning slip (empty NETMON_DASHBOARD_URL) can't silently disable
-    # check-in/enrollment the way it did on baker-agent.
+    # check-in/enrollment the way it did on an early sensor.
     url = (settings.dashboard_url or DEFAULT_DASHBOARD_URL).rstrip("/")
     if not url:
         log.info("checkin skipped: no dashboard URL configured")

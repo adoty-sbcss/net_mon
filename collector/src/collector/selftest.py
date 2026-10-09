@@ -192,7 +192,7 @@ def _check_capabilities() -> CheckResult:
 
 
 def _check_control_plane() -> CheckResult:
-    """Catch the silent never-enrolls misconfiguration (the baker-agent bug).
+    """Catch the silent never-enrolls misconfiguration (a bug first seen in the field).
 
     The dashboard control plane needs BOTH a URL and a credential (shared
     bootstrap key for auto-enroll, or a per-sensor enroll token). The failure

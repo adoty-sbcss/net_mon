@@ -142,12 +142,12 @@ def test_fqdn_used_as_winrm_host(monkeypatch):
     cap: dict = {}
     _install_fake_winrm(monkeypatch, result=_FakeResult(std_out=json.dumps(_SAMPLE).encode()), capture=cap)
     out = dh._collect_one(
-        {"server_ip": "10.0.0.10", "fqdn": "dc01.sbcss.org", "server_type": "windows",
-         "winrm_user": "svc@SBCSS.ORG", "winrm_password": "pw"},
+        {"server_ip": "10.0.0.10", "fqdn": "dc01.example.org", "server_type": "windows",
+         "winrm_user": "svc@EXAMPLE.ORG", "winrm_password": "pw"},
         winrm_timeout=30,
     )
     assert out["status"] == "ok"
-    assert cap["endpoint"] == "http://dc01.sbcss.org:5985/wsman"
+    assert cap["endpoint"] == "http://dc01.example.org:5985/wsman"
     # Identity is unchanged — server_ip anchors the record, not the FQDN.
     assert out["server_ip"] == "10.0.0.10"
 
@@ -173,13 +173,13 @@ def test_fqdn_endpoint_on_kerberos_path(monkeypatch):
     monkeypatch.setattr(dh, "_kinit", lambda user, password, ip: "/tmp/netmon_ccache")
     monkeypatch.setattr(dh, "_cleanup_ccache", lambda c: None)
     out = dh._collect_one(
-        {"server_ip": "10.0.0.10", "fqdn": "dc01.sbcss.org", "server_type": "windows",
-         "winrm_user": "svc@SBCSS.ORG", "winrm_password": "pw"},
+        {"server_ip": "10.0.0.10", "fqdn": "dc01.example.org", "server_type": "windows",
+         "winrm_user": "svc@EXAMPLE.ORG", "winrm_password": "pw"},
         winrm_timeout=30,
     )
     assert out["status"] == "ok"
     assert out["transport"] == "kerberos"
-    assert cap["endpoint"] == "http://dc01.sbcss.org:5985/wsman"
+    assert cap["endpoint"] == "http://dc01.example.org:5985/wsman"
 
 
 def test_ps_reported_error(monkeypatch):
@@ -274,8 +274,8 @@ def test_detect_transport(monkeypatch):
 def test_realm_from_server(monkeypatch):
     import socket
 
-    monkeypatch.setattr(socket, "gethostbyaddr", lambda ip: ("dc01.sbcss.org", [], [ip]))
-    assert dh._realm_from_server("10.0.0.10") == "SBCSS.ORG"
+    monkeypatch.setattr(socket, "gethostbyaddr", lambda ip: ("dc01.example.org", [], [ip]))
+    assert dh._realm_from_server("10.0.0.10") == "EXAMPLE.ORG"
     monkeypatch.setattr(
         socket, "gethostbyaddr", lambda ip: (_ for _ in ()).throw(OSError())
     )
@@ -298,13 +298,13 @@ def test_auto_selects_kerberos_and_kinits(monkeypatch):
     monkeypatch.setattr(dh, "_cleanup_ccache", lambda c: None)
     out = dh._collect_one(
         {"server_ip": "10.0.0.10", "server_type": "windows",
-         "winrm_user": "DHCP_User@SBCSS.ORG", "winrm_password": "pw"},
+         "winrm_user": "DHCP_User@EXAMPLE.ORG", "winrm_password": "pw"},
         winrm_timeout=30,
     )
     assert out["status"] == "ok"
     assert out["transport"] == "kerberos"
     assert cap["kwargs"]["transport"] == "kerberos"
-    assert kinited["user"] == "DHCP_User@SBCSS.ORG"
+    assert kinited["user"] == "DHCP_User@EXAMPLE.ORG"
 
 
 def test_kerberos_kinit_failure_is_clean(monkeypatch):
@@ -317,7 +317,7 @@ def test_kerberos_kinit_failure_is_clean(monkeypatch):
     monkeypatch.setattr(dh, "_kinit", _bad_kinit)
     out = dh._collect_one(
         {"server_ip": "10.0.0.10", "server_type": "windows",
-         "winrm_user": "DHCP_User@SBCSS.ORG", "winrm_password": "pw"},
+         "winrm_user": "DHCP_User@EXAMPLE.ORG", "winrm_password": "pw"},
         winrm_timeout=30,
     )
     assert out["status"] == "error"
@@ -416,7 +416,7 @@ def test_kinit_auth_failure_skips_rpc_fallback(monkeypatch):
     monkeypatch.setattr(dh, "_rpc_fallback", fb)
     out = dh._collect_one(
         {"server_ip": "10.0.0.10", "server_type": "windows",
-         "winrm_user": "DHCP_User@SBCSS.ORG", "winrm_password": "bad"},
+         "winrm_user": "DHCP_User@EXAMPLE.ORG", "winrm_password": "bad"},
         winrm_timeout=30,
     )
     assert out["status"] == "error"

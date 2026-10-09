@@ -1,7 +1,7 @@
 """INV-8: fold `cdp:`/`ip:` placeholder nodes onto the real device in one crawl.
 
 The fixtures here are COPIED from what production actually emitted, not invented —
-Cucamonga SD carried 356 duplicate pairs in exactly three shapes, and one of them
+District A carried 356 duplicate pairs in exactly three shapes, and one of them
 (`D0 3D 52 0D 28 BC` against `d0:3d:52:0d:28:bc`) is the same MAC written two ways,
 which is the kind of outlier a hand-typed fixture smooths away.
 
@@ -48,7 +48,7 @@ def test_identity_key_collapses_mac_spellings():
 
 
 def test_cdp_named_for_the_chassis_id_verbatim_folds():
-    """135 of Cucamonga's pairs: the CDP device-id IS the chassis id."""
+    """135 of District A's pairs: the CDP device-id IS the chassis id."""
     nodes = {
         "T34W44DBD28A3B6A": node("T34W44DBD28A3B6A", name="T34W", ips=["192.168.130.45"]),
         "cdp:T34W44DBD28A3B6A": node("cdp:T34W44DBD28A3B6A", name="T34W44DBD28A3B6A", source="cdp"),
@@ -77,18 +77,18 @@ def test_ip_placeholder_sharing_a_mgmt_address_folds():
     hands and folding is safe.
     """
     nodes = {
-        "ec:fc:c6:c7:e1:3a": node("ec:fc:c6:c7:e1:3a", name="RCH-Outdoor-North", ips=["10.10.0.66"]),
+        "ec:fc:c6:c7:e1:3a": node("ec:fc:c6:c7:e1:3a", name="AP-Outdoor-North", ips=["10.10.0.66"]),
         "ip:10.10.0.66": node("ip:10.10.0.66", name="10.10.0.66", ips=["10.10.0.66"]),
     }
     assert _fold_synthetic_nodes(nodes, []) == 1
     assert set(nodes) == {"ec:fc:c6:c7:e1:3a"}
-    assert nodes["ec:fc:c6:c7:e1:3a"]["system_name"] == "RCH-Outdoor-North"
+    assert nodes["ec:fc:c6:c7:e1:3a"]["system_name"] == "AP-Outdoor-North"
 
 
 def test_cdp_placeholder_matching_a_sysname_folds():
     nodes = {
-        "aa:bb:cc:00:00:01": node("aa:bb:cc:00:00:01", name="RCH-IDF-N", ips=["10.10.0.5"]),
-        "cdp:RCH-IDF-N": node("cdp:RCH-IDF-N", name="RCH-IDF-N", source="cdp"),
+        "aa:bb:cc:00:00:01": node("aa:bb:cc:00:00:01", name="SITE-IDF-N", ips=["10.10.0.5"]),
+        "cdp:SITE-IDF-N": node("cdp:SITE-IDF-N", name="SITE-IDF-N", source="cdp"),
     }
     assert _fold_synthetic_nodes(nodes, []) == 1
     assert set(nodes) == {"aa:bb:cc:00:00:01"}
@@ -143,8 +143,8 @@ def test_sysname_match_still_folds_when_the_placeholder_has_no_address():
     """
     for ips in ([], ["0.0.0.0"]):
         nodes = {
-            "aa:bb:cc:00:00:01": node("aa:bb:cc:00:00:01", name="RCH-IDF-N", ips=["10.10.0.5"]),
-            "cdp:RCH-IDF-N": node("cdp:RCH-IDF-N", name="RCH-IDF-N", ips=ips, source="cdp"),
+            "aa:bb:cc:00:00:01": node("aa:bb:cc:00:00:01", name="SITE-IDF-N", ips=["10.10.0.5"]),
+            "cdp:SITE-IDF-N": node("cdp:SITE-IDF-N", name="SITE-IDF-N", ips=ips, source="cdp"),
         }
         assert _fold_synthetic_nodes(nodes, []) == 1, ips
         assert set(nodes) == {"aa:bb:cc:00:00:01"}, ips
@@ -154,9 +154,9 @@ def test_sysname_match_folds_when_the_address_is_a_subset():
     """Agreement, not equality: the real node may know addresses CDP never reported."""
     nodes = {
         "aa:bb:cc:00:00:01": node(
-            "aa:bb:cc:00:00:01", name="RCH-IDF-N", ips=["10.10.0.5", "10.10.99.5"]
+            "aa:bb:cc:00:00:01", name="SITE-IDF-N", ips=["10.10.0.5", "10.10.99.5"]
         ),
-        "cdp:RCH-IDF-N": node("cdp:RCH-IDF-N", name="RCH-IDF-N", ips=["10.10.0.5"], source="cdp"),
+        "cdp:SITE-IDF-N": node("cdp:SITE-IDF-N", name="SITE-IDF-N", ips=["10.10.0.5"], source="cdp"),
     }
     assert _fold_synthetic_nodes(nodes, []) == 1
     assert set(nodes) == {"aa:bb:cc:00:00:01"}

@@ -1,6 +1,6 @@
 """A self-inflicted 429 must back OFF, not retry on the same cadence.
 
-The Cucamonga rate limit was our own load: three sensors behind one shared
+The District A rate limit was our own load: three sensors behind one shared
 egress IP, each generating hundreds of requests per run, on independent
 schedules with no awareness of each other. Retrying at the normal interval
 just feeds the limiter.

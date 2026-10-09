@@ -1,6 +1,6 @@
 """A REFUSING measurement source and a BROKEN LINK must not look the same.
 
-Cucamonga SD, 2026-08/09: three sensors behind ONE shared egress IP showed ~47%
+District A, 2026-08/09: three sensors behind ONE shared egress IP showed ~47%
 of speed tests returning 0.0 Mbps for over a week. It was diagnosed as a failing
 district firewall; the firewall was rebooted over it; the symptom came back.
 
@@ -69,7 +69,7 @@ class _FakeResp:
 def _install(monkeypatch, *, down, up, latency=None):
     """Patch urlopen. The tiny `bytes=0` latency GETs succeed unless `latency`
     says otherwise — a rate limit that only bites the bulk transfers is exactly
-    what Cucamonga looked like."""
+    what District A looked like."""
 
     def _urlopen(req, timeout=None, context=None, **_kw):  # noqa: ANN001
         url = req.full_url if hasattr(req, "full_url") else str(req)
@@ -109,7 +109,7 @@ def _serves_data():
 
 
 def test_a_429_is_unavailable_not_a_network_failure(monkeypatch):
-    """The exact Cucamonga shape: every bulk download stream gets 429."""
+    """The exact District A shape: every bulk download stream gets 429."""
     _install(monkeypatch, down=_rate_limited, up=_serves_data)
 
     res = speedtest.run_cloudflare(duration=2, streams=2)

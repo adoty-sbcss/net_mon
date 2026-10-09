@@ -156,7 +156,7 @@ def test_command_results_use_the_durable_result_spool() -> None:
 # /var/lib/netmon are host bind mounts owned by the unprivileged service user.
 # An atomic rewrite creates a new inode owned by the writer, which flipped
 # netmon.env to root:root 0600 and made every host-side `docker compose` read
-# fail with "permission denied" (update AND rollback — Monitor1 was down ~1.3
+# fail with "permission denied" (update AND rollback — the verification sensor was down ~1.3
 # days). _write_file_atomic must re-own what it writes to the parent dir's
 # owner, best-effort. Real chown needs root, so these tests pin the ATTEMPT
 # and its failure tolerance via monkeypatched os.stat/os.chown.
@@ -256,7 +256,7 @@ def test_write_file_atomic_skips_chown_when_owner_already_matches(tmp_path, monk
 
 
 def test_env_file_write_flows_through_the_owned_atomic_writer(tmp_path, monkeypatch) -> None:
-    # netmon.env is the file whose root-ownership drift took Monitor1 down; pin
+    # netmon.env is the file whose root-ownership drift took the verification sensor down; pin
     # that its rewrite rides _write_file_atomic (atomicity + re-owning) rather
     # than a bespoke writer that would silently miss the ownership fix.
     env = tmp_path / "netmon.env"

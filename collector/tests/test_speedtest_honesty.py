@@ -1,6 +1,6 @@
 """A BLOCKED speed test must not be recorded as a successful 0.0 Mbps one.
 
-The Cucamonga firewall incident (2026-08/09): a failing district firewall passed
+The District A firewall incident (2026-08/09): a failing district firewall passed
 the 20 tiny `bytes=0` latency GETs but choked every bulk stream. `_download` /
 `_upload` swallowed the resulting exceptions (`except Exception: pass`) and
 returned bytes-so-far, so `run_cloudflare` reported `ok=true, download_mbps=0.0`
@@ -128,7 +128,7 @@ def test_zero_bytes_without_an_exception_is_still_a_failure(monkeypatch):
 
 
 def test_slow_setup_outlasting_the_window_is_a_failure(monkeypatch):
-    """The realistic Cucamonga mechanism: an overloaded inspection proxy passes
+    """The realistic District A mechanism: an overloaded inspection proxy passes
     the 20 tiny `bytes=0` latency GETs (10s timeout each) but takes longer than
     the entire measurement window just to establish each bulk transfer. The read
     loop never runs, no exception is ever raised, and the exception-keyed rule

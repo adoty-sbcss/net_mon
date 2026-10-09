@@ -71,7 +71,7 @@ def test_updater_self_heals_unreadable_env_before_any_compose_use() -> None:
     # A root-owned 0600 netmon.env (rewritten by the root collector container on
     # a config push) makes every unprivileged `docker compose` invocation fail
     # with "permission denied" — the update fails AND the rollback safety net
-    # fails the same way (Monitor1 was down ~1.3 days). The updater must heal
+    # fails the same way (the verification sensor was down ~1.3 days). The updater must heal
     # the file before anything reads the env or parses the compose model.
     define = UPDATER.index("ensure_env_readable() {")
     call = UPDATER.index("\nensure_env_readable\n")

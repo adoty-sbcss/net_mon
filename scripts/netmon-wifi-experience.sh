@@ -25,7 +25,7 @@
 # probes actually traverse the joined network, then remove it. The box's real
 # uplink / default route is never touched.
 #
-# Validated live on Monitor1 2026-06-30 (PSK sbcss-mpsk): join, DHCP, gateway (from
+# Validated live on the verification sensor 2026-06-30 (a PSK SSID): join, DHCP, gateway (from
 # the DHCP `routers` option), source-routed probes, and clean teardown all confirmed.
 #
 # Source AFTER common.sh, paths.sh, envfile.sh, wifi.sh (the host-action does this).
@@ -48,7 +48,7 @@ WEBPERF_FMT='%{time_namelookup} %{time_connect} %{time_appconnect} %{time_startt
 RT_TABLE=51                       # dedicated policy-routing table for the analysis radio
 # Rule priority MUST be below the main-table rule (prio 32766), or the main table
 # matches first and the wifi-sourced probe leaves via the wired uplink. Validated
-# on Monitor1: at 5100 `ip route get <dst> from <wifi-ip>` routes via the wifi.
+# on the verification sensor: at 5100 `ip route get <dst> from <wifi-ip>` routes via the wifi.
 RT_RULE_PRIO=5100
 
 # Cleanup target for the EXIT trap. MUST be a global: the trap fires after main()
@@ -66,7 +66,7 @@ _TRAP_IFACE=""
 # policy rules still installed and no artifact written. Idempotent; clears the traps
 # first so the exit below can't re-enter it.
 #
-# Timing note (measured on Monitor1): bash defers a trap until the foreign command
+# Timing note (measured on the verification sensor): bash defers a trap until the foreign command
 # running in the FOREGROUND returns, so a manual `kill -TERM` of just this PID does
 # not clean up until the in-flight curl/ping finishes -- bounded by the per-probe
 # timeouts (<=15s each), not unbounded. Under systemd it is prompt: the unit has no
@@ -145,7 +145,7 @@ _captive_probe() {
 # caller re-probes generate_204 to confirm internet opened. All fetches are source-bound
 # + http(s)-pinned (the portal URL is the joined network's redirect — refuse file://,
 # gopher://, etc.). NOTE on validation: the Aruba Central flow was reverse-engineered live
-# on SBCSS-Guest 2026-07-01; the Cisco/Meraki routines follow each vendor's DOCUMENTED
+# on a guest SSID 2026-07-01; the Cisco/Meraki routines follow each vendor's DOCUMENTED
 # web-auth pattern but are not yet hardware-validated (no test gear) — best-effort, and a
 # failed accept is harmless (the portal simply stays up and we record it blocked).
 _UA_BROWSER='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
@@ -182,7 +182,7 @@ _captive_vendor() {
 # Aruba Central Cloud Guest (Svelte SPA): generate_204 -> capture -> JS/META bounce to a
 # /login SPA -> anonymous "I accept" AUP. Replicate the accept POST (capture + csrf +
 # cmd=authenticate), then POLL up to CAPTIVE_ACCEPT_POLL_SEC — the AP opens the gateway
-# ASYNC (seconds to a minute+) after the POST. Reverse-engineered live on SBCSS-Guest;
+# ASYNC (seconds to a minute+) after the POST. Reverse-engineered live on a guest SSID;
 # grant timing is being measured to tune the budget. If the grant lands after the budget,
 # the next battery run measures it (grant persists). Returns 0 iff internet opened here.
 _accept_aruba_central() {
@@ -387,7 +387,7 @@ _run_profile() {
         [[ -n "$ip4" ]] && dhcp_ms=$(( $(_now_ms) - d0 ))
         # Gateway: ignore-auto-routes suppresses IP4.GATEWAY AND installs no default
         # route, so the gateway comes from the DHCP lease's `routers` option (the
-        # only reliable source on a routes-off connection; validated on Monitor1).
+        # only reliable source on a routes-off connection; validated on the verification sensor).
         # grep-gate to `routers` at a word boundary so a dhclient box's
         # `requested_routers = 1` option can't be captured as gw="1".
         gw="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null | tr ',' '\n' | grep -E '(^|[[:space:]])routers = ' | sed -n 's/.*routers = \([0-9.]*\).*/\1/p' | head -1)"
@@ -468,7 +468,7 @@ _run_profile() {
         # `nmcli -g` joins MULTIPLE values with " | " on one line, so a lease handing
         # out two resolvers yields "10.0.0.1 | 10.0.0.2" — passing that whole string as
         # dig's @server silently fails and reads as "this network's DNS is broken".
-        # Caught on Monitor1: the guest SSID has two resolvers and reported a false
+        # Caught on the verification sensor: the guest SSID has two resolvers and reported a false
         # dns_ok=false. Take the FIRST server only.
         dns_srv="$($SUDO nmcli -g IP4.DNS dev show "$iface" 2>/dev/null \
             | head -1 | tr '|' '\n' | head -1 | tr -d '[:space:]')"

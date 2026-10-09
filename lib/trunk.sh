@@ -120,7 +120,7 @@ _vlan_backend() {
 # default route and DHCP-pushed routes ignored (routes-off, mirroring netplan's
 # use-routes:false) so a monitored VLAN can never hijack the box's uplink. Idempotent:
 # reconciles the set — (re)creates the wanted VLANs, removes our stale ones. Guarded:
-# reverts if the default route disappears. Validated on Monitor1 (NM box) 2026-06-24.
+# reverts if the default route disappears. Validated on the verification sensor (NM box) 2026-06-24.
 _apply_vlan_nmcli() {
     local parent="$1" vlans="$2" statics="${3:-}"
     if ! command -v nmcli >/dev/null 2>&1; then
