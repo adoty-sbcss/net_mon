@@ -98,7 +98,7 @@ if [[ $run_wizard -eq 1 ]]; then
     /usr/local/sbin/netmon-wizard
 fi
 
-# --- 5. Build, start, optional SFTP test ---------------------------------
+# --- 5. Build and start --------------------------------------------------
 
 echo ""
 # REL-3: pull the prebuilt image; build locally only if the registry is
