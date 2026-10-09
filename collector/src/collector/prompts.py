@@ -97,8 +97,9 @@ files into a Claude conversation, then send the prompt below.
   with sub-second peaks may be missed; sustained issues will show.
 - nmap was run with `-sn -PE -PR` only — no port scanning. Hostnames
   come from PTR records if upstream DNS provided any.
-- SNMP polling is off by default and only runs when configured with
-  community strings.
+- SNMP polling is enabled by default but does nothing until read
+  community strings are configured, so SNMP-derived data is absent on a
+  box that has none.
 """
 
 
@@ -107,7 +108,7 @@ CLAUDE_BUNDLE_README_HOURLY = """\
 
 This ZIP rolls up every network scan that completed during one hour on a
 single Ubuntu collector box. It was generated automatically and uploaded
-to the configured SFTP server at the top of the hour.
+over HTTPS to the NetMon dashboard's storage at the top of the hour.
 
 ## What's in here
 

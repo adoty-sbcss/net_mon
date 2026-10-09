@@ -413,8 +413,17 @@ LOCAL=$(git rev-parse HEAD)
 # historical behavior — so shipping this is a no-op until channels are set from
 # the dashboard. 'canary' tracks origin/main (latest); 'hold' pauses updates;
 # 'stable' with a pin (NETMON_UPDATE_REF) converges to that exact commit.
-UPDATE_CHANNEL="$(read_env NETMON_UPDATE_CHANNEL)"
-UPDATE_REF="$(read_env NETMON_UPDATE_REF)"
+#
+# A hold or a pin is a statement that this box must NOT follow main, so neither
+# may degrade into following it:
+#   - the values are normalized first (case, stray whitespace/CR/quotes from a
+#     hand edit), so "Hold" or "hold " still holds;
+#   - a pin that does not resolve to a commit STOPS the run where it is and
+#     reports why. It used to log a WARN and track origin/main — the opposite of
+#     what a pin asks for, visible only in the journal;
+#   - an unrecognized channel is treated as stable, so it still honours a pin.
+UPDATE_CHANNEL="$(read_env NETMON_UPDATE_CHANNEL | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
+UPDATE_REF="$(read_env NETMON_UPDATE_REF | tr -d "[:space:]'")"
 case "$UPDATE_CHANNEL" in
     hold)
         log "update channel=hold; skipping auto-update"
@@ -426,22 +435,30 @@ case "$UPDATE_CHANNEL" in
         IMAGE_TAG="$REMOTE"
         log "update channel=canary -> origin/main ${REMOTE:0:8} (immutable image :${REMOTE:0:8})"
         ;;
-    stable|"")
-        if [[ -n "$UPDATE_REF" ]] && REMOTE=$(git rev-parse --verify "${UPDATE_REF}^{commit}" 2>/dev/null); then
-            # Pinned to an exact commit -> the immutable per-commit image tag.
-            IMAGE_TAG="$REMOTE"
-            log "update channel=stable; pinned ${UPDATE_REF} -> ${REMOTE:0:8} (image :${REMOTE:0:8})"
-        else
-            [[ -n "$UPDATE_REF" ]] && log "WARN: pinned ref '${UPDATE_REF}' not found after fetch; tracking origin/main"
+    *)
+        case "$UPDATE_CHANNEL" in
+            stable|"") ;;
+            *) log "WARN: unknown update channel '${UPDATE_CHANNEL}'; treating it as stable" ;;
+        esac
+        if [[ -z "$UPDATE_REF" ]]; then
             REMOTE=$(git rev-parse origin/main)
             IMAGE_TAG="$REMOTE"
             log "update channel=stable -> origin/main ${REMOTE:0:8} (immutable image :${REMOTE:0:8})"
+        elif REMOTE=$(git rev-parse --verify --quiet "${UPDATE_REF}^{commit}" 2>/dev/null) \
+                && [[ "$REMOTE" =~ ^[0-9a-f]{40,64}$ ]]; then
+            # Pinned to an exact commit -> the immutable per-commit image tag.
+            IMAGE_TAG="$REMOTE"
+            log "update channel=stable; pinned -> ${REMOTE:0:8} (image :${REMOTE:0:8})"
+        else
+            # The ref is operator-supplied text headed for a JSON string and the
+            # journal: keep only characters a ref can legitimately contain.
+            SAFE_REF="${UPDATE_REF//[^A-Za-z0-9._\/~^-]/?}"
+            SAFE_REF="${SAFE_REF:0:64}"
+            log "FATAL: pinned ref '${SAFE_REF}' does not resolve to a commit after fetching origin/main; staying on ${LOCAL:0:8}"
+            log "       Fix NETMON_UPDATE_REF (a commit on main) or clear it. This box will NOT follow main while the pin is set."
+            RESULT_STATUS="failed"; RESULT_REASON="pinned ref '${SAFE_REF}' not found on origin/main; staying on ${LOCAL:0:8} (fix or clear the pinned release)"
+            exit 1
         fi
-        ;;
-    *)
-        REMOTE=$(git rev-parse origin/main)
-        IMAGE_TAG="$REMOTE"
-        log "WARN: unknown update channel '${UPDATE_CHANNEL}'; tracking origin/main (immutable image :${REMOTE:0:8})"
         ;;
 esac
 

@@ -58,7 +58,7 @@ WIZARD_STATE="not run"
 
 # Enrollment / control plane: enrolled if the box holds a per-sensor token.
 # "NOT ENROLLED" (yellow) when a credential is configured but no token yet —
-# the silent-failure case we want loud. "off" = intentional SFTP-only box.
+# the silent-failure case we want loud. "off" = intentional standalone box (no dashboard).
 ENROLL="off"
 if [ "$HEALTH" = "containers up" ]; then
     if docker exec netmon-collector sh -c 'test -f /var/lib/netmon/enroll-token' 2>/dev/null; then

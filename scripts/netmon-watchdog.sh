@@ -10,7 +10,7 @@
 #                    Uploaded bundles go first; un-uploaded only if disk pressure.
 #   2. Disk pressure: if /var/lib/netmon usage > 85%, emergency pass that
 #                    deletes ALL uploaded bundles regardless of age.
-#   3. Upload stall:  if no successful SFTP upload in 6h AND there are
+#   3. Upload stall:  if no successful bundle upload in 6h AND there are
 #                    pending bundles, restart the collector + log to syslog.
 #   4. DB stall:      if postgres unreachable for > 5min, restart it.
 #
@@ -129,7 +129,7 @@ emergency_cleanup_if_pressured() {
     pct="$(disk_pct "$BUNDLES_DIR")"
     if [[ -n "$pct" ]] && (( pct >= DISK_PRESSURE_PCT )); then
         log "WARNING: still at ${pct}% after emergency cleanup; manual triage needed"
-        log "         un-uploaded bundles are protected — fix SFTP first, then they ship out"
+        log "         un-uploaded bundles are protected — fix the upload path first, then they ship out"
     fi
     ACTIONS=$((ACTIONS + 1))
 }

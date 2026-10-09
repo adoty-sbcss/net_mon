@@ -77,7 +77,7 @@ The sensor needs outbound access to these. Nothing else is contacted by default.
 |---|---|---|
 | Your NetMon dashboard (HTTPS) | Enrollment, check-in, command results, measurement results. Authenticated with a per-sensor bearer token. | Check-in every 3 min; console poll every 30 s |
 | Azure Blob Storage (HTTPS) | The hourly bundle is uploaded to a short-lived, write-only URL the dashboard issues for that one file. | Hourly |
-| The dashboard's console broker (WebSocket) | Only while a dashboard operator has a remote console session open. | On demand |
+| The dashboard's console broker (WebSocket over TLS — `wss://` only; a plain `ws://` broker is refused) | Only while a dashboard operator has a remote console session open. | On demand |
 | `github.com` | Nightly code update from this repository. | 03:00 nightly, plus a weekly refresh |
 | `ghcr.io` | The prebuilt collector image. | With each update |
 | Docker Hub, Debian mirrors, PyPI, `wireshark.org` | Base images and packages when the image is built locally — the weekly refresh, and the fallback when the prebuilt image cannot be pulled. | Weekly |
@@ -178,7 +178,7 @@ Dedicate a machine to the sensor. Do not install it on a box that does anything 
 | Per-sensor enrollment token | `/var/lib/netmon/enroll-token`, mode 0600 | Sent to the dashboard as the bearer token on each request |
 | Shared bootstrap key | `/etc/netmon/netmon.env`, mode 0600 | Sent at enrollment, and again if the sensor has to re-enroll |
 | SNMP read communities | `netmon.env` (0600) and the local database | **Yes.** The community that worked for each device is included in the hourly bundle, and the configured list is reported at check-in, so the dashboard can show which credential works where. Use read-only communities. |
-| DHCP-server (WinRM) account | `/var/lib/netmon/dhcp-targets.json`, 0600 | The password never does. If a login fails, the error text in the bundle may name the account. |
+| DHCP-server (WinRM) account | `/var/lib/netmon/dhcp-targets.json`, 0600 | No. A failed collection is reported as a fixed error code and sentence; the underlying error text, which can name the account, stays in the sensor's local log. |
 | Switch SSH credentials | `/var/lib/netmon/device-config-targets.json`, 0600 | No |
 | Wi-Fi PSK / 802.1X credentials | `netmon.env`, a 0600 profile file, and a 0600 NetworkManager keyfile | No |
 | Secrets inside backed-up switch configs | Replaced on the box by a keyed hash before storage; the key never leaves the box | No — only the redacted config is uploaded |
@@ -227,15 +227,16 @@ your own data-classification and student-privacy obligations.
 - To control it, set the update channel:
   - `NETMON_UPDATE_CHANNEL=hold` — pause updates.
   - `NETMON_UPDATE_CHANNEL=stable` with `NETMON_UPDATE_REF=<commit>` — stay on a
-    commit you have reviewed. The commit must be on `main`. **If the ref cannot
-    be resolved the box falls back to following `main`** and only logs a
-    warning (`journalctl -u netmon-update`), so use `hold` when you need a
-    guarantee.
+    commit you have reviewed. The commit must be on `main`. If the ref cannot
+    be resolved the box **stays on the commit it is running** and does not
+    update; the reason is reported to the dashboard as a failed update and
+    logged (`journalctl -u netmon-update`). It never falls back to `main`.
 
   The channel is a dashboard-managed setting, so set it there; the dashboard
   operator can change it. The weekly refresh (`scripts/weekly-deep-refresh.sh`)
-  pulls and rebuilds from `main` regardless of the channel — disable
-  `netmon-deep-refresh.timer` if you need a strict pin.
+  honours the channel: on `hold`, or with a pinned commit, it rebuilds the
+  commit already checked out (fresh OS and Python packages, same sensor code)
+  and does not pull `main`.
 - `scripts/install-auto-update.sh --uninstall` removes all scheduled jobs.
 
 ## 9. Reducing the footprint

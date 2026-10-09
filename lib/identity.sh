@@ -59,8 +59,8 @@ _prompt_one_identity() {
 prompt_identity_config() {
     echo ""
     echo "${C_INFO}=== Box identity ===${C_OFF}"
-    echo "These names tag every scan and organize uploads on the SFTP server"
-    echo "into <district>/<school>/<device>/ folders."
+    echo "These names tag every scan and file this sensor's uploads on the"
+    echo "dashboard under <district>/<school>/<device>."
     echo ""
 
     _prompt_one_identity NETMON_DISTRICT NETMON_DISTRICT_SLUG \

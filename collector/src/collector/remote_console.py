@@ -55,6 +55,7 @@ from .checkin import (
     _QUEUED_ONLY_COMMANDS,
     _redact_secrets,
     _run_command,
+    is_tls_console_broker,
 )
 
 log = structlog.get_logger(__name__)
@@ -378,6 +379,12 @@ def run_console_session(broker: str, token: str, sid: str, mode: str = "restrict
         return 1
     if not broker or not token or not sid:
         log.warning("remote console: missing broker/token/sid")
+        return 2
+    # Re-checked at the dial itself, not only where the command is accepted
+    # (checkin._spawn_console_session): `collector console-session --broker …` is
+    # also a CLI entry point, and this is the line that puts the token on the wire.
+    if not is_tls_console_broker(broker):
+        log.warning("remote console: refusing a non-TLS broker (wss:// required)", sid=sid)
         return 2
 
     url = f"{broker}?role=sensor&token={token}&sid={sid}"

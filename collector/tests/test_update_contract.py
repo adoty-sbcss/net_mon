@@ -42,9 +42,11 @@ def test_current_source_still_reconciles_image_and_container() -> None:
 
 def test_all_update_channels_select_immutable_commit_image() -> None:
     case_start = UPDATER.index('case "$UPDATE_CHANNEL" in')
-    channel_logic = UPDATER[case_start : UPDATER.index("esac", case_start)]
+    channel_logic = UPDATER[case_start : UPDATER.index("\n# Reconcile image", case_start)]
 
-    assert channel_logic.count('IMAGE_TAG="$REMOTE"') == 4
+    # canary, unpinned stable, pinned stable. (An unresolvable pin selects no
+    # image at all — it stops the run; see test_update_channel.py.)
+    assert channel_logic.count('IMAGE_TAG="$REMOTE"') == 3
     assert 'IMAGE_TAG="stable"' not in channel_logic
     assert 'IMAGE_TAG="canary"' not in channel_logic
 

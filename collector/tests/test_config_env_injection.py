@@ -405,6 +405,16 @@ def test_host_action_command_id_record_injection_is_refused(tmp_path, monkeypatc
     ("field", "value"),
     [
         ("broker", "http://b.example"),      # not a websocket scheme
+        # Plain ws:// is refused: the session token rides the query string and a
+        # full-shell stream is a host-root terminal. No loopback exception either.
+        ("broker", "ws://b.example/ws"),
+        ("broker", "ws://localhost:8080/console"),
+        ("broker", "ws://127.0.0.1/console"),
+        ("broker", "WS://b.example/ws"),
+        ("broker", "ws://wss://b.example/ws"),
+        ("broker", "wss://"),                # TLS scheme but no host
+        ("broker", "wss:///console"),
+        ("broker", "wss://@b.example/ws"),
         ("broker", "wss://b.example/ws#x"),  # fragment truncates the query
         ("broker", "wss://b.example/ w"),
         ("token", "t&role=admin"),           # forges a following query parameter
@@ -452,3 +462,47 @@ def test_console_session_still_starts_for_a_normal_request(tmp_path, monkeypatch
     lines = req.read_text().splitlines()
     assert len(lines) == 3
     assert all(len(line.split("\t")) == 2 for line in lines)
+
+
+@pytest.mark.parametrize(
+    "broker",
+    ["ws://b.example/ws", "ws://localhost/console", "http://b.example", "wss://", "b.example/ws"],
+)
+def test_console_dial_itself_refuses_a_non_tls_broker(broker, monkeypatch) -> None:
+    # The intake check above is not the only way in: `collector console-session
+    # --broker …` reaches run_console_session directly, and that is the call that
+    # puts the token on the wire. It must refuse before it dials.
+    import sys
+    import types
+
+    from collector import remote_console
+
+    dialed: list = []
+    fake = types.ModuleType("websocket")
+    fake.create_connection = lambda url, **kw: dialed.append(url)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "websocket", fake)
+
+    assert remote_console.run_console_session(broker, "tok", "abc123") == 2
+    assert dialed == []
+
+
+def test_console_dial_proceeds_for_a_wss_broker(monkeypatch) -> None:
+    # Positive control for the test above: with wss:// the same stub IS dialed,
+    # so "not dialed" there means refused, not "the stub never runs".
+    import sys
+    import types
+
+    from collector import remote_console
+
+    dialed: list = []
+
+    def create_connection(url, **kw):
+        dialed.append(url)
+        raise OSError("stop after the dial")
+
+    fake = types.ModuleType("websocket")
+    fake.create_connection = create_connection  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "websocket", fake)
+
+    assert remote_console.run_console_session("wss://b.example/ws", "tok", "abc123") == 3
+    assert dialed == ["wss://b.example/ws?role=sensor&token=tok&sid=abc123"]

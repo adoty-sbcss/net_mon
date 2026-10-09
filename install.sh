@@ -3,7 +3,7 @@
 #
 # The dashboard "Deploy a sensor here" page generates a provisioning file for a
 # specific district/school landing spot (dashboard URL + scoped enroll key +
-# slugs + that district's SFTP creds). On a fresh Ubuntu box:
+# slugs). On a fresh Ubuntu box:
 #
 #     git clone <collector-repo> NetMon && cd NetMon
 #     # save the file from the dashboard at config/provisioning.env
@@ -133,7 +133,7 @@ log "Starting containers..."
 # --force-recreate so a RE-RUN after a config change actually reloads the env
 # file. docker compose only injects netmon.env at container-create time, so a
 # plain `up -d` on an existing container keeps the old env (this is how a box
-# can end up with valid SFTP creds but uploads still disabled).
+# can end up enrolled but with uploads still disabled).
 dc up -d --force-recreate
 log "Waiting for the collector to come up..."
 for _ in $(seq 1 15); do

@@ -28,7 +28,7 @@ printf '\033[1;36m╔═══════════════════�
 printf '\033[1;36m║   NetMon — first-boot wizard has not been run on this box.   ║\033[0m\n'
 printf '\033[1;36m╚══════════════════════════════════════════════════════════════╝\033[0m\n'
 printf '\n'
-printf '  Run it now to configure SFTP destination, identity, and SNMP:\n'
+printf '  Run it now to configure identity, SNMP, and the dashboard connection:\n'
 printf '      sudo netmon-wizard\n'
 printf '\n'
 printf '  Or run later — this prompt will keep appearing until the wizard\n'
