@@ -56,7 +56,7 @@ def get_one(name: str) -> InterfaceState | None:
 def primary_interface() -> str | None:
     """Return the name of the interface that owns the default route.
 
-    This is the box's primary uplink — how it reaches the SFTP server and the
+    This is the box's primary uplink — how it reaches the dashboard and the
     internet. Auto-detected (not configured) so it survives NIC renaming
     across different hardware. Returns None if there's no default route yet.
     """
