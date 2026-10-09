@@ -99,6 +99,7 @@ _MAX_OUTPUT_BYTES = 8 * 1024 * 1024
 # scrubbed) to the sensor's own log, which stays on the box.
 _ERROR_TEXT: dict[str, str] = {
     "no_server_ip": "No server address is configured for this target.",
+    "unsupported_server_type": "This server type is not supported yet (Windows DHCP only).",
     "dependency_missing": "The sensor is missing a component this transport needs.",
     "auth_failed": (
         "Sign-in was rejected: the password is wrong or expired, or the account is "
@@ -165,6 +166,24 @@ def _fail(
     if transport is not None:
         entry["transport"] = transport
     return entry
+
+
+# The only top-level fields a server's report may contribute to a successful
+# entry. The report is the SERVER's text: merged wholesale (as it used to be) it
+# could overwrite status/transport/server_ip, or add a field of its own — so a
+# reply of {"ok": true, "status": "error", "detail": "<account>"} produced a
+# non-ok entry that never went through _fail. Sensor-owned fields are written
+# last and nothing outside this list is copied.
+_REPORT_FIELDS: tuple[str, ...] = (
+    "hostname", "is_authorized", "is_domain_joined",
+    "server_stats", "failover", "server_options", "scopes",
+)
+
+
+def _ok(base: dict[str, Any], transport: str, report: dict[str, Any]) -> dict[str, Any]:
+    """Build a successful entry from the whitelisted part of a server's report."""
+    picked = {k: report[k] for k in _REPORT_FIELDS if k in report}
+    return {**picked, **base, "status": "ok", "transport": transport}
 
 
 # ---------------------------------------------------------------------------
@@ -290,8 +309,8 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
     if not ip:
         return _fail(base, "no_server_ip")
     if server_type != "windows":
-        return {**base, "status": "unsupported",
-                "error": f"server_type '{server_type}' not supported yet (v1 = windows)"}
+        return {**base, "status": "unsupported", "code": "unsupported_server_type",
+                "error": _ERROR_TEXT["unsupported_server_type"]}
 
     transport = str(target.get("transport") or "auto").lower()
     user = str(target.get("winrm_user") or "")
@@ -408,12 +427,10 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
         return _fail(base, _classify(err, "probe_failed"), transport=transport,
                      detail=err, secret=password)
 
-    # Merge the server's own report onto the target identity. `ok`/`error` in the
-    # PS payload are control fields — drop them; keep everything else. `transport`
-    # records which auth actually worked, for the dashboard status line.
-    parsed.pop("ok", None)
-    parsed.pop("error", None)
-    return {**base, "status": "ok", "transport": transport, **parsed}
+    # Merge the server's own report onto the target identity (see _ok: only the
+    # known report fields, and never over the sensor's own). `transport` records
+    # which auth actually worked, for the dashboard status line.
+    return _ok(base, transport, parsed)
 
 
 def _is_wmi_denied(err: str) -> bool:
@@ -516,8 +533,7 @@ def _collect_via_rpc(
     finally:
         if ccache:
             _cleanup_ccache(ccache)
-    parsed.pop("transport_detail", None)
-    return {**base, "status": "ok", "transport": "rpc", **parsed}
+    return _ok(base, "rpc", parsed)
 
 
 # ---------------------------------------------------------------------------
