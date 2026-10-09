@@ -390,7 +390,13 @@ def run_console_session(broker: str, token: str, sid: str, mode: str = "restrict
     url = f"{broker}?role=sensor&token={token}&sid={sid}"
     log.info("remote console: dialing broker", sid=sid)
     try:
-        ws = websocket.create_connection(url, timeout=20, enable_multithread=True)
+        # redirect_limit=0: websocket-client follows up to three HTTP redirects by
+        # default and dials whatever scheme the Location carries, re-sending this
+        # URL's query. A redirect to ws:// would undo the check above after it has
+        # passed, so no redirect is followed at all.
+        ws = websocket.create_connection(
+            url, timeout=20, enable_multithread=True, redirect_limit=0
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("remote console: connect failed", sid=sid, error=str(exc))
         return 3

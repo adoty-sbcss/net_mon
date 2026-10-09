@@ -495,9 +495,11 @@ def test_console_dial_proceeds_for_a_wss_broker(monkeypatch) -> None:
     from collector import remote_console
 
     dialed: list = []
+    seen_kwargs: dict = {}
 
     def create_connection(url, **kw):
         dialed.append(url)
+        seen_kwargs.update(kw)
         raise OSError("stop after the dial")
 
     fake = types.ModuleType("websocket")
@@ -506,3 +508,65 @@ def test_console_dial_proceeds_for_a_wss_broker(monkeypatch) -> None:
 
     assert remote_console.run_console_session("wss://b.example/ws", "tok", "abc123") == 3
     assert dialed == ["wss://b.example/ws?role=sensor&token=tok&sid=abc123"]
+    # The wss:// check covers the first hop only; this is what covers the rest.
+    assert seen_kwargs["redirect_limit"] == 0
+
+
+def _redirecting_server(location: str):
+    """A plain-HTTP listener that answers every request with a 302 to `location`."""
+    import socket
+    import threading
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    srv.settimeout(5)
+    hits: list[bytes] = []
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(2)
+                try:
+                    hits.append(conn.recv(4096))
+                    conn.sendall(
+                        f"HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n".encode()
+                    )
+                except OSError:
+                    pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv, hits
+
+
+@pytest.mark.parametrize("limit", [0, None])
+def test_redirect_limit_zero_really_stops_the_library_following_a_redirect(limit) -> None:
+    # Not a test of our code but of the premise it rests on: that the installed
+    # websocket-client follows a redirect by default (limit=None here, the
+    # positive control) and does not when redirect_limit=0. If a release changes
+    # either, this is where it shows.
+    websocket = pytest.importorskip("websocket")
+    second, second_hits = _redirecting_server("ws://127.0.0.1:1/unused")
+    port2 = second.getsockname()[1]
+    first, first_hits = _redirecting_server(f"ws://127.0.0.1:{port2}/next?token=SECRET")
+    port1 = first.getsockname()[1]
+    kwargs = {} if limit is None else {"redirect_limit": limit}
+    try:
+        with pytest.raises(Exception):  # noqa: B017, PT011 - any refusal will do
+            websocket.create_connection(
+                f"ws://127.0.0.1:{port1}/console?token=SECRET", timeout=5, **kwargs
+            )
+    finally:
+        first.close()
+        second.close()
+
+    assert len(first_hits) == 1
+    if limit == 0:
+        assert second_hits == []          # the redirect target was never dialed
+    else:
+        assert len(second_hits) >= 1      # by default it IS dialed, token and all
+        assert b"token=SECRET" in second_hits[0]
