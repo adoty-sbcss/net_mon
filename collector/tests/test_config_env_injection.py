@@ -555,18 +555,53 @@ def test_redirect_limit_zero_really_stops_the_library_following_a_redirect(limit
     first, first_hits = _redirecting_server(f"ws://127.0.0.1:{port2}/next?token=SECRET")
     port1 = first.getsockname()[1]
     kwargs = {} if limit is None else {"redirect_limit": limit}
+    returned_status = None
     try:
-        with pytest.raises(Exception):  # noqa: B017, PT011 - any refusal will do
-            websocket.create_connection(
-                f"ws://127.0.0.1:{port1}/console?token=SECRET", timeout=5, **kwargs
-            )
+        # Releases before 1.9.1 return a "connected" object holding the 3xx
+        # instead of raising; either is acceptable HERE, and run_console_session
+        # rejects the non-101 status itself (tested below).
+        returned_status = websocket.create_connection(
+            f"ws://127.0.0.1:{port1}/console?token=SECRET", timeout=5, **kwargs
+        ).getstatus()
+    except Exception:  # noqa: BLE001
+        pass
     finally:
         first.close()
         second.close()
 
     assert len(first_hits) == 1
+    assert returned_status != 101
     if limit == 0:
         assert second_hits == []          # the redirect target was never dialed
     else:
         assert len(second_hits) >= 1      # by default it IS dialed, token and all
         assert b"token=SECRET" in second_hits[0]
+
+
+@pytest.mark.parametrize(("status", "expected"), [(302, 3), (307, 3), (200, 3)])
+def test_console_refuses_a_connection_the_broker_did_not_upgrade(status, expected, monkeypatch) -> None:
+    # websocket-client < 1.9.1 with redirects off returns a "connected" object for
+    # a 3xx. run_console_session must not treat that as a session.
+    import sys
+    import types
+
+    from collector import remote_console
+
+    closed: list = []
+
+    class NotUpgraded:
+        def getstatus(self):
+            return status
+
+        def close(self):
+            closed.append(True)
+
+        def __getattr__(self, name):  # any use as a live socket is the bug
+            raise AssertionError(f"used a non-upgraded connection: {name}")
+
+    fake = types.ModuleType("websocket")
+    fake.create_connection = lambda url, **kw: NotUpgraded()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "websocket", fake)
+
+    assert remote_console.run_console_session("wss://b.example/ws", "tok", "abc123") == expected
+    assert closed == [True]

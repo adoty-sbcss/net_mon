@@ -400,6 +400,21 @@ def run_console_session(broker: str, token: str, sid: str, mode: str = "restrict
     except Exception as exc:  # noqa: BLE001
         log.warning("remote console: connect failed", sid=sid, error=str(exc))
         return 3
+    # With redirects off, websocket-client before 1.9.1 does not raise on a 3xx: it
+    # hands back an object marked connected whose "handshake" was the redirect. That
+    # is not a console session, so refuse anything but 101 Switching Protocols.
+    try:
+        handshake_status = ws.getstatus()
+    except Exception:  # noqa: BLE001 - a stub or odd build without it: nothing to judge
+        handshake_status = None
+    if handshake_status is not None and handshake_status != 101:
+        log.warning("remote console: broker did not upgrade the connection",
+                    sid=sid, status=handshake_status)
+        try:
+            ws.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return 3
 
     # Full-shell mode (CON-7): attach to the host-side PTY server now so the prompt
     # is ready the moment the operator pairs. Full shell targets the HOST root via
