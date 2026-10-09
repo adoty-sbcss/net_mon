@@ -421,7 +421,25 @@ LOCAL=$(git rev-parse HEAD)
 #   - a pin that does not resolve to a commit STOPS the run where it is and
 #     reports why. It used to log a WARN and track origin/main — the opposite of
 #     what a pin asks for, visible only in the journal;
-#   - an unrecognized channel is treated as stable, so it still honours a pin.
+#   - an unrecognized channel is treated as stable, so it still honours a pin;
+#   - a pin must be a commit ON main, not merely one this checkout happens to
+#     hold;
+#   - if the env file is there but cannot be read, the channel is UNKNOWN and the
+#     run stops. read_env turns every error into an empty value, and an empty
+#     channel means "follow main" — so without this an unreadable file would
+#     read as "no hold, no pin".
+channel_env_known() {
+    [[ -r "$ENV_FILE" ]] && return 0
+    sudo -n true 2>/dev/null && return 0    # read_env's sudo will work (or the file is absent)
+    local dir; dir="$(dirname "$ENV_FILE")"
+    # No sudo: fine only if the file is verifiably absent (a box not set up yet).
+    [[ ! -e "$ENV_FILE" ]] && { [[ ! -e "$dir" ]] || [[ -x "$dir" ]]; }
+}
+if ! channel_env_known; then
+    log "FATAL: cannot read $ENV_FILE to learn the update channel (no passwordless sudo?); staying on ${LOCAL:0:8}"
+    RESULT_STATUS="failed"; RESULT_REASON="cannot read the env file to learn the update channel; staying on ${LOCAL:0:8}"
+    exit 1
+fi
 UPDATE_CHANNEL="$(read_env NETMON_UPDATE_CHANNEL | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
 UPDATE_REF="$(read_env NETMON_UPDATE_REF | tr -d "[:space:]'")"
 case "$UPDATE_CHANNEL" in
@@ -445,7 +463,8 @@ case "$UPDATE_CHANNEL" in
             IMAGE_TAG="$REMOTE"
             log "update channel=stable -> origin/main ${REMOTE:0:8} (immutable image :${REMOTE:0:8})"
         elif REMOTE=$(git rev-parse --verify --quiet "${UPDATE_REF}^{commit}" 2>/dev/null) \
-                && [[ "$REMOTE" =~ ^[0-9a-f]{40,64}$ ]]; then
+                && [[ "$REMOTE" =~ ^[0-9a-f]{40,64}$ ]] \
+                && git merge-base --is-ancestor "$REMOTE" origin/main 2>/dev/null; then
             # Pinned to an exact commit -> the immutable per-commit image tag.
             IMAGE_TAG="$REMOTE"
             log "update channel=stable; pinned -> ${REMOTE:0:8} (image :${REMOTE:0:8})"
@@ -454,7 +473,7 @@ case "$UPDATE_CHANNEL" in
             # journal: keep only characters a ref can legitimately contain.
             SAFE_REF="${UPDATE_REF//[^A-Za-z0-9._\/~^-]/?}"
             SAFE_REF="${SAFE_REF:0:64}"
-            log "FATAL: pinned ref '${SAFE_REF}' does not resolve to a commit after fetching origin/main; staying on ${LOCAL:0:8}"
+            log "FATAL: pinned ref '${SAFE_REF}' is not a commit on origin/main (after fetching it); staying on ${LOCAL:0:8}"
             log "       Fix NETMON_UPDATE_REF (a commit on main) or clear it. This box will NOT follow main while the pin is set."
             RESULT_STATUS="failed"; RESULT_REASON="pinned ref '${SAFE_REF}' not found on origin/main; staying on ${LOCAL:0:8} (fix or clear the pinned release)"
             exit 1

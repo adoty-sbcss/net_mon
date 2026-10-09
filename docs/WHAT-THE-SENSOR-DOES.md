@@ -228,7 +228,7 @@ your own data-classification and student-privacy obligations.
   - `NETMON_UPDATE_CHANNEL=hold` — pause updates.
   - `NETMON_UPDATE_CHANNEL=stable` with `NETMON_UPDATE_REF=<commit>` — stay on a
     commit you have reviewed. The commit must be on `main`. If the ref cannot
-    be resolved the box **stays on the commit it is running** and does not
+    be resolved, or is not on `main`, the box **stays on the commit it is running** and does not
     update; the reason is reported to the dashboard as a failed update and
     logged (`journalctl -u netmon-update`). It never falls back to `main`.
 
