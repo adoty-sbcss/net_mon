@@ -113,7 +113,7 @@ def test_existing_keyword_and_bearer_secrets_still_masked(text: str, secret: str
         # Bare `user@host` (ssh target) — no scheme, no ':pass', not a credential.
         "ssh adaministrator@10.8.2.100 to verify the box",
         # An email address — the '@' must not trip userinfo masking.
-        "notified admin a.user@sbcss.net about the scan",
+        "notified admin a.user@example.net about the scan",
         # scp-like git remote `git@host:path` — no '://', not a password.
         "git clone git@github.com:adoty-sbcss/net_mon.git",
         # Ordinary key=value log fields must stay readable.
@@ -447,7 +447,7 @@ def test_private_key_block_body_is_dropped_and_fences_kept() -> None:
 @pytest.mark.parametrize(
     "line",
     [
-        "hostname rch-idf-n-3560cx-1",
+        "hostname site-idf-n-3560cx-1",
         "ip access-list standard SNMP-ACL",
         " permit 10.20.30.0 0.0.0.255",
         "interface GigabitEthernet1/0/24",
@@ -455,7 +455,7 @@ def test_private_key_block_body_is_dropped_and_fences_kept() -> None:
         " ip address 10.20.100.1 255.255.255.0",
         "spanning-tree mode rapid-pvst",
         "ntp server 10.20.30.49 prefer",
-        "snmp-server location RCH-IDF-NORTH",
+        "snmp-server location SITE-IDF-NORTH",
         "snmp-server contact netops@example.org",
         "vlan 100",
         " name STAFF-DATA",

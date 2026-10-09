@@ -22,7 +22,7 @@ every user says "the internet is down". So the verdict is driven by whether a
 TCP handshake to :443 completes. That is binary, fast, and unambiguous.
 
 Traceroute cannot carry the verdict, because on a real school network it lies in
-both directions. Measured on a HEALTHY production sensor (Monitor1, 2026-09-05):
+both directions. Measured on a HEALTHY production sensor (the verification sensor, 2026-09-05):
 
   * `traceroute -T -p 443 --sport=33434 1.1.1.1` — the fixed-flow form, which is
     the textbook recommendation for stable ECMP — returned hops 1-3 then STARS to
@@ -99,7 +99,7 @@ CAPTURE_DIR = WAN_PATH_DIR / "captures"
 CAPTURE_MAX = 1200
 
 # Traceroute bounds. 15 hops reaches the dashboard (measured: 15 hops to
-# netmon.sbcss.net) without paying for a long walk to nowhere; -w 2 is the
+# the dashboard hostname) without paying for a long walk to nowhere; -w 2 is the
 # per-probe wait, -q 1 one query per hop (the baseline's repeat samples give us
 # redundancy more cheaply than -q 3 does).
 TRACE_MAX_HOPS = 15
@@ -114,7 +114,7 @@ TRACE_TIMEOUT_SEC = TRACE_MAX_HOPS * TRACE_WAIT_SEC + 15
 CAPTURE_BUDGET_SEC = 150
 
 # How many traces per mode a baseline refresh takes, to learn the ECMP sets.
-# Four runs was enough on Monitor1 to expose both flapping hops.
+# Four runs was enough on the verification sensor to expose both flapping hops.
 BASELINE_SAMPLES = 4
 
 # How many hops SHORT of the baseline before we will call it a break.
@@ -122,7 +122,7 @@ BASELINE_SAMPLES = 4
 # Not a magic number: we send one query per hop (`-q 1`), so a single dropped
 # probe at the tail costs exactly one hop of apparent depth, and a destination
 # that declines to answer one round costs one more. A healthy production capture
-# on Monitor1 showed hop 10 silent with hop 11 answering — had hop 11 also missed
+# on the verification sensor showed hop 10 silent with hop 11 answering — had hop 11 also missed
 # its single probe, a 1-2 hop shortfall would have been headlined "PATH ENDS
 # HERE" on a perfectly good path. A real break is not subtle: the incident this
 # feature exists for truncated the path by most of its length. So require the

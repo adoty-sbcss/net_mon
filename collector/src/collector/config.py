@@ -155,7 +155,7 @@ class Settings(BaseSettings):
     # flooding sideways into every IDF; where an uplink can't be resolved it falls
     # back to a normal (capability-gated, budgeted) crawl at that switch, so
     # visibility is never lost. 'full' = the historical omnidirectional walk.
-    # Validated on a live fabric (Monitor1): polled 35 devices vs 197 / 6s vs 15min
+    # Validated on a live fabric (the verification sensor): polled 35 devices vs 197 / 6s vs 15min
     # for the same coverage. Sibling switches a sensor isn't on the path to surface
     # as uncovered in the dashboard coverage view rather than being crawled.
     snmp_topology_scope: str = Field(default="spine", alias="NETMON_SNMP_TOPOLOGY_SCOPE")

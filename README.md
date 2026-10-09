@@ -2,7 +2,9 @@
 
 Plug an Ubuntu box into a network, collect everything about it, ship the data to your NetMon dashboard every hour.
 
-> **Want the whole-system picture?** The architecture diagrams — sensor → dashboard ingest/analysis, provisioning, and the remote-console broker — live in the dashboard repo: [netmon-dashboard/docs/ARCHITECTURE.md](https://github.com/adoty-sbcss/netmon-dashboard/blob/main/docs/ARCHITECTURE.md).
+> **Evaluating NetMon for your network?** Read [What the sensor does on your network](docs/WHAT-THE-SENSOR-DOES.md) first — every packet it sends, every place it connects, what it uploads, and what the dashboard can make it do. Then [CONFIG.md](CONFIG.md) for deployment values and [docs/HARDENING.md](docs/HARDENING.md) for host hardening.
+>
+> This repository is the **sensor** only. The NetMon dashboard that sensors report to is a separate, privately hosted application.
 
 ---
 
@@ -13,7 +15,6 @@ After `./setup.sh` runs, the canonical paths on the box are:
 | Path | Contents |
 |---|---|
 | `/etc/netmon/netmon.env` | All configuration (identity, SNMP, dashboard enrollment). `chmod 600`. |
-| `/etc/netmon/snmp.yaml` | Optional per-device SNMP overrides. |
 | `/var/lib/netmon/bundles/` | Hourly ZIPs awaiting upload + recent uploads. |
 | `/var/log/netmon/` | `collector.log` + `audit.log`, rotated nightly. |
 | *this repo* | Code only — no state. Safe to `rm -rf` and re-clone. |
@@ -24,7 +25,9 @@ Boxes provisioned before this layout existed get **auto-migrated** on the next `
 
 ## 1. One-time setup on a fresh Ubuntu box
 
-Copy-paste this. `setup.sh` does all the heavy lifting — installs Docker + the Compose plugin, resolves any package conflicts, adds you to the docker group, creates `/etc/netmon` + `/var/lib/netmon`, installs the `netmon-wizard` command, then launches the wizard for your inputs.
+Copy-paste this. `setup.sh` does all the heavy lifting — installs Docker + the Compose plugin, resolves any package conflicts, adds you to the docker group, enables Ubuntu's unattended security updates, creates `/etc/netmon` + `/var/lib/netmon`, installs the `netmon-wizard` command and a login banner, then launches the wizard for your inputs.
+
+At the end it offers to install the scheduled jobs (check-in, remote console, update, watchdog — see section 7). Saying yes also grants the installing user **passwordless sudo**, which those jobs need to run unattended. Use a machine dedicated to the sensor. Details: [Privileges on the box](docs/WHAT-THE-SENSOR-DOES.md#5-privileges-on-the-box).
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
@@ -64,7 +67,6 @@ There is no upload destination to configure. Bundles ship over HTTPS to the dash
 
 **Then** the wizard asks "Set up advanced options now?" — say yes only if you want to override defaults for:
 - SNMP communities (if you have read strings for switches/routers)
-- Scan mode (`field` vs `monitor`)
 - Capture cadence / log level
 
 After the wizard, `setup.sh` builds the containers, starts them, and offers to test the upload path.
@@ -76,7 +78,7 @@ sudo netmon-wizard               # full re-run (current values shown as defaults
 sudo netmon-wizard identity      # just district / school / device
 sudo netmon-wizard snmp          # just SNMP communities
 sudo netmon-wizard dashboard     # just dashboard URL + enrollment bootstrap key
-sudo netmon-wizard advanced      # mode / cadence / log level
+sudo netmon-wizard advanced      # cadence / log level
 ```
 
 You can also reach all of those from `./netmon` → **Configure** submenu.
@@ -93,10 +95,11 @@ A `/etc/profile.d/` snippet posts a reminder on the first interactive login that
 
 | Trigger | What it does |
 |---|---|
-| Plug in a network cable | Detects new IP within 30s, runs a ~1-minute scan |
+| Plug in a network cable | Detects new IP within 30s, runs a scan (a few minutes: a 60 s capture plus the active probes) |
 | Top of every hour | Bundles all scans from the past hour into one ZIP, uploads to the dashboard |
+| Every 3 minutes | Checks in with the dashboard: reports health, picks up configuration and queued commands, and runs the latency probes |
 
-Upload filename format: `<deviceName>_YYYY_MM_DD_HH.zip` (hour is the just-completed hour in local time). If no scans happened in the hour, no file is uploaded.
+Upload filename format: `<device>_YYYY_MM_DD_HH.zip` (hour is the just-completed hour in local time). If no scans happened in the hour, no file is uploaded.
 
 ---
 
@@ -145,7 +148,7 @@ NetMon — Operations
   c) Configure ▶   s) System ▶   d) Diagnostics ▶   q) Quit
 ```
 
-- **Configure ▶** — Identity / SNMP / scan mode / cadence / log level / show config / re-run full wizard. (All delegate to `netmon-wizard`.)
+- **Configure ▶** — Identity / SNMP / cadence / log level / VLAN trunk setup / show config / re-run full wizard. (All delegate to `netmon-wizard`.)
 - **System ▶** — Bundle history / update timer schedule / run update now / version info / reboot.
 - **Diagnostics ▶** — Ping / DNS lookup / collector self-test (from inside the collector container).
 
@@ -169,7 +172,7 @@ Underneath it's still `docker compose ...` — see `netmon` for the exact comman
 
 ## 6. How monitoring works (continuous, multi-interface)
 
-NetMon continuously monitors **every active network interface** — the wired uplink, an associated Wi-Fi NIC, and (later) VLAN sub-interfaces. There's no "field" vs "monitor" mode anymore; the box always runs continuously.
+NetMon continuously monitors **every active network interface** — the wired uplink, an associated Wi-Fi NIC, and any VLAN sub-interfaces you configure. There's no "field" vs "monitor" mode anymore; the box always runs continuously.
 
 Each network is re-scanned on the **rescan interval** (default hourly), so there's fresh data to bundle and upload every hour. A newly plugged-in network is scanned within ~30s of link-up; a stable network is re-scanned once the interval elapses.
 
@@ -229,7 +232,7 @@ The wizard:
 
 The switch port must already be a trunk that allows those VLANs — the sensor can't reconfigure the switch. Each VLAN's scans are tagged with `vlan_id` + `parent_interface` in the bundle. Drop noisy VLANs from auto-scanning with `NETMON_EXCLUDE_VLANS=900,999` (a manual `./netmon scan eth0.900` still works). Confirm the sub-interfaces with `./netmon interfaces`.
 
-**Field notes:** trunk monitoring needs **systemd-networkd** (the Ubuntu Server default) — on a NetworkManager box the wizard warns and the VLANs may not attach. The apply uses `netplan try` (auto-reverts in 120s if it can't reach the network), so a bad VLAN change can't strand the box. If **detection sees no VLANs on a known-good trunk**, the NIC may be stripping 802.1Q tags in hardware before capture — turn that off with `sudo ethtool -K <parent> rxvlan off` and re-run, or just enter the VLANs manually (detection is only a convenience; the sub-interfaces work regardless).
+**Field notes:** trunk monitoring needs **systemd-networkd** (the Ubuntu Server default) — on a NetworkManager box the wizard warns and the VLANs may not attach. The interactive wizard applies with `netplan try` (auto-reverts in 120s if it can't reach the network), so a bad VLAN change can't strand the box. When VLANs are applied non-interactively — by the one-line installer or from the dashboard — it uses `netplan apply` and then checks that the default route survived. If **detection sees no VLANs on a known-good trunk**, the NIC may be stripping 802.1Q tags in hardware before capture — turn that off with `sudo ethtool -K <parent> rxvlan off` and re-run, or just enter the VLANs manually (detection is only a convenience; the sub-interfaces work regardless).
 
 To pause hourly uploads for a box, use **start / pause uploads** on its dashboard sensor page. That sets `NETMON_BUNDLE_TRANSPORT` back to the staging value, and the box keeps scanning and bundling locally — nothing is lost, the bundles just wait. Editing `/etc/netmon/netmon.env` by hand works too, but the dashboard will re-push its desired value on the next check-in.
 
@@ -237,12 +240,24 @@ To pause hourly uploads for a box, use **start / pause uploads** on its dashboar
 
 ## 7. Recovery & self-healing
 
-NetMon runs two background timers to keep itself current and durable:
+NetMon installs seven systemd timers. Two keep the box current and durable:
 
 | Timer | Cadence | What it does |
 |---|---|---|
-| `netmon-update` | nightly ~03:00 | `git pull` + rebuild + `up -d`. **Pre-update**: `pg_dump` snapshot + tag current image as `:previous`. **Post-update**: 2-min healthcheck → auto-rollback if it fails. |
+| `netmon-update` | nightly ~03:00 | Fetches this repository's `main`, resets the checkout to it, pulls the matching prebuilt collector image and recreates the containers. **Pre-update**: `pg_dump` snapshot + records the running commit. **Post-update**: 2-min healthcheck → auto-rollback to that commit if it fails. |
 | `netmon-watchdog` | every 15 min | Prunes bundles + logs >7 days; emergency cleanup if disk >85%; restarts collector if no upload in 6h; restarts postgres if unreachable >5min. |
+
+The others connect the box to its dashboard and run scheduled measurements:
+
+| Timer | Cadence | What it does |
+|---|---|---|
+| `netmon-checkin` | every 3 min | Outbound check-in: health report, configuration pull, queued commands, latency probes. |
+| `netmon-console-poll` | every 30 s | Starts a remote-console session or host action the dashboard has requested. |
+| `netmon-deep-refresh` | weekly, Sun 04:00 | Pulls `main` and rebuilds the collector image from scratch to pick up base-image security patches. |
+| `netmon-wifi-survey` | every 15 min | Wi-Fi scan of visible networks (no-op without a radio). |
+| `netmon-wifi-experience` | 15-min tick | Wi-Fi client-experience test. Idle unless enabled. |
+
+**Updates are unattended.** To pause them or stay on a commit you have reviewed, set the update channel — see [Updates](docs/WHAT-THE-SENSOR-DOES.md#8-updates). To remove every scheduled job and the sudo grant: `scripts/install-auto-update.sh --uninstall`.
 
 Check them with:
 ```bash
@@ -258,8 +273,8 @@ journalctl -u netmon-update.service -n 50
 | **Nightly auto-update broke the collector** | Auto-rollback should have already fired. Verify with `journalctl -u netmon-update.service -n 50`. To force a manual rollback: `./netmon rollback`. |
 | **Collector container is in a weird state but data is fine** | `./netmon quick-rebuild` — wipes the image, rebuilds from current source, keeps DB + config. |
 | **Box is misconfigured beyond repair** | `./netmon factory-reset` — wipes DB + config + logs. Re-run the wizard to start over; the dashboard re-pushes this box's desired config on the next check-in. |
-| **Walked up to a factory-reset box** | 1) `./setup.sh` (installs deps + runs the wizard). 2) Re-enroll it against the dashboard — `/etc/netmon/netmon.env` + `snmp.yaml` are a materialization of the dashboard's `desired_config`, so a dead box is **redeployed, not restored**. |
-| **DB snapshots filling disk** | Watchdog prunes >7 days. Override with `NETMON_RETENTION_DAYS=N` env var on the watchdog service. |
+| **Walked up to a factory-reset box** | 1) `./setup.sh` (installs deps + runs the wizard). 2) Re-enroll it against the dashboard — `/etc/netmon/netmon.env` is a materialization of the dashboard's `desired_config`, so a dead box is **redeployed, not restored**. |
+| **DB snapshots filling disk** | The nightly snapshot job prunes snapshots older than 7 days. Override with `NETMON_SNAPSHOT_RETENTION_DAYS=N`. |
 
 All three recovery levels are also in the operator menu: `./netmon` → **System ▶** → options 6 (rollback) / 7 (quick rebuild) / 8 (factory reset).
 
@@ -302,17 +317,18 @@ sudo rm -rf /etc/netmon /var/lib/netmon /var/log/netmon   # also wipes all confi
 
 Each hourly ZIP contains:
 
-- `README.md` — the prompt to paste into Claude
+- `README.md` — a description of the bundle's contents, written as an analysis prompt
 - `HOURLY_SUMMARY.md` — table of scans in this hour
 - `inventory.csv` / `inventory.json` — the box's **persistent** device inventory across all scans (per MAC: first/last seen, times seen, last known IP / hostname / vendor / device-class / location). Lets the analysis tell brand-new devices from long-known ones.
 - `scans/scan_<id>/` — one folder per scan with `summary.md`, `topology.json`, `devices.csv`, `metrics.json`, `timeline.json`, `findings.json`, `service_discovery.json` (mDNS/SSDP), and `raw/` tool outputs
 
-Drop the ZIP into a Claude chat, paste the prompt from inside, and Claude tells you what's going on with the network — loops, broadcast storms, rogue DHCP servers, duplicate IPs, unusual devices.
+The dashboard ingests each bundle automatically and is where the analysis happens — loops, broadcast storms, rogue DHCP servers, duplicate IPs, unusual devices. The bundle is also self-describing, so a ZIP taken off a box that has no dashboard can be read by hand. It holds device names, MAC addresses and network topology: handle it as sensitive, and don't give it to a third-party service your organization hasn't approved. The full list of what a bundle contains is in [What is collected and uploaded](docs/WHAT-THE-SENSOR-DOES.md#7-what-is-collected-and-uploaded).
 
 ---
 
 ## Notes
 
-- Only run scans on networks you're authorized to assess. NetMon does light active probing (ARP scan, ping sweep), not port scans, but it still puts packets on the wire.
-- All collected data stays on this box and the NetMon dashboard you enroll it to.
-- Built from free, open-source tools: `lldpd`, `arp-scan`, `nmap`, `tshark`, `paramiko`, `postgres`.
+- Only run scans on networks you're authorized to assess. NetMon does not port scan and never stores packet payloads, but it does actively probe: ARP and ping sweeps, a DHCP discover, mDNS/SSDP queries, traceroutes, SNMP polling of switches once a community is configured, and regular latency and speed tests to the internet. The complete list, with the setting that turns each one off, is in [What the sensor does on your network](docs/WHAT-THE-SENSOR-DOES.md).
+- Collected data goes to the NetMon dashboard you enroll the box to (bundles are uploaded over HTTPS to that dashboard's Azure Blob storage) and nowhere else. The site's public IP address is learned from Cloudflare and reported to the dashboard.
+- The dashboard is also the sensor's control plane: its operators can push configuration, queue commands and, with the highest role, open a root shell on the box. See [What the dashboard can make a sensor do](docs/WHAT-THE-SENSOR-DOES.md#4-what-the-dashboard-can-make-a-sensor-do).
+- Built from free, open-source tools: `lldpd`, `arp-scan`, `nmap`, `tshark`, `net-snmp`, `iperf3`, `traceroute`, `dig`, `curl`, `postgres`, and the Python libraries `paramiko`, `netmiko`, `impacket`, `pywinrm` and `websocket-client`.

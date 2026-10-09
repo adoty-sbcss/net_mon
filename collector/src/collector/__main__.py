@@ -271,7 +271,7 @@ def cmd_speedtest() -> None:
     if res.get("status") == "unavailable":
         # This is the on-box diagnostic someone runs while standing next to a
         # box they suspect. Printing FAIL for a refused probe points them at the
-        # district's link — the exact wrong turn Cucamonga took for a week. Its
+        # district's link — the exact wrong turn District A took for a week. Its
         # own exit code so a script can tell "no measurement" from "bad link".
         click.echo(
             f"SKIP cloudflare: {res.get('error')}\n"

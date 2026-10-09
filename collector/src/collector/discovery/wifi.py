@@ -13,7 +13,7 @@ No association, no payloads, no secrets.
 
 Two source tools, picked host-side by network backend (mirrors lib/trunk.sh):
   * nmcli  — NetworkManager boxes. Terse output; SIGNAL is a 0-100 quality.
-             FULLY parsed + validated on a live NM box (Monitor1).
+             FULLY parsed + validated on a live NM box (the verification sensor).
   * iw     — systemd-networkd boxes. SIGNAL is dBm; richer (PMF, width, BSS load).
              Best-effort parser — NOT yet hardware-validated (no networkd Wi-Fi
              box on hand). See _parse_iw.
@@ -139,7 +139,7 @@ def survey() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# nmcli terse parser (NetworkManager boxes) — validated on Monitor1
+# nmcli terse parser (NetworkManager boxes) — validated on the verification sensor
 # ---------------------------------------------------------------------------
 
 

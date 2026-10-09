@@ -7,14 +7,14 @@ matters — a row is either placed correctly or dropped and counted.
 
 The two REAL fixtures in `fixtures/poe_aruba_cx_walks.json` are verbatim
 snmpwalk output (ifName / ifType / pethPsePortTable), captured through the
-Monitor1 sensor on 2026-08-20:
+the verification sensor on 2026-08-20:
 
-  rch_idf_n_stk  Aruba 6200M, 4-member ArubaOS-CX VSF stack. 212 interfaces,
+  site_idf_n_stk  Aruba 6200M, 4-member ArubaOS-CX VSF stack. 212 interfaces,
                  192 PSE rows. ifIndex == (member-1)*64 + port, and the PSE
                  index space uses the SAME numbering (group 1: 1..48,
                  group 2: 65..112, group 3: 129..176, group 4: 193..240),
                  so on this chassis pethPsePortIndex IS the ifIndex.
-  rch_idf_n      the same model with a single member — 56 interfaces, 48 rows.
+  site_idf_n      the same model with a single member — 56 interfaces, 48 rows.
 """
 
 import json
@@ -45,7 +45,7 @@ def _run(interfaces, physical, keys):
 
 
 # --------------------------------------------------------------- real hardware
-@pytest.mark.parametrize("fixture", ["rch_idf_n_stk", "rch_idf_n"])
+@pytest.mark.parametrize("fixture", ["site_idf_n_stk", "site_idf_n"])
 def test_arubaos_cx_every_row_lands_on_its_own_ifindex(fixture: str) -> None:
     """On ArubaOS-CX the PSE index IS the ifIndex, measured on the real stack."""
     interfaces, physical, keys = _load(fixture)
@@ -65,7 +65,7 @@ def test_stack_join_does_not_depend_on_walk_order() -> None:
     name match against EVERY member. First-match-wins was therefore correct only
     because snmpwalk happens to ascend by ifIndex: reversing the order used to
     mis-attach 22 rows and silently lose 48."""
-    interfaces, physical, keys = _load("rch_idf_n_stk")
+    interfaces, physical, keys = _load("site_idf_n_stk")
     reversed_walk = {i: interfaces[i] for i in sorted(interfaces, key=lambda x: -int(x))}
 
     _work, landed, dropped = _run(reversed_walk, physical, keys)
@@ -79,7 +79,7 @@ def test_stack_join_does_not_depend_on_walk_order() -> None:
 
 def test_no_reading_ever_lands_on_a_non_physical_interface() -> None:
     """An SVI/LAG/loopback can never be a PSE port."""
-    for fixture in ("rch_idf_n_stk", "rch_idf_n"):
+    for fixture in ("site_idf_n_stk", "site_idf_n"):
         interfaces, physical, keys = _load(fixture)
         work, landed, _dropped = _run(interfaces, physical, keys)
         stray = {i: work[i]["name"] for i in landed if i not in physical}
@@ -108,7 +108,7 @@ def test_cisco_stack_still_joins_by_name() -> None:
 
 
 def test_orphan_row_is_dropped_rather_than_shown_on_an_svi() -> None:
-    """Reproduces what production showed on the Cucamonga 2930M stacks: a PSE
+    """Reproduces what production showed on the District A 2930M stacks: a PSE
     row whose index matched nothing but the VLAN100 SVI (the only interface
     whose ifName ended in 100) was rendered as that SVI's PoE status."""
     interfaces, physical, keys, truth = _stack(3, 48, "{m}/{p}")
@@ -128,7 +128,7 @@ def test_single_pse_group_with_stack_global_index_keeps_its_readings() -> None:
     information, so requiring a member token here would throw away every reading
     past member 1. Only the unplaceable orphan may be dropped.
 
-    This chassis shape could not be walked directly — the Cucamonga stacks are
+    This chassis shape could not be walked directly — the District A stacks are
     not reachable from the sensor we have shell on — so it is pinned as the
     conservative boundary rather than as measured fact.
     """

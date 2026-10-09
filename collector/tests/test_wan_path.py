@@ -5,7 +5,7 @@ This module's job is to name the hop — and, just as importantly, to REFUSE to
 name one when the measurement does not support it.
 
 Every traceroute fixture below is COPIED VERBATIM from a real production sensor
-(Monitor1, 2026-09-05), including the awkward ones. That matters more than usual
+(the verification sensor, 2026-09-05), including the awkward ones. That matters more than usual
 here: the whole design turns on empirical facts about how traceroute behaves on
 this network, and an invented fixture would encode the textbook behaviour instead
 of the real one — which is precisely backwards. In particular `_ICMP_INTERIOR_STAR`
@@ -23,14 +23,14 @@ from types import SimpleNamespace
 from collector import wan_path
 
 
-# --- Real traceroute output, copied from Monitor1 --------------------------
+# --- Real traceroute output, copied from the verification sensor --------------------------
 
 # Healthy TCP-443 trace, no --sport: all 11 hops, 0.06s.
 _HEALTHY = """traceroute to 1.1.1.1 (1.1.1.1), 12 hops max, 60 byte packets
  1  10.8.3.254  0.429 ms
  2  10.1.251.134  0.319 ms
  3  10.2.20.254  0.377 ms
- 4  163.150.15.189  0.624 ms
+ 4  203.0.113.189  0.624 ms
  5  137.164.3.90  2.299 ms
  6  137.164.11.86  2.362 ms
  7  137.164.11.111  2.281 ms
@@ -47,7 +47,7 @@ _ICMP_INTERIOR_STAR = """traceroute to 1.1.1.1 (1.1.1.1), 12 hops max, 60 byte p
  1  10.8.3.254  0.464 ms
  2  10.1.251.134  0.329 ms
  3  10.2.20.254  0.421 ms
- 4  163.150.15.189  0.906 ms
+ 4  203.0.113.189  0.906 ms
  5  137.164.3.90  2.643 ms
  6  137.164.11.86  2.639 ms
  7  137.164.11.111  2.564 ms
@@ -183,7 +183,7 @@ def test_a_single_silent_tail_hop_is_not_a_break():
     """The false alarm a healthy sensor would otherwise raise on itself.
 
     We send one query per hop, so ONE dropped probe at the tail costs one hop of
-    apparent depth. A live healthy capture on Monitor1 had hop 10 silent and hop
+    apparent depth. A live healthy capture on the verification sensor had hop 10 silent and hop
     11 answering; if hop 11 had also missed its single probe, the headline would
     have read "PATH ENDS HERE" on a working path. A real break is not subtle.
     """
@@ -277,7 +277,7 @@ def test_changing_the_destination_resets_that_mode_baseline():
     assert entry["deepest_responding_hop"] == 2, (
         "depth must describe the NEW path, not inherit the old one's 11 hops"
     )
-    assert "163.150.15.189" not in str(entry["hop_ips"]), "old route must be gone"
+    assert "203.0.113.189" not in str(entry["hop_ips"]), "old route must be gone"
 
 
 def test_baseline_ignores_failed_traces():
@@ -297,7 +297,7 @@ def test_baseline_ignores_failed_traces():
 def test_traceroute_argv_never_pins_the_source_port():
     """Regression guard on a measured, counter-intuitive fact.
 
-    `--sport` is the textbook way to hold an ECMP flow steady, and on Monitor1 it
+    `--sport` is the textbook way to hold an ECMP flow steady, and on the verification sensor it
     turned a healthy 11-hop TCP trace into 'hops 1-3 then stars', in 18s instead
     of 0.06s — indistinguishable from a total blackout, on a path whose TCP
     connect succeeded in 15ms. Anyone 'fixing' the ECMP noise by adding it back

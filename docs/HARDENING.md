@@ -5,6 +5,9 @@ it needs a privileged, host-networked container, raw packet capture, VLAN
 sub-interfaces, and unrestricted outbound access to do its job. So we apply a
 **reviewed subset** of the CIS Ubuntu Benchmark, not the whole thing.
 
+This file covers the host. For what the sensor does on the network and what the
+dashboard can make it do, see [WHAT-THE-SENSOR-DOES.md](WHAT-THE-SENSOR-DOES.md).
+
 - **Report:** `scripts/cis-check.sh` (read-only; never changes anything).
 - **Apply:** `scripts/cis-apply.sh --apply` (the safe subset below; backs up every
   change; `--revert` undoes it). Opt-in per deploy via `NETMON_CIS_HARDEN=true`
@@ -90,21 +93,39 @@ can do genuine host administration (`systemctl`, `apt`, `/etc/netmon`) without S
 - **No new attack surface** over the prior in-container full-shell: that already
   ran in a `privileged` + `network_mode: host` container with `/dev`, which is
   host-root-equivalent (`mount` the disk + `chroot`). This just makes it direct.
-- **Gates (unchanged from the container full-shell):** superadmin-only, dashboard
+- **Gates enforced by the dashboard and broker:** superadmin-only, dashboard
   **email one-time-code step-up**, broker relays shell frames only when `/validate`
   reports `mode=full`, **full transcript recording**, **30/60-min time-box + idle
-  timeout + kill-switch**. Plus: a one-time **nonce** authenticates the container
+  timeout + kill-switch**. The sensor cannot verify any of these: it acts on a
+  full-shell request that arrives through its authenticated check-in.
+- **Gates enforced on the sensor:** a one-time **nonce** authenticates the container
   bridge to the host server, `HISTFILE=/dev/null`, and a **hard TTL backstop**
-  (`systemd RuntimeMaxSec` + the server's own self-timeout). On teardown the whole
-  bash **session** is SIGKILLed so nothing lingers root.
+  (`systemd RuntimeMaxSec` + the server's own self-timeout, 61 min). On teardown
+  the whole bash **session** is SIGKILLed so nothing lingers root.
+- **Trust boundary:** the remote console means whoever can act as a dashboard
+  superadmin can act as root on the sensor. Securing the dashboard and its
+  accounts is part of securing the sensor.
 - **Still outbound-only:** the new hop is a local Unix socket, not a network
   listener — the "no inbound" invariant holds. The fixed-argv **restricted** diag
   console (allow-listed commands) is unchanged.
 
+## Unattended operation — passwordless sudo
+
+`scripts/install-auto-update.sh` writes `/etc/sudoers.d/netmon-update`, granting
+the installing user `NOPASSWD: ALL`. The update, watchdog, console-poll and
+host-action jobs run as that user and need root for `docker`, `systemctl`,
+`netplan` and file ownership repair. It is the usual posture for a
+single-purpose appliance whose admin account already has full control, and it is
+why the sensor should be a dedicated machine. `--uninstall` removes the drop-in
+together with all the timers, which also stops check-in and updates. Running the
+timers as root instead of granting sudo is not a supported configuration today:
+the installer regenerates the units and the drop-in whenever it re-runs.
+
 ## Scope / status
 
-- **New installs only** for now (the installer checkbox). A fleet-wide apply path
-  for already-deployed boxes is a deliberate later step (after deeper testing).
+- The safe subset is applied at install (the installer checkbox) and can also be
+  applied or reverted on an enrolled box from the dashboard, as a queued host
+  action. There is no bulk fleet-wide apply.
 - `cis-apply.sh` is idempotent and reversible (`--revert` restores the latest
   backup under `/var/lib/netmon/cis-backups/` and removes the drop-ins it wrote;
   installed packages are left in place).

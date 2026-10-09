@@ -1,6 +1,6 @@
 {
- "rch_idf_n_stk": {
-  "_source": "snmpwalk of 10.10.0.198 RCH-IDF-N-STK via Monitor1 2026-08-20 -- Aruba R8Q71A 6200M ML.10.13.1150, 4-member ArubaOS-CX VSF stack",
+ "site_idf_n_stk": {
+  "_source": "snmpwalk of a production IDF stack via the verification sensor 2026-08-20 -- Aruba R8Q71A 6200M ML.10.13.1150, 4-member ArubaOS-CX VSF stack",
   "interfaces": {
    "1": [
     "1/1/1",
@@ -1046,8 +1046,8 @@
    "4.240"
   ]
  },
- "rch_idf_n": {
-  "_source": "snmpwalk of 10.10.0.12 RCH-IDF-N via Monitor1 2026-08-20 -- Aruba R8Q71A 6200M ML.10.13.1070, single member",
+ "site_idf_n": {
+  "_source": "snmpwalk of a production IDF switch via the verification sensor 2026-08-20 -- Aruba R8Q71A 6200M ML.10.13.1070, single member",
   "interfaces": {
    "1": [
     "1/1/1",

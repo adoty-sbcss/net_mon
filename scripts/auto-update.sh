@@ -37,7 +37,7 @@ HEALTHCHECK_WAIT_SECONDS="${NETMON_HEALTHCHECK_WAIT:-120}"
 # force update (`sudo bash scripts/auto-update.sh`) makes `id -un` return root,
 # and the self-heal below used to chown the whole checkout to root:root while
 # the unit stays User=<service account> - manufacturing the exact "dubious
-# ownership" freeze it exists to prevent (hit on Monitor1, 2026-09-04).
+# ownership" freeze it exists to prevent (hit on the verification sensor, 2026-09-04).
 # Resolution order: the installed unit (authoritative) -> the sudo invoker ->
 # the repo's current owner -> ourselves.
 UPDATE_UNIT="/etc/systemd/system/netmon-update.service"
@@ -204,7 +204,7 @@ ensure_paths_if_available() {
 # the documented manual force update, `sudo bash scripts/auto-update.sh`: this
 # used to chown the whole tree to root:root, which satisfied the root process it
 # was running under while handing the next nightly run (User=<service account>)
-# the very freeze this function exists to prevent. Monitor1 hit it 2026-09-04.
+# the very freeze this function exists to prevent. The verification sensor hit it 2026-09-04.
 ensure_repo_ownership() {
     local repo_uid want_uid owner
     repo_uid="$(stat -c %u "$REPO_DIR/.git" 2>/dev/null || stat -c %u "$REPO_DIR" 2>/dev/null || echo -1)"
@@ -247,7 +247,7 @@ ensure_repo_ownership
 # 22.04 ships 2.34 - ignore it silently. So PROBE rather than match on a version
 # string, and fall back to the durable global entry, deduped: the unconditional
 # `git config --global --add` this replaces has already stacked five copies of
-# the same path in the service user's ~/.gitconfig on Monitor1.
+# the same path in the service user's ~/.gitconfig on the verification sensor.
 ensure_git_trusts_repo() {
     local repo_uid
     repo_uid="$(stat -c %u "$REPO_DIR/.git" 2>/dev/null || stat -c %u "$REPO_DIR" 2>/dev/null || echo -1)"
@@ -269,7 +269,7 @@ ensure_git_trusts_repo
 # model, so EVERY unprivileged compose command then failed with "permission
 # denied" — the nightly update failed, the pre-update DB snapshot silently
 # skipped, and the rollback path (also compose) failed the same way, leaving
-# the box down until a human logged in (Monitor1 lost ~1.3 days to this).
+# the box down until a human logged in (the verification sensor lost ~1.3 days to this).
 # Heal it up front, before anything reads the env or touches compose, exactly
 # like the repo-ownership self-heal above. chown never touches the 0600 mode.
 ensure_env_readable() {
@@ -362,7 +362,7 @@ selfheal_reclone() {
 # /etc/netmon + /var/lib/netmon — the checkout is pure code), yet a repo cloned
 # by a different user than the one running this script leaves permanent exec-bit
 # / filemode drift that git reports as modified. That "dirt" is never real, but
-# the guard refused every nightly run (Cucamonga elem-mdf + datacenter sat 16h+
+# the guard refused every nightly run (District A elem-mdf + datacenter sat 16h+
 # stuck on 2026-07-29, "No version reported"). Self-heal instead of refusing —
 # this is exactly what docs/help/recover-stuck-sensor tells an admin to do by
 # hand, done automatically:
@@ -377,7 +377,7 @@ if [[ -n "$(git status --porcelain)" ]]; then
     git reset --hard 2>/dev/null || true
     # `reset --hard` does NOT remove UNTRACKED files, so one stray file (nohup.out,
     # a .orig from a failed merge, an operator's scratch copy) would leave the tree
-    # permanently dirty and re-wedge the box exactly the way the Cucamonga exec-bit
+    # permanently dirty and re-wedge the box exactly the way the District A exec-bit
     # did. -d also clears untracked directories.
     # Deliberately NOT -x: gitignored state must survive — above all the repo-root
     # .env that pins NETMON_IMAGE_TAG, which every later compose call reads.

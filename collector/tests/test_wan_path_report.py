@@ -383,7 +383,7 @@ def test_only_conforming_names_are_treated_as_captures(monkeypatch, tmp_path):
 def test_capture_retention_outlasts_the_motivating_outage():
     """Nothing is delivered DURING an outage — the dashboard is the unreachable
     thing — so captures accumulate at the daily cap and the cap is what decides
-    whether the ONSET survives to be reported. The Cucamonga incident ran ~7
+    whether the ONSET survives to be reported. The District A incident ran ~7
     days; at 300 captures / 48 per day the first ~36 would have been evicted
     before `_report_wan_path` ever saw them."""
     daily_cap = 48  # config.py wan_path_daily_cap

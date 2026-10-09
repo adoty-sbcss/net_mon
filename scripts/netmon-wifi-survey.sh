@@ -78,7 +78,7 @@ done
 # --- Provision the radio for scanning (self-heal, best-effort) --------------
 # A box that never used its analysis radio ships two blockers the survey can fix
 # itself, so enabling Wi-Fi monitoring from the dashboard "just works" with no
-# SSH — a console-only operator has no host shell (the Trona 2026-07-03 case: box
+# SSH — a console-only operator has no host shell (a 2026-07-03 field case: box
 # recovered, monitoring enabled, but the survey could never run):
 #   1. `iw` may be absent on a networkd box (fresh images don't ship it; NM boxes
 #      use nmcli, already present). Install it once, non-interactively.

@@ -184,7 +184,7 @@ _PETH_CLASS = {"1": "class0", "2": "class1", "3": "class2", "4": "class3", "5": 
 # ifType values that can physically host a PSE. Only real Ethernet ports deliver
 # PoE — an SVI, LAG, loopback or OOBM port never can — so a PoE row that "matches"
 # one is a mis-join, not a reading. Observed in production 2026-08-20: on the
-# Cucamonga 2930M stacks a PSE row was landing on `VLAN100` because that SVI was
+# District A 2930M stacks a PSE row was landing on `VLAN100` because that SVI was
 # the only interface whose ifName ended in 100.
 _PHYSICAL_IFTYPES = {"6"}  # ethernetCsmacd
 # Cap interfaces recorded per switch so a big chassis can't bloat the bundle.
@@ -1210,9 +1210,9 @@ def _attach_poe(
     Only interfaces in `physical` (ifType ethernetCsmacd) are eligible: an SVI or
     LAG can never be a PSE port.
 
-    Hardware-validated 2026-08-20 against RCH-IDF-N-STK, a 4-member ArubaOS-CX
+    Hardware-validated 2026-08-20 against SITE-IDF-N-STK, a 4-member ArubaOS-CX
     VSF stack (192 PSE rows, ifIndex = (member-1)*64 + port, PSE index space
-    1..48 / 65..112 / 129..176 / 193..240) and RCH-IDF-N, a single-member 6200M.
+    1..48 / 65..112 / 129..176 / 193..240) and SITE-IDF-N, a single-member 6200M.
     """
     groups = {k.split(".", 1)[0] for k in poe}
     tokens: list[tuple[list[int], str]] = []
@@ -1237,7 +1237,7 @@ def _attach_poe(
         #    ("2/1/12", "3/1/12", ...). The old first-match-wins silently picked
         #    whichever the walk happened to emit first — correct only because
         #    snmpwalk ascends by ifIndex. Reversing that order mis-attached 22
-        #    rows and silently lost 48 on the real RCH stack.
+        #    rows and silently lost 48 on the real stack.
         cands = [i for nums, i in tokens if nums[-1] == port and grp in nums[:-1]]
         # 2) otherwise, a single physical port whose ifName ends with the port.
         if len(cands) != 1:

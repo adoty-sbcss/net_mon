@@ -1,4 +1,9 @@
-# Optional SNMP configuration. Only used when NETMON_SNMP_ENABLED=true.
+# NOT USED. The collector does not read snmp.yaml; this file is kept only as a
+# record of an earlier design. Configure SNMP with NETMON_SNMP_COMMUNITIES and
+# NETMON_SNMP_CREDENTIAL_OVERRIDES in /etc/netmon/netmon.env, or from the
+# dashboard.
+#
+# (Original header follows.) Optional SNMP configuration. Only used when NETMON_SNMP_ENABLED=true.
 # Copy to snmp.yaml and edit. The .gitignore should keep snmp.yaml out of source control.
 
 # Read-only community strings, keyed by CIDR. First match wins.

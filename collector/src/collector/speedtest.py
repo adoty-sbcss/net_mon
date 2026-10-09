@@ -33,7 +33,7 @@ log = structlog.get_logger(__name__)
 
 # --- the outcomes of a speed test ------------------------------------------
 # A probe has THREE possible endings, not two, and collapsing the third is what
-# produced a week of false diagnosis at Cucamonga (2026-08/09) (a fourth state,
+# produced a week of false diagnosis at District A (2026-08/09) (a fourth state,
 # for the slot that was never probed at all, follows them):
 #
 #   ok           we measured the link.
@@ -43,7 +43,7 @@ log = structlog.get_logger(__name__)
 #                answered with an HTTP status instead of data (429 above all).
 #                This says NOTHING about the district's link.
 #
-# Cucamonga was diagnosed as a failing firewall for over a week, and a firewall
+# District A was diagnosed as a failing firewall for over a week, and a firewall
 # was rebooted over it. It was Cloudflare rate-limiting our own probe: three
 # sensors behind one shared egress IP, each generating hundreds of requests per
 # run. Single-sensor districts on their own address never showed it. With only
@@ -121,7 +121,7 @@ _BROWSER_UA = (
 # block, so a small block on a fast link means an enormous request rate. Measured
 # on a live 900 Mbps sensor at the old fixed 1 MiB: 557 POSTs inside the 5-second
 # window (~110/s) against ~12 download GETs. Three sensors doing that on one
-# address is enough to earn a 429 — the Cucamonga incident, self-inflicted.
+# address is enough to earn a 429 — the District A incident, self-inflicted.
 #
 # So size each request at roughly ONE SECOND of the stream's own measured rate:
 # identical bytes, identical throughput number, ~20x fewer requests on a fast
@@ -267,7 +267,7 @@ def run_cloudflare(duration: int = 5, streams: int = 16, timeout: int = 60) -> d
     # Each transfer worker returns (bytes_moved, first_exception_or_None). The
     # exception is CAPTURED, not swallowed: a stream that moved nothing because it
     # was reset/timed out is evidence of a blocked path, and the exception CLASS is
-    # the most useful thing in the row. (Cucamonga, 2026-08/09: 47% of speed tests
+    # the most useful thing in the row. (District A, 2026-08/09: 47% of speed tests
     # stored 0.0 Mbps with ok=true and nothing ever flagged it.)
     # Note the exception is diagnostic, NOT the failure trigger — zero bytes is.
     # Setup can outlast the window without ever raising; see the `blocked` rules.
@@ -374,7 +374,7 @@ def run_cloudflare(duration: int = 5, streams: int = 16, timeout: int = 60) -> d
         return _empty("cloudflare", f"throughput probe failed: {exc}")
 
     # A direction that moved ZERO bytes MEASURED NOTHING. It is a failed test, not
-    # a 0.0 Mbps reading, and reporting it as a success is the whole Cucamonga bug.
+    # a 0.0 Mbps reading, and reporting it as a success is the whole District A bug.
     # TWO different mechanisms produce a zero, and both were reachable there:
     #   * one or more streams RAISED (reset / timed out) → the path is actively
     #     blocked mid-transfer;

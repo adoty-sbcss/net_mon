@@ -616,7 +616,7 @@ def _detect_transport(endpoint: str, timeout: int) -> str | None:
 
 def _realm_from_server(ip: str) -> str | None:
     """Kerberos realm from the server's DNS domain via reverse lookup, e.g.
-    10.0.0.10 -> dc01.sbcss.org -> SBCSS.ORG."""
+    10.0.0.10 -> dc01.example.org -> EXAMPLE.ORG."""
     import socket
 
     try:

@@ -19,7 +19,7 @@ def test_num_handles_int_and_ndr_element():
 def test_ip_and_wstr():
     assert r._ip(167772160) == "10.0.0.0"
     assert r._ip({"Data": 4294967040}) == "255.255.255.0"
-    assert r._wstr("SBCSS.ORG\x00") == "SBCSS.ORG"
+    assert r._wstr("EXAMPLE.ORG\x00") == "EXAMPLE.ORG"
     assert r._wstr(None) == ""
     assert r._wstr("NULL") == ""
 
@@ -27,12 +27,12 @@ def test_ip_and_wstr():
 def test_opt_value_strings_decodes_each_type():
     data = {"Elements": [
         {"OptionType": 4, "Element": {"IpAddressOption": 167772414}},   # 10.0.0.254
-        {"OptionType": 5, "Element": {"StringDataOption": "SBCSS.ORG\x00"}},
+        {"OptionType": 5, "Element": {"StringDataOption": "EXAMPLE.ORG\x00"}},
         {"OptionType": 2, "Element": {"DWordOption": 28800}},
         {"OptionType": 0, "Element": {"ByteOption": 1}},
         {"OptionType": 1, "Element": {"WordOption": 1500}},
     ]}
-    assert r._opt_value_strings(data) == ["10.0.0.254", "SBCSS.ORG", "28800", "1", "1500"]
+    assert r._opt_value_strings(data) == ["10.0.0.254", "EXAMPLE.ORG", "28800", "1", "1500"]
 
 
 def test_options_from_enum_flattens_values():

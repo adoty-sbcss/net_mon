@@ -1,7 +1,7 @@
 """Regression: a device advertising an embedded NUL (0x00) must not fail the
 whole scan persist.
 
-Cucamonga Middle 2026-07-25: an Android TV's mDNS/SSDP record carried a NUL, and
+One District A middle school, 2026-07-25: an Android TV's mDNS/SSDP record carried a NUL, and
 the service_discovery batch insert died with psycopg
 `UntranslatableCharacter: \\u0000 cannot be converted to text` -- failing the
 ENTIRE scan and leaving the sensor with zero data on the dashboard. db._strip_nul
@@ -38,7 +38,7 @@ def test_non_string_scalars_pass_through():
 
 
 def test_dumps_jsonb_never_emits_a_nul_escape():
-    """The ACTUAL Cucamonga Middle failure: a NUL inside a JSONB payload that is
+    """The ACTUAL District A middle-school failure: a NUL inside a JSONB payload that is
     pre-serialized with json.dumps becomes a ``\\u0000`` escape, which Postgres'
     jsonb parser rejects (UntranslatableCharacter). Stripping only at insert_many
     was too late -- json.dumps had already run. dumps_jsonb must strip first so
