@@ -5,7 +5,7 @@
 # Usage pattern:
 #
 #     menu_header "NetMon — Configure"
-#     menu_item 1 "Edit SFTP destination"
+#     menu_item 1 "Edit dashboard enrollment"
 #     menu_item 2 "Edit SNMP communities"
 #     menu_footer "b" "Back" "q" "Quit"
 #     choice="$(menu_read)"
