@@ -227,15 +227,16 @@ your own data-classification and student-privacy obligations.
 - To control it, set the update channel:
   - `NETMON_UPDATE_CHANNEL=hold` — pause updates.
   - `NETMON_UPDATE_CHANNEL=stable` with `NETMON_UPDATE_REF=<commit>` — stay on a
-    commit you have reviewed. The commit must be on `main`. **If the ref cannot
-    be resolved the box falls back to following `main`** and only logs a
-    warning (`journalctl -u netmon-update`), so use `hold` when you need a
-    guarantee.
+    commit you have reviewed. The commit must be on `main`. If the ref cannot
+    be resolved, or is not on `main`, the box **stays on the commit it is running** and does not
+    update; the reason is reported to the dashboard as a failed update and
+    logged (`journalctl -u netmon-update`). It never falls back to `main`.
 
   The channel is a dashboard-managed setting, so set it there; the dashboard
   operator can change it. The weekly refresh (`scripts/weekly-deep-refresh.sh`)
-  pulls and rebuilds from `main` regardless of the channel — disable
-  `netmon-deep-refresh.timer` if you need a strict pin.
+  honours the channel: on `hold`, or with a pinned commit, it rebuilds the
+  commit already checked out (fresh OS and Python packages, same sensor code)
+  and does not pull `main`.
 - `scripts/install-auto-update.sh --uninstall` removes all scheduled jobs.
 
 ## 9. Reducing the footprint

@@ -25,8 +25,52 @@ log() {
 
 log "starting weekly deep refresh"
 
+# Which commit this box runs is auto-update.sh's decision, made from the update
+# channel. This script used to `git pull origin main` unconditionally, which
+# moved a held or pinned box onto main once a week. So read the channel first,
+# and pull only when the box is one that follows main anyway.
+#
+# channel_follows_main answers "may this run pull main?". It must fail CLOSED:
+# if the env file is there but cannot be read, the channel is unknown, and an
+# unknown channel is treated as a hold rather than as "no hold set".
+ENV_FILE="/etc/netmon/netmon.env"
+CHANNEL_NOTE=""
+read_env_file() {
+    if [[ -r "$ENV_FILE" ]]; then
+        cat "$ENV_FILE"
+    elif sudo -n true 2>/dev/null; then
+        if sudo -n test -e "$ENV_FILE"; then sudo -n cat "$ENV_FILE"; fi
+    elif [[ -e "$ENV_FILE" || ! -x "$(dirname "$ENV_FILE")" ]]; then
+        return 1    # present (or its directory is closed to us) and no sudo
+    fi
+}
+env_value() {  # last assignment of KEY in the text on stdin, unquoted
+    { grep -E "^$1=" || true; } | tail -1 | cut -d= -f2- | tr -d "\"'[:space:]"
+}
+channel_follows_main() {
+    local env_text channel ref
+    if ! env_text="$(read_env_file)"; then
+        CHANNEL_NOTE="cannot read $ENV_FILE to learn the update channel"
+        return 1
+    fi
+    channel="$(printf '%s\n' "$env_text" | env_value NETMON_UPDATE_CHANNEL | tr '[:upper:]' '[:lower:]')"
+    ref="$(printf '%s\n' "$env_text" | env_value NETMON_UPDATE_REF)"
+    if [[ "$channel" == "hold" ]]; then
+        CHANNEL_NOTE="update channel=hold"
+        return 1
+    fi
+    # Mirrors auto-update.sh: canary ignores a pin; every other channel honours it.
+    if [[ "$channel" != "canary" && -n "$ref" ]]; then
+        CHANNEL_NOTE="pinned release (NETMON_UPDATE_REF is set)"
+        return 1
+    fi
+    return 0
+}
+
 # Pull the latest code first so we rebuild against current source.
-if [[ -n "$(git status --porcelain)" ]]; then
+if ! channel_follows_main; then
+    log "$CHANNEL_NOTE; rebuilding the commit already checked out ($(git rev-parse --short HEAD 2>/dev/null || echo unknown)) without git pull"
+elif [[ -n "$(git status --porcelain)" ]]; then
     log "WARN: working tree dirty; building current state without git pull"
 else
     if git fetch --quiet origin main 2>/dev/null; then

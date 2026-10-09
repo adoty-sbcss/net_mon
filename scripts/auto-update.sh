@@ -146,7 +146,14 @@ fi
 
 # Read a NETMON_* key from the env file (root-owned 0600). Empty if absent.
 read_env() {
-    sudo grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true
+    # Read directly when we can; sudo only when we must. Either way a failure
+    # yields "" — so callers that must not mistake "unreadable" for "unset"
+    # (the update channel) check channel_env_known first.
+    if [[ -r "$ENV_FILE" ]]; then
+        grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true
+    else
+        sudo -n grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true
+    fi
 }
 # Persist the live commit SHA so the dashboard can show exactly which release a
 # box is on (release-channel rollout view). Best-effort.
@@ -413,8 +420,37 @@ LOCAL=$(git rev-parse HEAD)
 # historical behavior — so shipping this is a no-op until channels are set from
 # the dashboard. 'canary' tracks origin/main (latest); 'hold' pauses updates;
 # 'stable' with a pin (NETMON_UPDATE_REF) converges to that exact commit.
-UPDATE_CHANNEL="$(read_env NETMON_UPDATE_CHANNEL)"
-UPDATE_REF="$(read_env NETMON_UPDATE_REF)"
+#
+# A hold or a pin is a statement that this box must NOT follow main, so neither
+# may degrade into following it:
+#   - the values are normalized first (case, stray whitespace/CR/quotes from a
+#     hand edit), so "Hold" or "hold " still holds;
+#   - a pin that does not resolve to a commit STOPS the run where it is and
+#     reports why. It used to log a WARN and track origin/main — the opposite of
+#     what a pin asks for, visible only in the journal;
+#   - an unrecognized channel is treated as stable, so it still honours a pin;
+#   - a pin must be a commit ON main, not merely one this checkout happens to
+#     hold;
+#   - if the env file is there but cannot be read, the channel is UNKNOWN and the
+#     run stops. read_env turns every error into an empty value, and an empty
+#     channel means "follow main" — so without this an unreadable file would
+#     read as "no hold, no pin".
+channel_env_known() {
+    [[ -r "$ENV_FILE" ]] && return 0                       # read_env reads it directly
+    sudo -n cat "$ENV_FILE" >/dev/null 2>&1 && return 0    # read_env's sudo read works
+    # Not readable either way: fine only if it is verifiably ABSENT (a box not
+    # set up yet), never merely invisible.
+    sudo -n test ! -e "$ENV_FILE" 2>/dev/null && return 0
+    local dir; dir="$(dirname "$ENV_FILE")"
+    [[ ! -e "$ENV_FILE" ]] && { [[ ! -e "$dir" ]] || [[ -x "$dir" ]]; }
+}
+if ! channel_env_known; then
+    log "FATAL: cannot read $ENV_FILE to learn the update channel (no passwordless sudo?); staying on ${LOCAL:0:8}"
+    RESULT_STATUS="failed"; RESULT_REASON="cannot read the env file to learn the update channel; staying on ${LOCAL:0:8}"
+    exit 1
+fi
+UPDATE_CHANNEL="$(read_env NETMON_UPDATE_CHANNEL | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
+UPDATE_REF="$(read_env NETMON_UPDATE_REF | tr -d "[:space:]'")"
 case "$UPDATE_CHANNEL" in
     hold)
         log "update channel=hold; skipping auto-update"
@@ -426,22 +462,31 @@ case "$UPDATE_CHANNEL" in
         IMAGE_TAG="$REMOTE"
         log "update channel=canary -> origin/main ${REMOTE:0:8} (immutable image :${REMOTE:0:8})"
         ;;
-    stable|"")
-        if [[ -n "$UPDATE_REF" ]] && REMOTE=$(git rev-parse --verify "${UPDATE_REF}^{commit}" 2>/dev/null); then
-            # Pinned to an exact commit -> the immutable per-commit image tag.
-            IMAGE_TAG="$REMOTE"
-            log "update channel=stable; pinned ${UPDATE_REF} -> ${REMOTE:0:8} (image :${REMOTE:0:8})"
-        else
-            [[ -n "$UPDATE_REF" ]] && log "WARN: pinned ref '${UPDATE_REF}' not found after fetch; tracking origin/main"
+    *)
+        case "$UPDATE_CHANNEL" in
+            stable|"") ;;
+            *) log "WARN: unknown update channel '${UPDATE_CHANNEL}'; treating it as stable" ;;
+        esac
+        if [[ -z "$UPDATE_REF" ]]; then
             REMOTE=$(git rev-parse origin/main)
             IMAGE_TAG="$REMOTE"
             log "update channel=stable -> origin/main ${REMOTE:0:8} (immutable image :${REMOTE:0:8})"
+        elif REMOTE=$(git rev-parse --verify --quiet "${UPDATE_REF}^{commit}" 2>/dev/null) \
+                && [[ "$REMOTE" =~ ^[0-9a-f]{40,64}$ ]] \
+                && git merge-base --is-ancestor "$REMOTE" origin/main 2>/dev/null; then
+            # Pinned to an exact commit -> the immutable per-commit image tag.
+            IMAGE_TAG="$REMOTE"
+            log "update channel=stable; pinned -> ${REMOTE:0:8} (image :${REMOTE:0:8})"
+        else
+            # The ref is operator-supplied text headed for a JSON string and the
+            # journal: keep only characters a ref can legitimately contain.
+            SAFE_REF="${UPDATE_REF//[^A-Za-z0-9._\/~^-]/?}"
+            SAFE_REF="${SAFE_REF:0:64}"
+            log "FATAL: pinned ref '${SAFE_REF}' is not a commit on origin/main (after fetching it); staying on ${LOCAL:0:8}"
+            log "       Fix NETMON_UPDATE_REF (a commit on main) or clear it. This box will NOT follow main while the pin is set."
+            RESULT_STATUS="failed"; RESULT_REASON="pinned ref '${SAFE_REF}' not found on origin/main; staying on ${LOCAL:0:8} (fix or clear the pinned release)"
+            exit 1
         fi
-        ;;
-    *)
-        REMOTE=$(git rev-parse origin/main)
-        IMAGE_TAG="$REMOTE"
-        log "WARN: unknown update channel '${UPDATE_CHANNEL}'; tracking origin/main (immutable image :${REMOTE:0:8})"
         ;;
 esac
 

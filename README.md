@@ -253,7 +253,7 @@ The others connect the box to its dashboard and run scheduled measurements:
 |---|---|---|
 | `netmon-checkin` | every 3 min | Outbound check-in: health report, configuration pull, queued commands, latency probes. |
 | `netmon-console-poll` | every 30 s | Starts a remote-console session or host action the dashboard has requested. |
-| `netmon-deep-refresh` | weekly, Sun 04:00 | Pulls `main` and rebuilds the collector image from scratch to pick up base-image security patches. |
+| `netmon-deep-refresh` | weekly, Sun 04:00 | Pulls `main` (not when the update channel is `hold` or pinned to a commit) and rebuilds the collector image from scratch to pick up base-image security patches. |
 | `netmon-wifi-survey` | every 15 min | Wi-Fi scan of visible networks (no-op without a radio). |
 | `netmon-wifi-experience` | 15-min tick | Wi-Fi client-experience test. Idle unless enabled. |
 
