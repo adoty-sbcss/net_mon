@@ -62,11 +62,22 @@ ensure_env_readable
 snap_exists() {
     [[ -e "$LATEST_SNAP" ]] || sudo -n test -e "$LATEST_SNAP" 2>/dev/null
 }
+# latest.sql.gz is a symlink that db-snapshot.sh re-points. Resolve it ONCE to the
+# timestamped file it names and use that file for both the check and the restore:
+# otherwise a snapshot taken in between could swap the file after it was checked.
+# (The timestamped file itself is never rewritten, and the newest one is never
+# pruned.) Falls back to the symlink path if it cannot be resolved.
+SNAP_FILE=""
+snap_resolve() {
+    SNAP_FILE="$(readlink -f "$LATEST_SNAP" 2>/dev/null || sudo -n readlink -f "$LATEST_SNAP" 2>/dev/null || true)"
+    [[ -n "$SNAP_FILE" ]] || SNAP_FILE="$LATEST_SNAP"
+}
 snap_cat() {
-    if [[ -r "$LATEST_SNAP" ]]; then
-        gunzip -c "$LATEST_SNAP"
+    [[ -n "$SNAP_FILE" ]] || snap_resolve
+    if [[ -r "$SNAP_FILE" ]]; then
+        gunzip -c "$SNAP_FILE"
     else
-        sudo -n gunzip -c "$LATEST_SNAP"
+        sudo -n gunzip -c "$SNAP_FILE"
     fi
 }
 # True only if the WHOLE snapshot decompresses and ends with pg_dump's own
@@ -148,7 +159,8 @@ if snap_exists; then
         sleep 2
     done
 
-    log "restoring DB snapshot: $(readlink "$LATEST_SNAP" 2>/dev/null || sudo -n readlink "$LATEST_SNAP" 2>/dev/null || echo latest.sql.gz)"
+    snap_resolve
+    log "restoring DB snapshot: $(basename "$SNAP_FILE")"
     # Reset the schema, then load, in ONE transaction. The plain pg_dump carries
     # no DROP statements, so loading it into the current (post-update) schema used
     # to collide on the first CREATE and abort under ON_ERROR_STOP — a silent
