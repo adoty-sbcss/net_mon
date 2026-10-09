@@ -78,7 +78,7 @@ The sensor needs outbound access to these. Nothing else is contacted by default.
 | Your NetMon dashboard (HTTPS) | Enrollment, check-in, command results, measurement results. Authenticated with a per-sensor bearer token. | Check-in every 3 min; console poll every 30 s |
 | Azure Blob Storage (HTTPS) | The hourly bundle is uploaded to a short-lived, write-only URL the dashboard issues for that one file. | Hourly |
 | The dashboard's console broker (WebSocket) | Only while a dashboard operator has a remote console session open. | On demand |
-| `github.com` | Nightly code update from this repository. | 03:00 nightly, plus a weekly refresh |
+| `github.com` | Nightly code update from this repository. | 03:00 nightly, plus a weekly refresh (which does not fetch code when the channel is `hold` or pinned) |
 | `ghcr.io` | The prebuilt collector image. | With each update |
 | Docker Hub, Debian mirrors, PyPI, `wireshark.org` | Base images and packages when the image is built locally — the weekly refresh, and the fallback when the prebuilt image cannot be pulled. | Weekly |
 | Ubuntu package mirrors | OS packages at install; unattended security updates afterwards. | Ongoing |
@@ -228,7 +228,7 @@ your own data-classification and student-privacy obligations.
   - `NETMON_UPDATE_CHANNEL=hold` — pause updates.
   - `NETMON_UPDATE_CHANNEL=stable` with `NETMON_UPDATE_REF=<commit>` — stay on a
     commit you have reviewed. The commit must be on `main`. If the ref cannot
-    be resolved the box **stays on the commit it is running** and does not
+    be resolved, or is not on `main`, the box **stays on the commit it is running** and does not
     update; the reason is reported to the dashboard as a failed update and
     logged (`journalctl -u netmon-update`). It never falls back to `main`.
 

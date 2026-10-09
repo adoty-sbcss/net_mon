@@ -73,7 +73,7 @@ def repo(tmp_path: Path) -> dict[str, str]:
 
 # --- auto-update.sh -------------------------------------------------------
 
-CHANNEL_BLOCK = _between(UPDATER, 'UPDATE_CHANNEL="$(read_env NETMON_UPDATE_CHANNEL', "\n# Reconcile image")
+CHANNEL_BLOCK = _between(UPDATER, "channel_env_known() {", "\n# Reconcile image")
 
 UPDATER_HARNESS = """\
 set -euo pipefail
@@ -84,18 +84,22 @@ read_env() {
         NETMON_UPDATE_REF) printf '%s' "${T_REF-}" ;;
     esac
 }
+sudo() { return 1; }
+ENV_FILE="${T_ENV_FILE:-/nonexistent-netmon-dir/netmon.env}"
 RESULT_STATUS="unset"; RESULT_REASON="unset"; REMOTE=""; IMAGE_TAG=""
 trap 'printf "STATUS=%s\\nREASON=%s\\nREMOTE=%s\\nIMAGE_TAG=%s\\n" "$RESULT_STATUS" "$RESULT_REASON" "$REMOTE" "$IMAGE_TAG"' EXIT
 LOCAL=$(git rev-parse HEAD)
 """
 
 
-def _resolve(repo: dict[str, str], tmp_path: Path, channel: str, ref: str) -> dict[str, str]:
+def _resolve(
+    repo: dict[str, str], tmp_path: Path, channel: str, ref: str, env_file: str = ""
+) -> dict[str, str]:
     script = tmp_path / "channel.sh"
     script.write_text(UPDATER_HARNESS + CHANNEL_BLOCK + "\n", encoding="utf-8", newline="\n")
     proc = subprocess.run(
         [_bash(), script.as_posix()], cwd=repo["root"], capture_output=True, text=True,
-        env={**os.environ, "T_CHANNEL": channel, "T_REF": ref},
+        env={**os.environ, "T_CHANNEL": channel, "T_REF": ref, "T_ENV_FILE": env_file},
     )
     fields = dict(
         ln.split("=", 1) for ln in proc.stdout.splitlines() if "=" in ln and not ln.startswith("LOG ")
@@ -110,6 +114,61 @@ def test_resolvable_pin_is_honoured(repo, tmp_path, channel) -> None:
     out = _resolve(repo, tmp_path, channel, repo["a"])
     assert out["rc"] == "0", out["log"]
     assert out["REMOTE"] == repo["a"] == out["IMAGE_TAG"]
+
+
+@pytest.mark.parametrize("spell", ["abbrev", "upper", "padded"])
+def test_pin_spellings_the_dashboard_accepts_still_resolve(repo, tmp_path, spell) -> None:
+    # The dashboard forwards what the operator typed: 7-40 hex, either case.
+    # Failing closed on any of these would freeze a correctly pinned fleet.
+    ref = {"abbrev": repo["a"][:7], "upper": repo["a"].upper(), "padded": f" {repo['a']}\r"}[spell]
+    out = _resolve(repo, tmp_path, "stable", ref)
+    assert out["rc"] == "0", out["log"]
+    assert out["REMOTE"] == repo["a"]
+
+
+def test_a_pin_must_be_on_main_not_merely_present(repo, tmp_path) -> None:
+    # A commit this checkout holds but main does not contain is not a release.
+    root = Path(repo["root"])
+    (root / "f").write_text("off-main\n")
+    _git(root, "commit", "-q", "-am", "side")
+    side = _git(root, "rev-parse", "HEAD")
+    _git(root, "checkout", "-q", "--detach", repo["a"])
+
+    out = _resolve(repo, tmp_path, "stable", side)
+
+    assert out["rc"] == "1", out["log"]
+    assert out["REMOTE"] != side or out["IMAGE_TAG"] == ""
+    assert out["IMAGE_TAG"] == ""
+    assert out["STATUS"] == "failed"
+    # Positive control: main's own tip is accepted by the same check.
+    assert _resolve(repo, tmp_path, "stable", repo["b"])["IMAGE_TAG"] == repo["b"]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="needs a file the test user genuinely cannot read",
+)
+def test_unreadable_env_file_stops_the_run_instead_of_following_main(repo, tmp_path) -> None:
+    # read_env returns "" on any error, and "" means "follow main". An env file
+    # that exists but cannot be read must therefore stop the run.
+    env_file = tmp_path / "netmon.env"
+    env_file.write_text("NETMON_UPDATE_CHANNEL=hold\n")
+    env_file.chmod(0o000)
+
+    out = _resolve(repo, tmp_path, "", "", env_file=env_file.as_posix())
+
+    assert out["rc"] == "1", out["log"]
+    assert out["STATUS"] == "failed"
+    assert out["REMOTE"] == "" and out["IMAGE_TAG"] == ""
+    assert "cannot read the env file" in out["REASON"]
+
+
+def test_a_readable_or_absent_env_file_does_not_stop_the_run(repo, tmp_path) -> None:
+    # Positive control for the test above, on every platform.
+    env_file = tmp_path / "netmon.env"
+    env_file.write_text("POSTGRES_USER=netmon\n")
+    assert _resolve(repo, tmp_path, "", "", env_file=env_file.as_posix())["REMOTE"] == repo["b"]
+    assert _resolve(repo, tmp_path, "", "", env_file=(tmp_path / "absent.env").as_posix())["REMOTE"] == repo["b"]
 
 
 @pytest.mark.parametrize("channel", ["stable", "", "nightly"])
