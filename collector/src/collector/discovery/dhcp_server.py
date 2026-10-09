@@ -50,7 +50,8 @@ Output (written to INTEL_FILE, shipped box-global in the hourly bundle as
                      reservations: [{ip, mac, name, active, client_mac,
                                      lease_expiry, bad_address}, ...],
                      options: [{id, name, value: [...]}, ...]}, ...]},
-        {"server_ip", "label", "status": "error", "error": "..."},
+        {"server_ip", "label", "status": "error",
+         "code": "<one of _ERROR_TEXT>", "error": "<that code's fixed sentence>"},
         ...
       ],
       "stats": {"targets", "ok", "errors", "elapsed_sec", "budget_exhausted"}
@@ -79,6 +80,110 @@ INTEL_FILE = Path("/var/lib/netmon/dhcp_intel.json")
 # is still well under this; a runaway output gets rejected rather than eating
 # memory.
 _MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Failure vocabulary
+# ---------------------------------------------------------------------------
+# A failed target is reported as a CODE plus that code's fixed sentence — never
+# as exception text. The text of a WinRM / Kerberos / RPC failure is written by
+# someone else's library or by the server, and routinely names the account
+# ("kinit: Client 'svc-dhcp@EXAMPLE.ORG' not found in Kerberos database"); it was
+# being copied into dhcp_intel.json, which ships in the hourly bundle, with only
+# the password scrubbed. Scrubbing by blocklist cannot fix that — the account
+# name can be spelled three ways (UPN, DOMAIN\user, bare) and the realm is
+# derived, not configured — so nothing from the exception reaches the artifact at
+# all. Same contract as device_config._fail: `error` carries no raw text.
+#
+# The detail is still needed to fix a real problem, so _fail writes it (password
+# scrubbed) to the sensor's own log, which stays on the box.
+_ERROR_TEXT: dict[str, str] = {
+    "no_server_ip": "No server address is configured for this target.",
+    "unsupported_server_type": "This server type is not supported yet (Windows DHCP only).",
+    "dependency_missing": "The sensor is missing a component this transport needs.",
+    "auth_failed": (
+        "Sign-in was rejected: the password is wrong or expired, or the account is "
+        "locked or disabled."
+    ),
+    "kerberos_failed": (
+        "Kerberos sign-in could not be completed (realm, KDC, clock, or an account "
+        "the domain does not recognise) - not a rejected password."
+    ),
+    "wmi_denied": (
+        "Signed in, but the account may not query DHCP over WMI on this server. "
+        "Use the RPC transport, or grant the account WMI access."
+    ),
+    "access_denied": (
+        "Signed in, but access was denied. Check the account is in the DHCP Users group."
+    ),
+    "timeout": "The server did not answer in time.",
+    "tls_failed": "The TLS connection to the server could not be established.",
+    "unreachable": "Could not connect to the server (unreachable, refused or reset).",
+    "module_missing": "The DhcpServer PowerShell module is not available on the server.",
+    "response_too_large": "The server's response was too large to process.",
+    "response_unparseable": "The server's response could not be read.",
+    "probe_failed": "The DHCP query ran on the server but failed.",
+    "collect_failed": "Collection failed. The sensor's log has the detail.",
+}
+
+# Checked in order, after the credential-rejection test (which always wins, so the
+# code can never contradict the fail-fast decision made from the same text).
+_CODE_SIGNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("wmi_denied", ("cannot connect to cim server",)),
+    ("access_denied", ("access is denied", "access denied", "access_denied", "unauthorizedaccess")),
+    ("timeout", ("timed out", "timeout")),
+    ("tls_failed", ("ssl", "certificate", "tls")),
+    ("unreachable", (
+        "no route", "unreachable", "connection refused", "actively refused",
+        "connection reset", "connection aborted",
+        "name or service not known", "name resolution", "getaddrinfo",
+        "failed to establish", "max retries", "connectionerror", "broken pipe",
+    )),
+    ("module_missing", ("no valid module file", "dhcpserver' was not loaded")),
+)
+
+
+def _classify(detail: str, default: str) -> str:
+    """Map failure text to a code. The text is only ever READ here."""
+    if _is_auth_failure(detail):
+        return "auth_failed"
+    low = (detail or "").lower()
+    for code, signs in _CODE_SIGNS:
+        if any(sign in low for sign in signs):
+            return code
+    return default
+
+
+def _fail(
+    base: dict[str, Any], code: str, *, transport: str | None = None,
+    detail: str = "", secret: str = "",
+) -> dict[str, Any]:
+    """Build an error entry: a code and its fixed sentence, nothing else."""
+    if detail:
+        log.warning("dhcp intel failure detail", server=base.get("server_ip"),
+                    code=code, detail=_short(_scrub(detail, secret)))
+    entry = {**base, "status": "error", "code": code, "error": _ERROR_TEXT[code]}
+    if transport is not None:
+        entry["transport"] = transport
+    return entry
+
+
+# The only top-level fields a server's report may contribute to a successful
+# entry. The report is the SERVER's text: merged wholesale (as it used to be) it
+# could overwrite status/transport/server_ip, or add a field of its own — so a
+# reply of {"ok": true, "status": "error", "detail": "<account>"} produced a
+# non-ok entry that never went through _fail. Sensor-owned fields are written
+# last and nothing outside this list is copied.
+_REPORT_FIELDS: tuple[str, ...] = (
+    "hostname", "is_authorized", "is_domain_joined",
+    "server_stats", "failover", "server_options", "scopes",
+)
+
+
+def _ok(base: dict[str, Any], transport: str, report: dict[str, Any]) -> dict[str, Any]:
+    """Build a successful entry from the whitelisted part of a server's report."""
+    picked = {k: report[k] for k in _REPORT_FIELDS if k in report}
+    return {**picked, **base, "status": "ok", "transport": transport}
 
 
 # ---------------------------------------------------------------------------
@@ -202,10 +307,10 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
     base = {"server_ip": ip, "label": label, "server_type": server_type}
 
     if not ip:
-        return {**base, "status": "error", "error": "no server_ip"}
+        return _fail(base, "no_server_ip")
     if server_type != "windows":
-        return {**base, "status": "unsupported",
-                "error": f"server_type '{server_type}' not supported yet (v1 = windows)"}
+        return {**base, "status": "unsupported", "code": "unsupported_server_type",
+                "error": _ERROR_TEXT["unsupported_server_type"]}
 
     transport = str(target.get("transport") or "auto").lower()
     user = str(target.get("winrm_user") or "")
@@ -221,7 +326,7 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
     try:
         import winrm  # lazy: only needed when a target is actually collected
     except Exception as exc:  # pragma: no cover — dep-missing guard
-        return {**base, "status": "error", "error": f"pywinrm unavailable: {exc}"}
+        return _fail(base, "dependency_missing", detail=f"pywinrm unavailable: {exc}")
 
     port = int(target.get("winrm_port") or (5986 if target.get("use_https") else 5985))
     scheme = "https" if target.get("use_https") else "http"
@@ -255,8 +360,8 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
                 fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout)
                 if fb:
                     return fb
-            return {**base, "status": "error", "transport": "kerberos",
-                    "error": _short(reason)}
+            return _fail(base, _classify(reason, "kerberos_failed"), transport="kerberos",
+                         detail=reason, secret=password)
 
     try:
         session = winrm.Session(
@@ -286,26 +391,26 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
             fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout)
             if fb:
                 return fb
-        return {**base, "status": "error", "transport": transport,
-                "error": _short(_scrub(str(exc), password))}
+        detail = f"{type(exc).__name__}: {exc}"
+        return _fail(base, _classify(detail, "collect_failed"), transport=transport,
+                     detail=detail, secret=password)
     finally:
         if ccache:
             _cleanup_ccache(ccache)
 
     if getattr(result, "status_code", 1) != 0:
-        err = _short(_scrub((result.std_err or b"").decode("utf-8", "replace"), password))
-        return {**base, "status": "error", "transport": transport,
-                "error": err or "winrm returned non-zero"}
+        detail = (result.std_err or b"").decode("utf-8", "replace") or "winrm returned non-zero"
+        return _fail(base, _classify(detail, "probe_failed"), transport=transport,
+                     detail=detail, secret=password)
 
     raw = result.std_out or b""
     if len(raw) > _MAX_OUTPUT_BYTES:
-        return {**base, "status": "error", "transport": transport,
-                "error": "server response too large"}
+        return _fail(base, "response_too_large", transport=transport)
     try:
         parsed = json.loads(raw.decode("utf-8", "replace") or "{}")
     except Exception as exc:
-        return {**base, "status": "error", "transport": transport,
-                "error": f"unparseable server response: {exc}"}
+        return _fail(base, "response_unparseable", transport=transport,
+                     detail=f"unparseable server response: {exc}", secret=password)
 
     if not parsed.get("ok"):
         err = _short(str(parsed.get("error") or "DhcpServer probe failed"))
@@ -317,14 +422,15 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
             fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout)
             if fb:
                 return fb
-        return {**base, "status": "error", "transport": transport, "error": err}
+        # `err` is the server's own exception message — server-authored text, so
+        # it is classified like every other failure rather than copied through.
+        return _fail(base, _classify(err, "probe_failed"), transport=transport,
+                     detail=err, secret=password)
 
-    # Merge the server's own report onto the target identity. `ok`/`error` in the
-    # PS payload are control fields — drop them; keep everything else. `transport`
-    # records which auth actually worked, for the dashboard status line.
-    parsed.pop("ok", None)
-    parsed.pop("error", None)
-    return {**base, "status": "ok", "transport": transport, **parsed}
+    # Merge the server's own report onto the target identity (see _ok: only the
+    # known report fields, and never over the sensor's own). `transport` records
+    # which auth actually worked, for the dashboard status line.
+    return _ok(base, transport, parsed)
 
 
 def _is_wmi_denied(err: str) -> bool:
@@ -400,8 +506,8 @@ def _collect_via_rpc(
     try:
         from . import dhcp_rpc
     except Exception as exc:  # pragma: no cover — dep-missing guard
-        return {**base, "status": "error", "transport": "rpc",
-                "error": _short(f"rpc collector unavailable: {exc}")}
+        return _fail(base, "dependency_missing", transport="rpc",
+                     detail=f"rpc collector unavailable: {exc}")
 
     ccache: str | None = None
     use_kerberos = True
@@ -413,8 +519,8 @@ def _collect_via_rpc(
         # non-credential kinit failure (no realm/KDC/clock) still falls through to
         # let impacket attempt NTLM, which may be all the box offers.
         if _is_auth_failure(_scrub(str(exc), password)):
-            return {**base, "status": "error", "transport": "rpc",
-                    "error": _short(_scrub(f"authentication failed: {exc}", password))}
+            return _fail(base, "auth_failed", transport="rpc",
+                         detail=f"kinit: {exc}", secret=password)
         use_kerberos = False
     try:
         parsed = dhcp_rpc.collect(
@@ -422,14 +528,12 @@ def _collect_via_rpc(
         )
     except Exception as exc:  # noqa: BLE001 — connection / auth / bind error
         reason = _scrub(str(exc), password)
-        prefix = "authentication failed: " if _is_auth_failure(reason) else ""
-        return {**base, "status": "error", "transport": "rpc",
-                "error": _short(f"{prefix}{reason}")}
+        return _fail(base, _classify(reason, "collect_failed"), transport="rpc",
+                     detail=f"{type(exc).__name__}: {exc}", secret=password)
     finally:
         if ccache:
             _cleanup_ccache(ccache)
-    parsed.pop("transport_detail", None)
-    return {**base, "status": "ok", "transport": "rpc", **parsed}
+    return _ok(base, "rpc", parsed)
 
 
 # ---------------------------------------------------------------------------

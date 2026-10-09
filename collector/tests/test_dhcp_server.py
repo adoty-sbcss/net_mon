@@ -185,11 +185,15 @@ def test_fqdn_endpoint_on_kerberos_path(monkeypatch):
 def test_ps_reported_error(monkeypatch):
     _install_fake_winrm(
         monkeypatch,
-        result=_FakeResult(std_out=json.dumps({"ok": False, "error": "module missing"}).encode()),
+        result=_FakeResult(std_out=json.dumps({"ok": False, "error": (
+            "The specified module 'DhcpServer' was not loaded because no valid module "
+            "file was found in any module directory."
+        )}).encode()),
     )
     out = dh._collect_one({"server_ip": "10.0.0.10", "server_type": "windows"}, winrm_timeout=30)
     assert out["status"] == "error"
-    assert "module missing" in out["error"]
+    assert out["code"] == "module_missing"
+    assert out["error"] == dh._ERROR_TEXT["module_missing"]
 
 
 def test_nonzero_status_scrubs_password(monkeypatch):
@@ -199,15 +203,16 @@ def test_nonzero_status_scrubs_password(monkeypatch):
         winrm_timeout=30,
     )
     assert out["status"] == "error"
-    assert "p@ss" not in out["error"]
-    assert "***" in out["error"]
+    # Not scrubbed-and-forwarded any more: none of the server's text is forwarded.
+    assert "p@ss" not in json.dumps(out)
+    assert out["error"] == dh._ERROR_TEXT[out["code"]]
 
 
 def test_connection_error(monkeypatch):
     _install_fake_winrm(monkeypatch, raises=OSError("no route to host"))
     out = dh._collect_one({"server_ip": "10.0.0.10", "server_type": "windows"}, winrm_timeout=30)
     assert out["status"] == "error"
-    assert "no route" in out["error"]
+    assert out["code"] == "unreachable"
 
 
 def test_collect_all_shape(monkeypatch):
@@ -322,7 +327,7 @@ def test_kerberos_kinit_failure_is_clean(monkeypatch):
     )
     assert out["status"] == "error"
     assert out["transport"] == "kerberos"
-    assert "kerberos sign-in failed" in out["error"].lower()
+    assert out["code"] == "auth_failed"  # "Password incorrect" is a credential rejection
 
 
 # ---- F-COL-9: fail fast on an auth failure (avoid AD lockout) ----
@@ -446,5 +451,5 @@ def test_rpc_kinit_auth_failure_skips_ntlm(monkeypatch):
     )
     assert out["status"] == "error"
     assert out["transport"] == "rpc"
-    assert "authentication failed" in out["error"].lower()
+    assert out["code"] == "auth_failed"
     assert called["n"] == 0  # NTLM attempt skipped
