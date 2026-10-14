@@ -108,9 +108,25 @@ run_action() {
                 t_parent="$(current_value NETMON_TRUNK_PARENT 2>/dev/null || true)"
                 t_vlans="$(current_value NETMON_TRUNK_VLANS 2>/dev/null || true)"
                 t_statics="$(current_value NETMON_TRUNK_STATICS 2>/dev/null || true)"
-                [ -z "$t_vlans" ] && { echo "NETMON_TRUNK_VLANS empty — nothing to apply"; exit 1; }
+                # Empty is refused, never read as "remove everything": an unreadable
+                # env file also reads back empty. Clearing is host-remove-vlan.
+                [ -z "$t_vlans" ] && { echo "NETMON_TRUNK_VLANS empty — nothing to apply (clearing is host-remove-vlan)"; exit 1; }
                 [ -z "$t_parent" ] && t_parent="$(_trunk_default_parent)"
                 apply_vlan_netplan_headless "$t_parent" "$t_vlans" "$t_statics"
+            ) 2>&1 | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done
+            ;;
+        remove-vlan|host-remove-vlan)
+            log "ACTION remove-vlan: remove the VLAN sub-interfaces NetMon created (netplan file / netmon-vlan<id> NM connections)"
+            # The clear path for an emptied VLAN list. Touches only what NetMon
+            # created, never the parent; guarded — it restores the removed config if
+            # the box's default route is lost. Independent of NETMON_TRUNK_*: it
+            # removes what NetMon OWNS, whatever the env says.
+            (
+                for lib in common.sh paths.sh envfile.sh trunk.sh; do
+                    # shellcheck source=/dev/null
+                    [ -f "$REPO_DIR/lib/$lib" ] && . "$REPO_DIR/lib/$lib"
+                done
+                remove_vlan_interfaces_headless
             ) 2>&1 | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done
             ;;
         wifi-join|host-wifi-join)
