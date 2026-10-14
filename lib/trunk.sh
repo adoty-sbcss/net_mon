@@ -268,6 +268,23 @@ _nmcli_vlan_con_info() {
     printf '%s %s %s %s %s\n' "$ctype" "${ifname:--}" "${vparent:--}" "${vid:--}" "${addrs:--}"
 }
 
+# Is NM connection <con> provably absent? Only a SUCCESSFUL listing that does not
+# contain it counts; a failed listing proves nothing. (Here-string, not a pipe:
+# under pipefail `grep -q` can SIGPIPE its producer and read as "absent".)
+_nmcli_con_absent() {
+    local listing
+    listing="$($SUDO nmcli -g NAME con show 2>/dev/null)" || return 1
+    ! grep -qxF -- "$1" <<< "$listing"
+}
+
+# Are NetMon NM profiles saved on disk (keyfiles that come back when
+# NetworkManager starts)? Independent of nmcli being installed.
+_nm_netmon_keyfiles_saved() {
+    local files
+    files="$($SUDO ls "$NETMON_NM_CONN_DIR" 2>/dev/null)" || return 1
+    grep -qE '^netmon-vlan[0-9]+\.nmconnection$' <<< "$files"
+}
+
 # Delete one NetMon VLAN connection and the sub-interface it names (whatever its
 # naming scheme), so the VLAN id is free on the parent before anything re-adds it.
 # The netmon-vlan<id> name alone is not proof of ownership: a profile that is not a
@@ -277,7 +294,11 @@ _nmcli_vlan_con_info() {
 # NetworkManager refuses to delete. An absent profile returns 0.
 _nmcli_remove_vlan_con() {
     local con="$1" info ctype ifname vparent vid _a
-    info="$(_nmcli_vlan_con_info "$con")" || return 0
+    if ! info="$(_nmcli_vlan_con_info "$con")"; then
+        _nmcli_con_absent "$con" && return 0
+        warn "could not inspect NM connection ${con}."
+        return 1
+    fi
     read -r ctype ifname vparent vid _a <<< "$info"
     if [[ "$ctype" != "vlan" || "$vid" != "${con#netmon-vlan}" || "$ifname" == "-" ]]; then
         warn "not touching NM connection ${con}: not a NetMon VLAN profile (type ${ctype}, id ${vid}, interface ${ifname})"
@@ -543,25 +564,24 @@ remove_vlan_interfaces_headless() {
 
     # NetworkManager side: our netmon-vlan<digits> VLAN connections only.
     local con info ctype ifname vparent vid addrs saved=() nm_links="" cons=""
-    if command -v nmcli >/dev/null 2>&1; then
-        if ! cons="$($SUDO nmcli -g NAME con show 2>/dev/null)"; then
-            cons=""
-            # Running and failing is a failure. Stopped is fine only if no NetMon
-            # profile is saved to come back when NetworkManager starts.
-            if command -v systemctl >/dev/null 2>&1 \
-                && systemctl is-active --quiet NetworkManager 2>/dev/null; then
-                warn "could not list NetworkManager connections."
-                rc=1
-            elif $SUDO ls "$NETMON_NM_CONN_DIR" 2>/dev/null \
-                    | grep -qE '^netmon-vlan[0-9]+\.nmconnection$'; then
-                warn "NetworkManager is not running but NetMon VLAN profiles are saved in ${NETMON_NM_CONN_DIR} — start it and retry."
-                rc=1
-            fi
+    if ! command -v nmcli >/dev/null 2>&1 || ! cons="$($SUDO nmcli -g NAME con show 2>/dev/null)"; then
+        cons=""
+        # Running and failing is a failure. Stopped (or nmcli gone) is fine only if
+        # no NetMon profile is saved to come back when NetworkManager starts.
+        if command -v systemctl >/dev/null 2>&1 \
+            && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+            warn "could not list NetworkManager connections."
+            rc=1
+        elif _nm_netmon_keyfiles_saved; then
+            warn "NetworkManager is not running but NetMon VLAN profiles are saved in ${NETMON_NM_CONN_DIR} — start it and retry."
+            rc=1
         fi
+    fi
+    if [[ -n "$cons" ]]; then
         while IFS= read -r con; do
             [[ "$con" =~ ^netmon-vlan[0-9]+$ ]] || continue
             if ! info="$(_nmcli_vlan_con_info "$con")"; then
-                if $SUDO nmcli -g NAME con show 2>/dev/null | grep -qxF -- "$con"; then
+                if ! _nmcli_con_absent "$con"; then
                     warn "could not inspect NM connection ${con}."
                     rc=1
                 fi
