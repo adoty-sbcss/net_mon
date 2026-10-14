@@ -123,9 +123,12 @@ netplan() {
 }
 nmcli() {
     case "$*" in
-        "-g NAME con show") awk '{print $1}' "$ST/cons" ;;
+        "-g NAME con show")
+            [[ -e "$ST/list-fails" ]] && return 8
+            awk '{print $1}' "$ST/cons" ;;
         "-g connection.type,connection.interface-name,vlan.parent,vlan.id,ipv4.addresses con show "*)
             local c="${*: -1}" ifn par vid adr typ v
+            [[ -e "$ST/inspect-fails" ]] && return 8
             read -r _ ifn par vid adr typ < <(awk -v c="$c" '$1==c' "$ST/cons") || return 10
             for v in ifn par vid adr; do [[ "${!v}" == "-" ]] && printf -v "$v" '%s' ''; done
             printf '%s\n%s\n%s\n%s\n%s\n' "${typ:-vlan}" "$ifn" "$par" "$vid" "$adr" ;;
@@ -175,9 +178,10 @@ def _run(tmp_path: Path, body: str, *, backend: str, links: str = "",
     if netplan_file is not None:
         plan.write_text(netplan_file, encoding="utf-8", newline="\n")
     script = tmp_path / "t.sh"
+    (st / "nmconn").mkdir()
     script.write_text(
         f'ST="{st.as_posix()}"\nBACKEND="{backend}"\nUPLINK="{uplink}"\n'
-        f'NETMON_VLAN_NETPLAN="{plan.as_posix()}"\n'
+        f'NETMON_VLAN_NETPLAN="{plan.as_posix()}"\nNETMON_NM_CONN_DIR="{(st / "nmconn").as_posix()}"\n'
         + STUBS
         + f'. "{TRUNK.as_posix()}"\n'
         + body + "\n",
@@ -616,3 +620,37 @@ def test_a_malformed_route_wait_does_not_break_the_guard(tmp_path, wait) -> None
     assert "RC=1" in out, out + st["stderr"]
     assert "RESTORING" in out
     assert st["plan"] == old
+
+
+# --- review round 3: every NM failure on the clear and reconcile paths is reported ----
+
+
+def test_apply_reports_a_stale_profile_networkmanager_would_not_delete(tmp_path) -> None:
+    cons = "netmon-vlan20 eth0.20 eth0 20 -\n"
+    body = 'touch "$ST/delete-fails"; apply_vlan_netplan_headless eth0 10; echo "RC=$?"'
+    out, st = _run(tmp_path, body, backend="nm", cons=cons, links="eth0.20 vlan 20 eth0\n")
+    assert "RC=1" in out
+    assert "not removed: netmon-vlan20" in out
+
+
+def test_remove_reports_a_listed_profile_it_could_not_inspect(tmp_path) -> None:
+    cons = "netmon-vlan20 eth0.20 eth0 20 -\n"
+    out, st = _run(tmp_path, 'remove_vlan_interfaces_headless; echo "RC=$?"', backend="nm",
+                   cons=cons, links="eth0.20 vlan 20 eth0\n", flags=("inspect-fails",))
+    assert "RC=1" in out
+    assert "could not inspect NM connection netmon-vlan20" in out
+    assert st["cons"] == cons
+
+
+def test_remove_with_networkmanager_stopped_but_profiles_saved_is_not_clean(tmp_path) -> None:
+    body = ('touch "$NETMON_NM_CONN_DIR/netmon-vlan20.nmconnection"; '
+            'remove_vlan_interfaces_headless; echo "RC=$?"')
+    out, st = _run(tmp_path, body, backend="networkd", flags=("list-fails",))
+    assert "RC=1" in out
+    assert "not running but NetMon VLAN profiles are saved" in out
+
+
+def test_remove_with_networkmanager_stopped_and_nothing_saved_is_clean(tmp_path) -> None:
+    out, st = _run(tmp_path, 'remove_vlan_interfaces_headless; echo "RC=$?"', backend="networkd",
+                   flags=("list-fails",))
+    assert "RC=0" in out, out
