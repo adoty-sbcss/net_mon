@@ -116,9 +116,11 @@ _vlan_present_links() {
 # to NETMON_ROUTE_WAIT seconds before calling it lost — one early sample turned a
 # slow lease into a false revert.
 _trunk_route_lost() {
-    local before="$1" i
+    local before="$1" i wait="${NETMON_ROUTE_WAIT:-20}"
     [[ -n "$before" ]] || return 1
-    for (( i = 0; i < ${NETMON_ROUTE_WAIT:-20}; i++ )); do
+    [[ "$wait" =~ ^[0-9]{1,3}$ ]] || wait=20
+    (( wait <= 120 )) || wait=120
+    for (( i = 0; i < wait; i++ )); do
         [[ -n "$(ip route show default 2>/dev/null | head -1)" ]] && return 1
         sleep 1
     done
@@ -268,23 +270,28 @@ _nmcli_vlan_con_info() {
 # Delete one NetMon VLAN connection and the sub-interface it names (whatever its
 # naming scheme), so the VLAN id is free on the parent before anything re-adds it.
 # The netmon-vlan<id> name alone is not proof of ownership: a profile that is not a
-# VLAN, carries another VLAN id, or whose interface carries the default route is
-# left alone (returns 1). An absent profile returns 0.
+# VLAN, carries another VLAN id, has no interface name (NetMon always sets one, and
+# without it the device — and whether it is the uplink — cannot be known), or
+# whose interface carries the default route is left alone (returns 1), as is one
+# NetworkManager refuses to delete. An absent profile returns 0.
 _nmcli_remove_vlan_con() {
     local con="$1" info ctype ifname vparent vid _a
     info="$(_nmcli_vlan_con_info "$con")" || return 0
     read -r ctype ifname vparent vid _a <<< "$info"
-    if [[ "$ctype" != "vlan" || "$vid" != "${con#netmon-vlan}" ]]; then
-        warn "not touching NM connection ${con}: not a NetMon VLAN profile (type ${ctype}, id ${vid})"
+    if [[ "$ctype" != "vlan" || "$vid" != "${con#netmon-vlan}" || "$ifname" == "-" ]]; then
+        warn "not touching NM connection ${con}: not a NetMon VLAN profile (type ${ctype}, id ${vid}, interface ${ifname})"
         return 1
     fi
-    if [[ "$ifname" != "-" ]] && _trunk_is_uplink "$ifname"; then
+    if _trunk_is_uplink "$ifname"; then
         warn "not touching NM connection ${con}: ${ifname} carries the default route"
         return 1
     fi
-    $SUDO nmcli con delete "$con" >/dev/null 2>&1 || true
+    if ! $SUDO nmcli con delete "$con" >/dev/null 2>&1; then
+        warn "NetworkManager refused to delete ${con}"
+        return 1
+    fi
     [[ "$vparent" == "-" ]] && vparent=""
-    [[ "$ifname" != "-" ]] && _vlan_delete_link "$ifname" "$vid" "$vparent"
+    _vlan_delete_link "$ifname" "$vid" "$vparent"
     return 0
 }
 
@@ -334,25 +341,29 @@ _apply_vlan_nmcli() {
     local before_default
     before_default="$(ip route show default 2>/dev/null | head -1)"
 
-    local vid cidr pair wanted=""
+    local vid cidr pair wanted="" refused=""
     for vid in $vids; do
         cidr=""
         for pair in ${statics//,/ }; do
             [[ "$pair" == "${vid}:"* ]] && cidr="${pair#"${vid}":}"
         done
-        _nmcli_add_vlan "$parent" "$vid" "$cidr"
+        _nmcli_add_vlan "$parent" "$vid" "$cidr" || refused+="${vid} "
         wanted+="$(vlan_child_name "$parent" "$vid") ${vid} ${parent}"$'\n'
     done
 
-    # Remove netmon-vlan<digits> connections we own that are no longer wanted.
+    # Remove netmon-vlan<digits> connections we own that are no longer wanted —
+    # unless an add was refused: a foreign profile holds one of our names, so
+    # stop reconciling and report it rather than half-apply.
     local existing evid
-    while IFS= read -r existing; do
-        [[ "$existing" =~ ^netmon-vlan[0-9]+$ ]] || continue
-        evid="${existing#netmon-vlan}"
-        if [[ " $vids " != *" $evid "* ]] && _nmcli_remove_vlan_con "$existing"; then
-            log "removed stale VLAN connection ${existing}"
-        fi
-    done < <($SUDO nmcli -g NAME con show 2>/dev/null)
+    if [[ -z "$refused" ]]; then
+        while IFS= read -r existing; do
+            [[ "$existing" =~ ^netmon-vlan[0-9]+$ ]] || continue
+            evid="${existing#netmon-vlan}"
+            if [[ " $vids " != *" $evid "* ]] && _nmcli_remove_vlan_con "$existing"; then
+                log "removed stale VLAN connection ${existing}"
+            fi
+        done < <($SUDO nmcli -g NAME con show 2>/dev/null)
+    fi
 
     # Connectivity guard (belt-and-suspenders; never-default already blocks hijack).
     # The safe end state is "no NetMon VLANs": routes-off sub-interfaces cannot be
@@ -367,6 +378,10 @@ _apply_vlan_nmcli() {
         return 1
     fi
 
+    if [[ -n "$refused" ]]; then
+        warn "VLAN(s) not configured — a non-NetMon NM profile holds the name: ${refused% }"
+        return 1
+    fi
     local missing
     missing="$(_vlan_missing_links <<< "$wanted")"
     if [[ -n "$missing" ]]; then
@@ -494,6 +509,11 @@ remove_vlan_interfaces_headless() {
             return 1
         fi
         $SUDO rm -f "$f"
+        if $SUDO test -f "$f"; then
+            rm -f "$backup"
+            warn "could not remove ${f}."
+            return 1
+        fi
         log "removed ${f}"
         if command -v netplan >/dev/null 2>&1; then
             $SUDO netplan generate >/dev/null 2>&1 || true
@@ -510,8 +530,18 @@ remove_vlan_interfaces_headless() {
     fi
 
     # NetworkManager side: our netmon-vlan<digits> VLAN connections only.
-    local con info ctype ifname vparent vid addrs saved=() nm_links=""
+    local con info ctype ifname vparent vid addrs saved=() nm_links="" cons=""
     if command -v nmcli >/dev/null 2>&1; then
+        if ! cons="$($SUDO nmcli -g NAME con show 2>/dev/null)"; then
+            cons=""
+            # Not running means no profile can be live; running and failing is a
+            # failure, not "nothing to remove".
+            if command -v systemctl >/dev/null 2>&1 \
+                && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+                warn "could not list NetworkManager connections."
+                rc=1
+            fi
+        fi
         while IFS= read -r con; do
             [[ "$con" =~ ^netmon-vlan[0-9]+$ ]] || continue
             info="$(_nmcli_vlan_con_info "$con")" || continue
@@ -523,7 +553,7 @@ remove_vlan_interfaces_headless() {
             else
                 rc=1
             fi
-        done < <($SUDO nmcli -g NAME con show 2>/dev/null)
+        done <<< "$cons"
     fi
 
     if _trunk_route_lost "$before_default"; then
@@ -562,7 +592,7 @@ remove_vlan_interfaces_headless() {
         return 1
     fi
     if (( rc != 0 )); then
-        warn "some netmon-vlan<id> NM connections were left alone (see above)."
+        warn "NetMon's VLAN state could not be fully removed (see above)."
         return 1
     fi
     ok "NetMon VLAN sub-interfaces removed; the box's own interfaces are untouched."
@@ -633,8 +663,8 @@ prompt_trunk_config() {
     default_vlans="${detected:-$cur_vlans}"
     read -r -p "VLAN IDs to monitor (comma-separated) [${default_vlans}]: " vlans || vlans=""
     vlans="${vlans:-$default_vlans}"
-    vlans="$(printf '%s' "$vlans" | tr -cd '0-9,')"   # keep only digits + commas
-    if [[ -z "$vlans" ]]; then warn "No VLANs given — trunk setup cancelled."; return 0; fi
+    vlans="$(_trunk_vids "$vlans")"; vlans="${vlans// /,}"   # valid ids only, canonical
+    if [[ -z "$vlans" ]]; then warn "No valid VLAN ids (1-4094) given — trunk setup cancelled."; return 0; fi
 
     # 5. Optional static IPs
     local statics statics_in
@@ -652,9 +682,8 @@ prompt_trunk_config() {
     set_value NETMON_TRUNK_VLANS   "$vlans"
     set_value NETMON_TRUNK_STATICS "$statics"
 
-    # 7. Generate the netplan file (remembering what the previous one defined)
-    local f old_children
-    old_children="$(_vlan_netplan_children)"
+    # 7. Generate the netplan file
+    local f
     f="$(generate_vlan_netplan "$parent" "$vlans" "$statics")"
     ok "wrote ${f}"
     echo ""
@@ -688,9 +717,6 @@ prompt_trunk_config() {
         # `netplan try` is the safe path for remote boxes: it applies, then reverts
         # to the prior config on timeout or if the network can't be reached — so a
         # bad VLAN change can never strand the box.
-        # A child the new file renames/re-parents/drops must go first — networkd
-        # never modifies an existing netdev (see _vlan_drop_changed_children).
-        _vlan_drop_changed_children "$old_children" "$(_vlan_netplan_children "$f")"
         if $SUDO netplan try --timeout 120; then
             ok "applied + kept — VLAN sub-interfaces are up"
             echo "  the collector discovers + scans them within a poll tick (~30s)."

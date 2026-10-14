@@ -131,6 +131,7 @@ nmcli() {
             printf '%s\n%s\n%s\n%s\n%s\n' "${typ:-vlan}" "$ifn" "$par" "$vid" "$adr" ;;
         "con delete "*)
             local c="${*: -1}"
+            [[ -e "$ST/delete-fails" ]] && return 1
             echo "nmcli con delete $c" >> "$ST/calls"
             [[ -e "$ST/delete-drops-route" ]] && touch "$ST/noroute"
             awk -v c="$c" '$1!=c' "$ST/cons" > "$ST/cons.tmp" && mv "$ST/cons.tmp" "$ST/cons" ;;
@@ -568,3 +569,50 @@ def test_remove_leaves_a_netmon_vlan_profile_whose_device_is_the_uplink(tmp_path
     assert "nmcli con delete" not in st["calls"]
     assert st["cons"] == cons
     assert "RC=1" in out
+
+
+# --- review round 2 -----------------------------------------------------------------
+
+
+def test_remove_leaves_a_vlan_profile_with_no_interface_name(tmp_path) -> None:
+    # NetMon always sets one; without it the device (and whether it is the uplink)
+    # is unknown, so the profile is not provably ours.
+    cons = "netmon-vlan10 - eth0 10 -\n"
+    out, st = _run(tmp_path, 'remove_vlan_interfaces_headless; echo "RC=$?"', backend="nm", cons=cons)
+    assert "nmcli con delete" not in st["calls"]
+    assert st["cons"] == cons
+    assert "RC=1" in out
+
+
+def test_apply_stops_when_a_foreign_profile_holds_a_netmon_name(tmp_path) -> None:
+    # The add for VLAN 10 is refused (foreign ethernet profile named netmon-vlan10);
+    # even with an identity-matching link present, that is a failure — and the
+    # stale NetMon VLAN 20 is not reconciled away on a half-apply.
+    cons = "netmon-vlan10 eth0.10 - - - 802-3-ethernet\nnetmon-vlan20 eth0.20 eth0 20 -\n"
+    out, st = _run(tmp_path, 'apply_vlan_netplan_headless eth0 10; echo "RC=$?"', backend="nm",
+                   cons=cons, links="eth0.10 vlan 10 eth0\neth0.20 vlan 20 eth0\n")
+    assert "RC=1" in out
+    assert "non-NetMon NM profile holds the name: 10" in out
+    assert st["cons"] == cons
+    assert "nmcli con delete" not in st["calls"]
+
+
+def test_remove_reports_a_profile_networkmanager_would_not_delete(tmp_path) -> None:
+    cons = "netmon-vlan20 eth0.20 eth0 20 -\n"
+    out, st = _run(tmp_path, 'remove_vlan_interfaces_headless; echo "RC=$?"', backend="nm",
+                   cons=cons, links="eth0.20 vlan 20 eth0\n", flags=("delete-fails",))
+    assert "RC=1" in out
+    assert "refused to delete netmon-vlan20" in out
+    assert st["cons"] == cons
+    assert ("eth0.20", "20", "eth0") in _vlan_links(st)   # left consistent with its profile
+
+
+@pytest.mark.parametrize("wait", ["abc", "-1", "99999"])
+def test_a_malformed_route_wait_does_not_break_the_guard(tmp_path, wait) -> None:
+    old = _netplan_old([("eth0.10", 10, "eth0")])
+    out, st = _run(tmp_path, f'NETMON_ROUTE_WAIT="{wait}"; remove_vlan_interfaces_headless; echo "RC=$?"',
+                   backend="networkd", netplan_file=old, links="eth0.10 vlan 10 eth0\n",
+                   flags=("apply-drops-route",))
+    assert "RC=1" in out, out + st["stderr"]
+    assert "RESTORING" in out
+    assert st["plan"] == old
