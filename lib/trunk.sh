@@ -17,6 +17,7 @@
 _NETMON_TRUNK_SH=1
 
 NETMON_VLAN_NETPLAN="${NETMON_VLAN_NETPLAN:-/etc/netplan/60-netmon-vlans.yaml}"
+NETMON_NM_CONN_DIR="${NETMON_NM_CONN_DIR:-/etc/NetworkManager/system-connections}"
 
 # A Linux interface name: at most 15 bytes (IFNAMSIZ-1), no '/', ':' or space.
 # Same grammar the dashboard's VLAN form enforces on the parent (PROV-7).
@@ -354,15 +355,22 @@ _apply_vlan_nmcli() {
     # Remove netmon-vlan<digits> connections we own that are no longer wanted —
     # unless an add was refused: a foreign profile holds one of our names, so
     # stop reconciling and report it rather than half-apply.
-    local existing evid
+    local existing evid listing stale_left=""
     if [[ -z "$refused" ]]; then
-        while IFS= read -r existing; do
-            [[ "$existing" =~ ^netmon-vlan[0-9]+$ ]] || continue
-            evid="${existing#netmon-vlan}"
-            if [[ " $vids " != *" $evid "* ]] && _nmcli_remove_vlan_con "$existing"; then
-                log "removed stale VLAN connection ${existing}"
-            fi
-        done < <($SUDO nmcli -g NAME con show 2>/dev/null)
+        if listing="$($SUDO nmcli -g NAME con show 2>/dev/null)"; then
+            while IFS= read -r existing; do
+                [[ "$existing" =~ ^netmon-vlan[0-9]+$ ]] || continue
+                evid="${existing#netmon-vlan}"
+                [[ " $vids " == *" $evid "* ]] && continue
+                if _nmcli_remove_vlan_con "$existing"; then
+                    log "removed stale VLAN connection ${existing}"
+                else
+                    stale_left+="${existing} "
+                fi
+            done <<< "$listing"
+        else
+            stale_left="(could not list NetworkManager connections) "
+        fi
     fi
 
     # Connectivity guard (belt-and-suspenders; never-default already blocks hijack).
@@ -380,6 +388,10 @@ _apply_vlan_nmcli() {
 
     if [[ -n "$refused" ]]; then
         warn "VLAN(s) not configured — a non-NetMon NM profile holds the name: ${refused% }"
+        return 1
+    fi
+    if [[ -n "$stale_left" ]]; then
+        warn "stale NetMon VLAN connection(s) not removed: ${stale_left% }"
         return 1
     fi
     local missing
@@ -534,17 +546,27 @@ remove_vlan_interfaces_headless() {
     if command -v nmcli >/dev/null 2>&1; then
         if ! cons="$($SUDO nmcli -g NAME con show 2>/dev/null)"; then
             cons=""
-            # Not running means no profile can be live; running and failing is a
-            # failure, not "nothing to remove".
+            # Running and failing is a failure. Stopped is fine only if no NetMon
+            # profile is saved to come back when NetworkManager starts.
             if command -v systemctl >/dev/null 2>&1 \
                 && systemctl is-active --quiet NetworkManager 2>/dev/null; then
                 warn "could not list NetworkManager connections."
+                rc=1
+            elif $SUDO ls "$NETMON_NM_CONN_DIR" 2>/dev/null \
+                    | grep -qE '^netmon-vlan[0-9]+\.nmconnection$'; then
+                warn "NetworkManager is not running but NetMon VLAN profiles are saved in ${NETMON_NM_CONN_DIR} — start it and retry."
                 rc=1
             fi
         fi
         while IFS= read -r con; do
             [[ "$con" =~ ^netmon-vlan[0-9]+$ ]] || continue
-            info="$(_nmcli_vlan_con_info "$con")" || continue
+            if ! info="$(_nmcli_vlan_con_info "$con")"; then
+                if $SUDO nmcli -g NAME con show 2>/dev/null | grep -qxF -- "$con"; then
+                    warn "could not inspect NM connection ${con}."
+                    rc=1
+                fi
+                continue
+            fi
             if _nmcli_remove_vlan_con "$con"; then
                 saved+=("$info")
                 read -r ctype ifname vparent vid addrs <<< "$info"
