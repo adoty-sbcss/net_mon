@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -9,6 +10,38 @@ import structlog
 from ..models import InterfaceState
 
 log = structlog.get_logger(__name__)
+
+# The kernel's 802.1Q table: one "<name> | <vid> | <parent>" row per VLAN device.
+# /proc/net is per network namespace; the collector runs with host networking, so
+# this is the host's table.
+PROC_VLAN_CONFIG = Path("/proc/net/vlan/config")
+
+_DOTTED_VLAN_RE = re.compile(r"^(.+)\.(\d{1,4})$")
+
+
+def vlan_of(interface: str) -> tuple[int | None, str | None]:
+    """(vlan_id, parent) of a VLAN sub-interface, else (None, None).
+
+    The kernel's own table first, so a sub-interface named independently of its
+    parent (lib/trunk.sh names it vlan<id> when <parent>.<id> would pass the
+    15-byte limit) is still attributed to its VLAN and full parent. Falls back to
+    the historical <parent>.<vid> name ('eth0.10' -> (10, 'eth0')) when the table
+    is unreadable or does not list the interface.
+    """
+    try:
+        for line in PROC_VLAN_CONFIG.read_text().splitlines():
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) == 3 and parts[0] == interface and parts[1].isdigit():
+                vid = int(parts[1])
+                if 1 <= vid <= 4094 and parts[2]:
+                    return vid, parts[2]
+    except OSError:
+        pass
+    m = _DOTTED_VLAN_RE.match(interface)
+    if not m:
+        return None, None
+    vid = int(m.group(2))
+    return (vid, m.group(1)) if 1 <= vid <= 4094 else (None, None)
 
 
 def snapshot(*, exclude_prefixes: tuple[str, ...] = ()) -> list[InterfaceState]:

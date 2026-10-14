@@ -50,15 +50,10 @@ def _network_id(gateway_mac: str | None, cidr: str | None) -> str | None:
 
 
 def _vlan_of(interface: str) -> tuple[int | None, str | None]:
-    """Derive (vlan_id, parent) from a VLAN sub-interface name:
-    'eth0.10' -> (10, 'eth0'); 'enp0s31f6.100' -> (100, 'enp0s31f6'); a plain
-    NIC -> (None, None). Matches the `parent.vid` naming the trunk wizard
-    generates via netplan, so trunk scans are attributable to their VLAN."""
-    m = re.match(r"^(.+)\.(\d{1,4})$", interface)
-    if not m:
-        return None, None
-    vid = int(m.group(2))
-    return (vid, m.group(1)) if 1 <= vid <= 4094 else (None, None)
+    """Derive (vlan_id, parent) for a VLAN sub-interface: 'eth0.10' -> (10, 'eth0'),
+    a trunk sub-interface named 'vlan10' -> (10, its parent from the kernel); a plain
+    NIC -> (None, None). See discovery.interfaces.vlan_of."""
+    return iface_mod.vlan_of(interface)
 
 
 def _topology_due(net_id: str | None, interval_sec: int) -> bool:

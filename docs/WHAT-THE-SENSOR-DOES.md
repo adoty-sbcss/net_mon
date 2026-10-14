@@ -120,7 +120,7 @@ of the sensor.**
   logs, a fixed list of read-only diagnostics, flush the ARP cache, test a switch
   SSH login, back up switch configs, and update the sensor's code.
 - **Queue host actions.** Restart or rebuild the containers, reboot the box, roll
-  back to the previous version, apply VLAN sub-interfaces, join or leave a Wi-Fi
+  back to the previous version, apply or remove VLAN sub-interfaces, join or leave a Wi-Fi
   network, and apply or revert the CIS hardening subset
   (`scripts/host-action.sh`).
 - **Open a remote console.** The default is a restricted console limited to a
