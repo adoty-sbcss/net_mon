@@ -46,8 +46,9 @@ def _bash() -> str:
 
 # State files (all under $ST):
 #   links  "name kind vid parent"   kind is vlan|eth; vid/parent "-" for eth
-#   cons   "con ifname parent vid addrs"   addrs "-" for DHCP
+#   cons   "con ifname parent vid addrs [type]"   "-" = empty; type defaults to vlan
 #   noroute    present => no default route
+#   route-back-after   N: the route comes back after N one-second sleeps
 #   calls      every mutating stub call, for assertions
 STUBS = r'''
 set -uo pipefail
@@ -55,7 +56,13 @@ SUDO=""
 log()  { printf 'LOG %s\n' "$*"; }
 ok()   { printf 'OK %s\n' "$*"; }
 warn() { printf 'WARN %s\n' "$*"; }
-sleep() { :; }
+sleep() {
+    local n
+    if [[ -e "$ST/route-back-after" ]]; then
+        n=$(( $(cat "$ST/route-back-after") - 1 ))
+        if (( n <= 0 )); then rm -f "$ST/route-back-after" "$ST/noroute"; else echo "$n" > "$ST/route-back-after"; fi
+    fi
+}
 install() {  # install -m 600 -o root -g root SRC DST
     local a=("$@"); cp "${a[-2]}" "${a[-1]}"
 }
@@ -117,11 +124,11 @@ netplan() {
 nmcli() {
     case "$*" in
         "-g NAME con show") awk '{print $1}' "$ST/cons" ;;
-        "-g connection.interface-name,vlan.parent,vlan.id,ipv4.addresses con show "*)
-            local c="${*: -1}" ifn par vid adr
-            read -r _ ifn par vid adr < <(awk -v c="$c" '$1==c' "$ST/cons") || return 10
-            [[ "$adr" == "-" ]] && adr=""
-            printf '%s\n%s\n%s\n%s\n' "$ifn" "$par" "$vid" "$adr" ;;
+        "-g connection.type,connection.interface-name,vlan.parent,vlan.id,ipv4.addresses con show "*)
+            local c="${*: -1}" ifn par vid adr typ v
+            read -r _ ifn par vid adr typ < <(awk -v c="$c" '$1==c' "$ST/cons") || return 10
+            for v in ifn par vid adr; do [[ "${!v}" == "-" ]] && printf -v "$v" '%s' ''; done
+            printf '%s\n%s\n%s\n%s\n%s\n' "${typ:-vlan}" "$ifn" "$par" "$vid" "$adr" ;;
         "con delete "*)
             local c="${*: -1}"
             echo "nmcli con delete $c" >> "$ST/calls"
@@ -366,13 +373,16 @@ def test_remove_never_deletes_a_non_vlan_or_mismatched_or_uplink_device(tmp_path
     assert "still present after removal" in out
 
 
-def test_remove_never_deletes_a_non_vlan_device_an_nm_connection_names(tmp_path) -> None:
-    # No VLAN id to cross-check here (the connection carries none), so the 802.1Q
-    # kind check is the only thing between a bad record and the parent NIC.
+def test_remove_leaves_a_netmon_named_profile_that_is_not_a_netmon_vlan(tmp_path) -> None:
+    # The name prefix alone is not ownership: an admin's ethernet profile that
+    # happens to be called netmon-vlan10 (here the uplink), and a VLAN profile whose
+    # id disagrees with its name, are both left alone — profile AND device.
+    cons = "netmon-vlan10 eth0 - - - 802-3-ethernet\nnetmon-vlan50 eth0.51 eth0 51 -\n"
     out, st = _run(tmp_path, 'remove_vlan_interfaces_headless; echo "RC=$?"', backend="nm",
-                   cons="netmon-vlan50 eth1 - - -\n")
+                   cons=cons, links="eth0.51 vlan 51 eth0\n")
+    assert "nmcli con delete" not in st["calls"]
     assert "ip link delete" not in st["calls"]
-    assert "netmon-vlan50" not in st["cons"]
+    assert st["cons"] == cons
     assert "RC=1" in out
 
 
@@ -469,3 +479,92 @@ def test_checkin_interface_list_tags_bounded_names_with_their_vlan(monkeypatch, 
     monkeypatch.setattr(interfaces, "primary_interface", lambda: LONG)
     got = {i["name"]: i["vlan"] for i in checkin._interfaces()}
     assert got == {LONG: None, "vlan10": 10, "eth0.20": 20}
+
+
+# --- review round 1: identity, empty-ish lists, route timing, fail-closed backup ----
+
+
+def test_remove_does_not_delete_a_same_named_device_on_another_parent(tmp_path) -> None:
+    # Our records: vlan10 (VLAN 10) on LONG, vlan20 on LONG. The kernel: an admin's
+    # vlan10 / vlan20 with the same ids on other parents. Not ours.
+    old = _netplan_old([("vlan10", 10, LONG)])
+    cons = f"netmon-vlan20 vlan20 {LONG} 20 -\n"
+    links = "vlan10 vlan 10 eth0\nvlan20 vlan 20 eth1\n"
+    out, st = _run(tmp_path, 'remove_vlan_interfaces_headless; echo "RC=$?"', backend="nm",
+                   netplan_file=old, cons=cons, links=links)
+    assert "ip link delete" not in st["calls"]
+    assert _vlan_links(st) == {("vlan10", "10", "eth0"), ("vlan20", "20", "eth1")}
+    assert "RC=0" in out, out   # ours are gone; the others were never ours
+
+
+def test_apply_does_not_count_a_foreign_same_named_device_as_up(tmp_path) -> None:
+    # An admin's vlan10 on eth0 blocks NetMon's vlan10 on LONG; the old name-only
+    # presence check reported that as success.
+    out, st = _run(tmp_path, f'apply_vlan_netplan_headless {LONG} 10; echo "RC=$?"', backend="nm",
+                   links="vlan10 vlan 10 eth0\n")
+    assert "RC=1" in out
+    assert "did not come up: vlan10" in out
+    assert ("vlan10", "10", "eth0") in _vlan_links(st)
+
+
+@pytest.mark.parametrize("vlans", [",", "0", "4095", ",,0,"])
+@pytest.mark.parametrize("backend", ["nm", "networkd"])
+def test_a_list_with_no_valid_vlan_id_is_refused_not_applied_as_empty(tmp_path, vlans, backend) -> None:
+    old = _netplan_old([("eth0.10", 10, "eth0")])
+    cons = "netmon-vlan20 eth0.20 eth0 20 -\n"
+    out, st = _run(tmp_path, f'apply_vlan_netplan_headless eth0 "{vlans}"; echo "RC=$?"', backend=backend,
+                   netplan_file=old, cons=cons, links="eth0.10 vlan 10 eth0\neth0.20 vlan 20 eth0\n")
+    assert "RC=1" in out
+    assert st["calls"] == ""
+    assert st["plan"] == old and st["cons"] == cons
+
+
+def test_a_slow_dhcp_lease_on_the_uplink_is_not_a_lost_route(tmp_path) -> None:
+    # netplan apply re-runs DHCP on the uplink; the route is back after 5 s.
+    old = _netplan_old([("eth0.10", 10, "eth0")])
+    body = 'echo 5 > "$ST/route-back-after"; remove_vlan_interfaces_headless; echo "RC=$?"'
+    out, st = _run(tmp_path, body, backend="networkd", netplan_file=old,
+                   links="eth0.10 vlan 10 eth0\n", flags=("apply-drops-route",))
+    assert "RC=0" in out, out
+    assert "RESTORING" not in out
+    assert not st["plan_exists"]
+
+
+def test_apply_reverts_to_no_netmon_vlans_when_the_route_is_lost(tmp_path) -> None:
+    out, st = _run(tmp_path, 'apply_vlan_netplan_headless eth0 10,20; echo "RC=$?"', backend="networkd",
+                   flags=("apply-drops-route",))
+    assert "RC=1" in out
+    assert "REVERTING" in out
+    assert not st["plan_exists"]
+    assert _vlan_links(st) == set()
+
+
+def test_apply_reverts_nm_vlans_when_the_route_is_lost(tmp_path) -> None:
+    body = 'touch "$ST/delete-drops-route"; apply_vlan_netplan_headless eth0 10; echo "RC=$?"'
+    out, st = _run(tmp_path, body, backend="nm", cons="netmon-vlan20 eth0.20 eth0 20 -\n",
+                   links="eth0.20 vlan 20 eth0\n")
+    assert "RC=1" in out
+    assert "REVERTING" in out
+    assert "netmon-vlan10" not in st["cons"]
+    assert _vlan_links(st) == set()
+
+
+def test_remove_fails_closed_when_the_backup_cannot_be_made(tmp_path) -> None:
+    old = _netplan_old([("eth0.10", 10, "eth0")])
+    out, st = _run(tmp_path, 'mktemp() { return 1; }; remove_vlan_interfaces_headless; echo "RC=$?"',
+                   backend="networkd", netplan_file=old, links="eth0.10 vlan 10 eth0\n")
+    assert "RC=1" in out
+    assert st["plan"] == old
+    assert st["calls"] == ""
+    assert _vlan_links(st) == {("eth0.10", "10", "eth0")}
+
+
+def test_remove_leaves_a_netmon_vlan_profile_whose_device_is_the_uplink(tmp_path) -> None:
+    # A genuine VLAN profile, id matching its name — but its device carries the
+    # default route. Deleting the profile would deactivate the uplink.
+    cons = "netmon-vlan5 eth0.5 eth0 5 -\n"
+    out, st = _run(tmp_path, 'remove_vlan_interfaces_headless; echo "RC=$?"', backend="nm",
+                   cons=cons, links="eth0.5 vlan 5 eth0\n", uplink="eth0.5")
+    assert "nmcli con delete" not in st["calls"]
+    assert st["cons"] == cons
+    assert "RC=1" in out

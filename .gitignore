@@ -24,3 +24,6 @@ config/provisioning.env
 build/
 dist/
 __pycache__/
+
+# test_config_apply_integrity.py writes these into the cwd
+.test-applied-config-*
