@@ -125,6 +125,11 @@ nmcli() {
     case "$*" in
         "-g NAME con show")
             [[ -e "$ST/list-fails" ]] && return 8
+            if [[ -e "$ST/list-ok-count" ]]; then
+                local k; k=$(cat "$ST/list-ok-count")
+                (( k <= 0 )) && return 8
+                echo $(( k - 1 )) > "$ST/list-ok-count"
+            fi
             awk '{print $1}' "$ST/cons" ;;
         "-g connection.type,connection.interface-name,vlan.parent,vlan.id,ipv4.addresses con show "*)
             local c="${*: -1}" ifn par vid adr typ v
@@ -653,4 +658,40 @@ def test_remove_with_networkmanager_stopped_but_profiles_saved_is_not_clean(tmp_
 def test_remove_with_networkmanager_stopped_and_nothing_saved_is_clean(tmp_path) -> None:
     out, st = _run(tmp_path, 'remove_vlan_interfaces_headless; echo "RC=$?"', backend="networkd",
                    flags=("list-fails",))
+    assert "RC=0" in out, out
+
+
+# --- review round 4: absence must be proven; keyfiles checked without nmcli ----------
+
+
+def test_apply_does_not_count_an_uninspectable_stale_profile_as_removed(tmp_path) -> None:
+    cons = "netmon-vlan20 eth0.20 eth0 20 -\n"
+    out, st = _run(tmp_path, 'apply_vlan_netplan_headless eth0 10; echo "RC=$?"', backend="nm",
+                   cons=cons, links="eth0.20 vlan 20 eth0\n", flags=("inspect-fails",))
+    assert "RC=1" in out
+    assert "removed stale VLAN connection netmon-vlan20" not in out
+    assert "netmon-vlan20" in st["cons"]
+
+
+def test_remove_needs_a_successful_relisting_to_call_a_profile_gone(tmp_path) -> None:
+    # The first listing works; inspection fails; the re-listing fails too.
+    cons = "netmon-vlan20 eth0.20 eth0 20 -\n"
+    body = 'echo 1 > "$ST/list-ok-count"; remove_vlan_interfaces_headless; echo "RC=$?"'
+    out, st = _run(tmp_path, body, backend="nm", cons=cons, links="eth0.20 vlan 20 eth0\n",
+                   flags=("inspect-fails",))
+    assert "RC=1" in out
+    assert "could not inspect NM connection netmon-vlan20" in out
+
+
+def test_remove_checks_saved_keyfiles_even_without_nmcli(tmp_path) -> None:
+    body = ('command() { [[ "$1" == "-v" && "$2" == "nmcli" ]] && return 1; builtin command "$@"; }; touch "$NETMON_NM_CONN_DIR/netmon-vlan20.nmconnection"; '
+            'remove_vlan_interfaces_headless; echo "RC=$?"')
+    out, st = _run(tmp_path, body, backend="networkd")
+    assert "RC=1" in out
+    assert "not running but NetMon VLAN profiles are saved" in out
+
+
+def test_remove_without_nmcli_or_keyfiles_is_clean(tmp_path) -> None:
+    out, st = _run(tmp_path, 'command() { [[ "$1" == "-v" && "$2" == "nmcli" ]] && return 1; builtin command "$@"; }; remove_vlan_interfaces_headless; echo "RC=$?"',
+                   backend="networkd")
     assert "RC=0" in out, out
