@@ -35,6 +35,11 @@ Rules that each exist because the alternative lies:
   the worst a tampered list can do is make the box ping a host. An invalid list is
   refused whole — the old one is kept — and the refusal is reported with the
   version that was refused. The stored list is re-validated on every read.
+* **Own school first.** The list mixes this school's devices with other sites'
+  (``peer: true``, plus every ``sensor:`` key — another sensor's own address).
+  Own devices are probed first and peers after, so a cycle that runs out of budget
+  skips other sites, never this school's core. Peers get ONE packet with a 2 s
+  deadline: they are many, and the two-round debounce above still applies.
 * **Delivery.** The report is written BEFORE the state, so a kill between the two
   (the nightly container recreate, a power cut) can duplicate an edge but never
   lose one. Every event carries a per-box increasing ``seq`` so the dashboard can
@@ -123,8 +128,17 @@ def validate_targets(raw: Any) -> tuple[list[dict], str | None]:
         if key in seen:
             continue
         seen.add(key)
-        out.append({"key": key, "ip": ip, "label": label[:MAX_LABEL]})
+        target: dict[str, Any] = {"key": key, "ip": ip, "label": label[:MAX_LABEL]}
+        # Only a literal true marks a peer; anything else is an own-school target.
+        if t.get("peer") is True:
+            target["peer"] = True
+        out.append(target)
     return out, None
+
+
+def is_peer(t: dict) -> bool:
+    """Another site's device, or another sensor (``sensor:<id>``): probed after own targets, one packet."""
+    return t.get("peer") is True or str(t.get("key", "")).startswith("sensor:")
 
 
 # --- the pure state machine --------------------------------------------------------
@@ -299,9 +313,12 @@ def accept_targets(watch: Any) -> None:
         return
     current = _read_json(TARGETS_FILE) or {}
     version = watch.get("version")
-    if version is not None and current.get("version") == version and not current.get("refused"):
-        return
     targets, refusal = validate_targets(watch.get("targets"))
+    # Same version AND the same validated content: nothing to write. The content
+    # check matters across an upgrade: an older box stored this version with the
+    # fields it knew (no ``peer``), and the version alone would keep that copy.
+    if version is not None and current.get("version") == version and not current.get("refused") and not refusal and current.get("targets") == targets:
+        return
     if refusal:
         _write_json_atomic(TARGETS_FILE, {**current, "refused": refusal, "refused_version": version})
         return
@@ -329,18 +346,30 @@ def _ping(ip: str) -> bool:
     return res.returncode == 0
 
 
+def _ping_once(ip: str) -> bool:
+    # Peers: one packet, a 2 s deadline for the whole ping. IP literals only, see above.
+    try:
+        res = subprocess.run(["ping", "-n", "-c", "1", "-w", "2", ip], capture_output=True, text=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    return res.returncode == 0
+
+
 def probe_all(targets: list[dict], budget_s: float = CYCLE_BUDGET_S) -> dict[str, bool | None]:
     """Ping every target in parallel within ``budget_s``; unfinished → None (skipped).
 
-    Not-started pings are cancelled at the deadline; the ≤16 in flight are each
-    capped at 6 s by their own subprocess timeout, so the overrun is bounded.
+    Own-school targets are submitted first and peers after (the pool starts work in
+    submission order), so the deadline cancels peers before own devices. Not-started
+    pings are cancelled at the deadline; the ≤16 in flight are each capped at 6 s by
+    their own subprocess timeout, so the overrun is bounded.
     """
     results: dict[str, bool | None] = {t["key"]: None for t in targets}
     if not targets:
         return results
+    ordered = [t for t in targets if not is_peer(t)] + [t for t in targets if is_peer(t)]
     pool = ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(targets)))
     try:
-        futs = {pool.submit(_ping, t["ip"]): t["key"] for t in targets}
+        futs = {pool.submit(_ping_once if is_peer(t) else _ping, t["ip"]): t["key"] for t in ordered}
         done, _not_done = wait(futs, timeout=budget_s)
         for f in done:
             try:
