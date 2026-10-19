@@ -361,3 +361,59 @@ def test_a_successful_checkin_clears_what_it_carried(monkeypatch, tmp_path):
     checkin.run_checkin()
     assert bodies[0]["watch"]["cycles"] == 1
     assert watch.pending_report()["cycles"] == 1, "cleared after the POST, then this cycle's fresh report"
+
+
+# --- MON-7: own school first, peers with one packet ------------------------------------
+
+
+def test_peer_flag_is_kept_only_when_literally_true():
+    out, refused = watch.validate_targets(
+        [
+            {"key": "switch:1", "ip": "10.0.0.1"},
+            {"key": "switch:2", "ip": "10.0.0.2", "peer": True},
+            {"key": "switch:3", "ip": "10.0.0.3", "peer": "yes"},
+            {"key": "switch:4", "ip": "10.0.0.4", "peer": 1},
+        ]
+    )
+    assert refused is None
+    assert [t.get("peer") for t in out] == [None, True, None, None]
+    assert [watch.is_peer(t) for t in out] == [False, True, False, False]
+    assert watch.is_peer({"key": "sensor:9", "ip": "10.0.0.9"}), "another sensor is always watched from outside"
+
+
+def test_own_targets_are_probed_first_and_peers_with_one_packet(monkeypatch):
+    order: list[tuple[str, str]] = []
+    monkeypatch.setattr(watch, "MAX_WORKERS", 1)  # one worker: submission order is execution order
+    monkeypatch.setattr(watch, "_ping", lambda ip: order.append(("two", ip)) or True)
+    monkeypatch.setattr(watch, "_ping_once", lambda ip: order.append(("one", ip)) or True)
+    targets = [
+        {"key": "switch:9", "ip": "10.9.0.2", "label": "", "peer": True},
+        {"key": "sensor:7", "ip": "10.9.0.5", "label": ""},
+        {"key": "switch:1", "ip": "10.0.0.2", "label": ""},
+        {"key": "host:2", "ip": "10.0.0.3", "label": ""},
+    ]
+    results = watch.probe_all(targets)
+    assert all(results.values())
+    assert order == [("two", "10.0.0.2"), ("two", "10.0.0.3"), ("one", "10.9.0.2"), ("one", "10.9.0.5")]
+
+
+def test_ping_once_argv(monkeypatch):
+    seen: list[list[str]] = []
+
+    class R:
+        returncode = 0
+
+    monkeypatch.setattr(watch.subprocess, "run", lambda argv, **kw: seen.append(argv) or R())
+    assert watch._ping_once("10.0.0.1") is True
+    assert seen == [["ping", "-n", "-c", "1", "-w", "2", "10.0.0.1"]]
+
+
+def test_a_stored_peer_flag_survives_the_reread(files, monkeypatch):
+    watch.accept_targets({"version": 7, "targets": [{"key": "switch:1", "ip": "10.0.0.2"}, {"key": "switch:9", "ip": "10.9.0.2", "peer": True}]})
+    stored = json.loads(watch.TARGETS_FILE.read_text(encoding="utf-8"))["targets"]
+    assert stored[1].get("peer") is True and "peer" not in stored[0]
+    calls: list[str] = []
+    monkeypatch.setattr(watch, "_ping", lambda ip: calls.append("two:" + ip) or True)
+    monkeypatch.setattr(watch, "_ping_once", lambda ip: calls.append("one:" + ip) or True)
+    watch.run_cycle(lambda: None)
+    assert "one:10.9.0.2" in calls and "two:10.0.0.2" in calls
