@@ -313,9 +313,12 @@ def accept_targets(watch: Any) -> None:
         return
     current = _read_json(TARGETS_FILE) or {}
     version = watch.get("version")
-    if version is not None and current.get("version") == version and not current.get("refused"):
-        return
     targets, refusal = validate_targets(watch.get("targets"))
+    # Same version AND the same validated content: nothing to write. The content
+    # check matters across an upgrade: an older box stored this version with the
+    # fields it knew (no ``peer``), and the version alone would keep that copy.
+    if version is not None and current.get("version") == version and not current.get("refused") and not refusal and current.get("targets") == targets:
+        return
     if refusal:
         _write_json_atomic(TARGETS_FILE, {**current, "refused": refusal, "refused_version": version})
         return

@@ -176,8 +176,13 @@ def test_a_refused_list_keeps_the_previous_targets_and_reports_the_refusal(files
 def test_same_version_is_not_rewritten(files):
     watch.accept_targets({"version": 5, "targets": T})
     before = watch.TARGETS_FILE.stat().st_mtime_ns
-    watch.accept_targets({"version": 5, "targets": T[:1]})
+    watch.accept_targets({"version": 5, "targets": T})
     assert watch.TARGETS_FILE.stat().st_mtime_ns == before
+    # The version is the dashboard's content hash; the same version with different
+    # content is only an older box's copy of it (MON-7: fields it did not know) — the
+    # dashboard's list wins.
+    watch.accept_targets({"version": 5, "targets": T[:1]})
+    assert len(json.loads(watch.TARGETS_FILE.read_text(encoding="utf-8"))["targets"]) == 1
 
 
 def test_a_cycle_accumulates_until_cleared(files, monkeypatch):
@@ -417,3 +422,17 @@ def test_a_stored_peer_flag_survives_the_reread(files, monkeypatch):
     monkeypatch.setattr(watch, "_ping_once", lambda ip: calls.append("one:" + ip) or True)
     watch.run_cycle(lambda: None)
     assert "one:10.9.0.2" in calls and "two:10.0.0.2" in calls
+
+
+def test_an_upgraded_box_picks_up_peer_flags_under_the_same_version(files):
+    # Codex F1: the OLD collector stored this version without `peer` (it dropped the field).
+    watch.TARGETS_FILE.write_text(
+        json.dumps({"version": "v1", "targets": [{"key": "switch:1", "ip": "10.0.0.2", "label": ""}, {"key": "switch:9", "ip": "10.9.0.2", "label": ""}], "refused": None, "refused_version": None}),
+        encoding="utf-8",
+    )
+    watch.accept_targets({"version": "v1", "targets": [{"key": "switch:1", "ip": "10.0.0.2"}, {"key": "switch:9", "ip": "10.9.0.2", "peer": True}]})
+    stored = json.loads(watch.TARGETS_FILE.read_text(encoding="utf-8"))["targets"]
+    assert stored[1].get("peer") is True
+    before = watch.TARGETS_FILE.stat().st_mtime_ns
+    watch.accept_targets({"version": "v1", "targets": [{"key": "switch:1", "ip": "10.0.0.2"}, {"key": "switch:9", "ip": "10.9.0.2", "peer": True}]})
+    assert watch.TARGETS_FILE.stat().st_mtime_ns == before, "same version and content: not rewritten"
