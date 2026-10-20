@@ -264,7 +264,7 @@ def test_a_sub_interface_that_never_appears_is_a_failure_not_success(tmp_path) -
     out, st = _run(tmp_path, 'apply_vlan_netplan_headless eth0 10; echo "RC=$?"',
                    backend="nm", links="office10 vlan 10 eth0\n")
     assert "RC=1" in out
-    assert "did not come up: eth0.10" in out
+    assert "not up: eth0.10" in out
     assert ("office10", "10", "eth0") in _vlan_links(st)  # foreign device untouched
 
 
@@ -513,7 +513,7 @@ def test_apply_does_not_count_a_foreign_same_named_device_as_up(tmp_path) -> Non
     out, st = _run(tmp_path, f'apply_vlan_netplan_headless {LONG} 10; echo "RC=$?"', backend="nm",
                    links="vlan10 vlan 10 eth0\n")
     assert "RC=1" in out
-    assert "did not come up: vlan10" in out
+    assert "not up: vlan10" in out
     assert ("vlan10", "10", "eth0") in _vlan_links(st)
 
 

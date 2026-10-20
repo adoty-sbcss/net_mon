@@ -418,7 +418,7 @@ _apply_vlan_nmcli() {
     local missing
     missing="$(_vlan_missing_links <<< "$wanted")"
     if [[ -n "$missing" ]]; then
-        warn "VLAN sub-interface(s) did not come up: ${missing} (a parent with no link yet comes up when it is cabled)"
+        warn "VLAN sub-interface(s) not up: ${missing}. Either the VLAN got no DHCP lease (NetworkManager tears it down until its next retry: check the switch port carries it with a DHCP server, or give it a static IP), or another device already holds that VLAN id on ${parent}."
         return 1
     fi
     ok "VLAN sub-interfaces up via NetworkManager on ${parent} (${vids// /,}); the collector scans them within a poll tick (~30s)."
