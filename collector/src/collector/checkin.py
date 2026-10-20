@@ -921,6 +921,7 @@ _HOST_ACTIONS: set[str] = {
     "host-reboot",    # systemctl reboot the box
     "host-rollback",  # scripts/rollback.sh -> last-known-good SHA + image + DB
     "host-apply-vlan", # apply NETMON_TRUNK_* netplan sub-interfaces (lib/trunk.sh)
+    "host-remove-vlan", # remove only the VLAN sub-interfaces NetMon created (lib/trunk.sh; guarded)
     "host-wifi-join",  # join NETMON_WIFI_JOIN_* on the analysis radio (lib/wifi.sh, routes-off)
     "host-wifi-leave", # tear down all netmon-owned Wi-Fi connections (lib/wifi.sh)
     "host-wifi-experience", # WIFI-3 client-experience battery (join->measure->leave)
@@ -2573,8 +2574,9 @@ def _interfaces() -> list[dict]:
         for st in iface_mod.snapshot(
             exclude_prefixes=("lo", "docker", "br-", "veth", "virbr", "tun", "tap")
         ):
-            parent, _, tag = st.name.rpartition(".")
-            vlan = int(tag) if parent and tag.isdigit() and 1 <= int(tag) <= 4094 else None
+            # From the kernel, not the name: a trunk sub-interface on a long parent
+            # is named vlan<id> (lib/trunk.sh vlan_child_name), not <parent>.<id>.
+            vlan, _ = iface_mod.vlan_of(st.name)
             out.append(
                 {
                     "name": st.name,
