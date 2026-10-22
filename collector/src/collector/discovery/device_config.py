@@ -17,9 +17,13 @@ Security / robustness posture (mirrors dhcp_server.py):
     records a status/error and never crashes the poll loop.
   * Bounded by a per-device SSH timeout AND a whole-pass wall-clock budget.
   * netmiko is imported lazily so a box without the dep (feature off) imports clean.
-  * READ-ONLY: only `show`-class commands are ever sent and enable/config mode is
-    NEVER entered — the contract is a show-only account (IOS parser view /
-    NX-OS network-operator / AOS-CX operators). See the SEC threat model.
+  * READ-ONLY: only `show`-class commands are ever sent and config mode is NEVER
+    entered — the contract is a show-only account (IOS parser view / NX-OS
+    network-operator / AOS-CX operators / ICX `privilege 5`). See the SEC threat
+    model. Enable mode is NEVER entered EXCEPT on Ruckus ICX, where `show
+    running-config` exists only in privileged EXEC; there it is entered once, with
+    the same credential, and a read-only account stays read-only. See
+    _icx_connection_class.
   * REDACTION: secrets (snmp communities, local password hashes, enable secret,
     radius/tacacs keys, PSKs, private-key blocks) are masked with a deterministic
     keyed token BEFORE the config is written, so the plaintext secret never leaves
@@ -73,8 +77,9 @@ _MAX_CONFIG_BYTES = 4 * 1024 * 1024
 
 # Per-platform fetch commands (netmiko device_type -> running / startup show cmds).
 # netmiko disables paging automatically in session_preparation, and we NEVER enter
-# enable/config mode. Juniper/EXOS have no separate startup (single committed/running
-# config), so startup is None there.
+# config mode (enable only on ICX — see _icx_connection_class). Juniper/EXOS have no
+# separate startup (single committed/running config), so startup is None there.
+# ICX (FastIron) is Cisco-like, but `show configuration` is its STARTUP config.
 _PLATFORM_CMDS: dict[str, dict[str, str | None]] = {
     "cisco_ios": {"running": "show running-config", "startup": "show startup-config"},
     "cisco_xe": {"running": "show running-config", "startup": "show startup-config"},
@@ -85,6 +90,7 @@ _PLATFORM_CMDS: dict[str, dict[str, str | None]] = {
     "ubiquiti_edgeswitch": {"running": "show running-config", "startup": "show startup-config"},
     "netgear_prosafe": {"running": "show running-config", "startup": "show startup-config"},
     "extreme_exos": {"running": "show configuration", "startup": None},
+    "ruckus_fastiron": {"running": "show running-config", "startup": "show configuration"},
 }
 
 
@@ -214,6 +220,28 @@ _REDACT_PATTERNS = [
         r"^(\s*configure snmpv3 add user .*?\bprivacy (?:(?:3?des|aes\d*) )?(?:privacy-encrypted |encrypted )?(?:localized-key |hex )?)(?P<sec>\"[^\"]*\"|\S+)",
         r"(\bshared-secret (?:encrypted )?)(?P<sec>\"[^\"]*\"|\S+)",
         r"(\bsimple-password )(?P<sec>\"[^\"]*\"|[^\s;]+)",
+        # -- Ruckus / Brocade ICX (FastIron) --
+        # FastIron prints most secrets as `<type-digit> <value>`: `8 $1$salt$hash`
+        # (md5-crypt, which _DOLLAR_RE already claims) or `2 $<base64>` — a
+        # REVERSIBLE encoding with public decoders and NO second `$`, so _DOLLAR_RE
+        # does not see it. The Cisco-shaped patterns above mask the type DIGIT as if it
+        # were the secret (`snmp-server community 2 $x ro` -> the `2`) and the real
+        # value would be left to the backstop — the FASTPATH failure shape. Hence the
+        # digit-aware forms here, plus a catch-all for ANY `<digit> $blob` pair below.
+        r"^(\s*enable (?:super-user|read-only|port-config)-password (?:[0-9] )?)(?P<sec>.+?)\s*$",
+        r"^(\s*enable telnet password )(?P<sec>.+?)\s*$",
+        r"^(\s*snmp-server community [0-9] )(?P<sec>\"[^\"]*\"|\S+)",
+        r"^(\s*snmp-server host \S+ version v(?:1|2c) (?:[0-9] )?)(?P<sec>\"[^\"]*\"|\S+)",
+        r"(\bsnmp-server user .*?\bpriv encrypted (?:des|aes\S*) )(?P<sec>\S+)",
+        r"(\bmd5-authentication key-id \d+ key (?:[0-9] )?)(?P<sec>\S+)",
+        r"(\bauth-type (?:simple-text-auth|md5-auth) (?:[0-9] )?)(?P<sec>\S+)",
+        r"^(\s*authentication-key key-id \d+ (?:md5|sha1|sha256) (?:[0-9] )?)(?P<sec>\S+)",
+        r"^(\s*mac-authentication password-override )(?P<sec>\S+)",
+        # Any `<type-digit> $<blob>` pair, on any command: the ICX encoded form is
+        # always written this way, so a command this list has never heard of still
+        # masks. Unanchored on purpose; on other vendors it only ever re-claims a
+        # `5 $1$...` hash _DOLLAR_RE already masked.
+        r"((?:^|\s)[0-9] )(?P<sec>\$[^\s\"';]+)",
         # -- Juniper Junos (set-form) --
         r"^(\s*set .*\bencrypted-password )(?P<sec>\"[^\"]*\"|\S+)",
         r"^(\s*set .*\bsecret )(?P<sec>\"[^\"]*\"|\S+)",
@@ -436,6 +464,91 @@ def _redact_key() -> bytes:
 # ---------------------------------------------------------------------------
 
 
+class IcxEnableRejected(Exception):
+    """ICX signed us in, then refused privileged (enable) mode for the credential."""
+
+
+class IcxNoEnableAccess(Exception):
+    """ICX signed us in, but offers no way into privileged mode for this account."""
+
+
+def _icx_connection_class() -> Any:
+    """netmiko's FastIron driver with ONE enable attempt instead of three.
+
+    `show running-config` exists only in ICX privileged EXEC, so the stock driver's
+    session_preparation always runs `enable`. Its enable() retries a rejected
+    password up to three times per device, and the failure surfaces as a ValueError
+    raised before ConnectHandler returns — which classify_exception cannot tell from
+    any other pre-auth error, so the auth breaker never counts it. A district-wide
+    enable mismatch would be three failed logins per switch, all night, uncounted:
+    exactly the lockout the breaker exists to prevent.
+
+    Here: one attempt, using the SSH credential itself (netmiko answers ICX's
+    `User Name:` prompt with the username, then `secret`). That is the supported
+    setup — `aaa authentication enable default local` (enable re-checks the same
+    account) or `aaa authentication login privilege-mode` (the account lands in
+    privileged mode and nothing is sent). A rejection raises IcxEnableRejected, which
+    _fetch_one reports as stage `auth` so the breaker counts it.
+    """
+    from netmiko.ruckus import RuckusFastironSSH  # lazy, like ConnectHandler
+
+    class _IcxReadOnlySSH(RuckusFastironSSH):  # type: ignore[misc]
+        def enable(
+            self,
+            cmd: str = "enable",
+            pattern: str = r"(?:ssword|User Name|Login|No password has been assigned)",
+            enable_pattern: str | None = None,
+            check_state: bool = True,
+            re_flags: int = re.IGNORECASE,
+        ) -> str:
+            if check_state and self.check_enable_mode():
+                return ""
+            self.write_channel(self.normalize_cmd(cmd))
+            out = str(self.read_until_prompt_or_pattern(
+                pattern=pattern, re_flags=re_flags, read_entire_line=True))
+            if "No password has been assigned" in out:
+                raise IcxNoEnableAccess("no enable path for this account")
+            if "User Name" in out or "Login" in out:
+                self.write_channel(self.normalize_cmd(self.username))
+                out = str(self.read_until_prompt_or_pattern(
+                    pattern=pattern, re_flags=re_flags, read_entire_line=True))
+            if "ssword" in out:
+                self.write_channel(self.normalize_cmd(self.secret))
+                self.read_until_prompt(read_entire_line=True)
+            if not self.check_enable_mode():
+                raise IcxEnableRejected("enable refused")
+            return ""
+
+    return _IcxReadOnlySSH
+
+
+def _connect(platform: str, **kwargs: Any) -> Any:
+    """Open a netmiko session for `platform` (ICX gets its one-attempt driver)."""
+    if platform == "ruckus_fastiron":
+        return _icx_connection_class()(device_type=platform, secret=kwargs.get("password", ""), **kwargs)
+    from netmiko import ConnectHandler
+
+    return ConnectHandler(device_type=platform, **kwargs)
+
+
+# FastIron prints a header above the config — `Current configuration:` for running,
+# `Startup-config data location is flash memory` / `Startup configuration:` and
+# extra `!` separators for startup. They name the COMMAND, not the config, so left in
+# they make every ICX read as permanently drifted (the ArubaOS-CX banner bug). The
+# config proper always opens with its `ver <release>` line.
+_ICX_VER_RE = re.compile(r"^ver\s+\S", re.M)
+
+
+def _strip_icx_preamble(text: str | None) -> str | None:
+    """Drop everything above the `ver` line (only if it is in the first 20 lines)."""
+    if not text:
+        return text
+    m = _ICX_VER_RE.search(text)
+    if m is None or text.count("\n", 0, m.start()) > 20:
+        return text
+    return text[m.start():]
+
+
 def _fetch_one(
     target: dict[str, Any],
     *,
@@ -495,7 +608,7 @@ def _fetch_one(
     port = int(target.get("port") or 22)
 
     try:
-        from netmiko import ConnectHandler  # lazy: only when a device is fetched
+        import netmiko  # noqa: F401 — lazy: only when a device is fetched
     except Exception as exc:  # pragma: no cover — dep-missing guard
         # The detail goes to the log, not the payload: this result renders in a
         # browser, and "only codes and numbers" has no useful exceptions.
@@ -507,8 +620,8 @@ def _fetch_one(
     startup: str | None = None
     authenticated = False
     try:
-        conn = ConnectHandler(
-            device_type=platform,
+        conn = _connect(
+            platform,
             host=host,
             port=port,
             username=user,
@@ -528,6 +641,16 @@ def _fetch_one(
                 startup = str(conn.send_command(start_cmd, read_timeout=ssh_timeout * 2))
             except Exception:  # noqa: BLE001 — startup is optional (may be unset)
                 startup = None
+    except IcxEnableRejected:
+        # Signed in, then enable refused the same credential. Stage `auth` on purpose:
+        # it IS a failed login attempt on the device, so the breaker must count it.
+        log.info("device ssh failed", host=host, stage="auth", code="auth.enable_rejected")
+        return _fail("auth", "auth.enable_rejected")
+    except IcxNoEnableAccess:
+        # Signed in; the switch has no enable path for this account. No password was
+        # tried, nothing can lock — the account just needs privileged read access.
+        log.info("device ssh failed", host=host, stage="authz", code="authz.no_read_access")
+        return _fail("authz", "authz.no_read_access")
     except Exception as exc:  # noqa: BLE001 — connect / auth / timeout / read
         # Probe liveness ONLY for a pre-auth failure, and only to split the two
         # reach timeouts: "answers but SSH is filtered/off" vs "nothing there at
@@ -547,6 +670,10 @@ def _fetch_one(
     # Signed in, but the account isn't permitted to read the config. The password is
     # RIGHT — the least-privilege role was never applied to this box — and calling
     # this an auth failure sends the operator to rotate working credentials.
+    if platform == "ruckus_fastiron":
+        running = _strip_icx_preamble(running)
+        startup = _strip_icx_preamble(startup)
+
     if ssh_diag.looks_like_authz_denial(running):
         return _fail("authz", "authz.no_read_access")
 

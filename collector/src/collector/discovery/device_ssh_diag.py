@@ -57,6 +57,7 @@ CODES = {
     "auth.rejected": "device rejected the credentials",
     "auth.lockout_suspected": "repeated rejections; account may be locked",
     "auth.aaa_timeout": "auth service never answered (RADIUS/TACACS down?)",
+    "auth.enable_rejected": "signed in, but privileged (enable) mode refused the credential",
     # authz — signed in, but not permitted
     "authz.no_read_access": "signed in, but the account can't read the config",
     # read — the config itself
