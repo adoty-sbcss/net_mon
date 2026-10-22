@@ -503,8 +503,9 @@ class IcxNoEnableAccess(Exception):
     """ICX signed us in, but offers no way into privileged mode for this account."""
 
 
-# A credential prompt the device is waiting at, as the LAST line of its output.
-_ICX_REPROMPT_RE = re.compile(r"(?:ssword|User Name|Login):\s*$", re.I)
+# Credential prompts the device is waiting at, as the LAST line of its output.
+_ICX_USER_PROMPT_RE = re.compile(r"(?:User Name|Login):\s*$", re.I)
+_ICX_PASS_PROMPT_RE = re.compile(r"ssword:\s*$", re.I)
 # How long to wait for the switch to settle after the one enable credential (a
 # RADIUS/TACACS round trip can pause the reply for several seconds).
 _ICX_ENABLE_SETTLE_SEC = 20.0
@@ -521,19 +522,19 @@ def _icx_last_line(text: str) -> str:
 
 
 def _icx_enable_verdict(after: str, base_prompt: str) -> str | None:
-    """Classify the output that followed the enable credential, from its LAST line.
+    """Classify switch output from its LAST line (used at every step of `enable`).
 
-    "priv"     = sitting at the privileged prompt (`<base_prompt>#`): enable worked.
-    "unpriv"   = back at the unprivileged `<base_prompt>>`: refused.
-    "reprompt" = the last line is a credential prompt. Only a refusal if it is STILL
-                 the last line after another quiet read — a banner can arrive in
-                 pieces and pause on "Login:".
-    None       = not settled yet (banner text still arriving, or nothing yet).
+    "priv"   = the last line IS the privileged prompt `<base_prompt>#`.
+    "unpriv" = the last line IS the unprivileged prompt `<base_prompt>>`.
+    "user"   = the last line ends in a username prompt (`User Name:` / `Login:`).
+    "pass"   = the last line ends in a password prompt (`Password:`).
+    None     = not settled (banner / AAA text still arriving, or nothing yet).
 
-    Only the final line is read, and only a whole prompt counts. Everything above it
-    is banner, MOTD or AAA chatter whose words prove nothing: "Authorized login only",
-    "Help with incorrect password: call IT", "Policy #17 denies SSH@sw access" have
-    all been reviewer-constructed false verdicts for a stream-matching approach.
+    Only the final line is read, and only a WHOLE prompt line counts. Everything
+    above it is banner, MOTD or AAA chatter whose words prove nothing — reviewers
+    built false verdicts for every stream-matching variant: "Authorized login only",
+    "Notice: SSH@sw" above a `Password:`, a hostname `SSH@login-switch#`, "Access
+    denied for SSH@sw#", "Policy #17 denies ...".
     """
     last = _icx_last_line(after)
     if not last:
@@ -542,13 +543,14 @@ def _icx_enable_verdict(after: str, base_prompt: str) -> str | None:
     # prompt that arrived with an escape prefix (`\x1b[?25hSSH@sw>`) would otherwise
     # never equal the stripped reply.
     base_prompt = _ANSI_RE.sub("", base_prompt).strip()
-    # The WHOLE line must be the prompt: "Access denied for SSH@sw#" ends with it too.
     if base_prompt and last == base_prompt + "#":
         return "priv"
     if base_prompt and last == base_prompt + ">":
         return "unpriv"
-    if _ICX_REPROMPT_RE.search(last):
-        return "reprompt"
+    if _ICX_PASS_PROMPT_RE.search(last):
+        return "pass"
+    if _ICX_USER_PROMPT_RE.search(last):
+        return "user"
     return None
 
 
@@ -585,83 +587,80 @@ def _icx_connection_class() -> Any:
                 return  # close the transport only (disconnect does that next)
             super().cleanup(command=command)
 
+        def _icx_settle(self) -> tuple[str, str]:
+            """Read without writing until the output settles on a whole prompt line.
+
+            Returns (verdict, text). A credential prompt must STILL be the last line
+            after one more quiet read before it counts (a banner can arrive in pieces
+            and pause on "Login:"). "timeout" after _ICX_ENABLE_SETTLE_SEC or on any
+            read error.
+            """
+            text = ""
+            cred_seen_at = -1
+            deadline = time.monotonic() + _ICX_ENABLE_SETTLE_SEC
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return "timeout", text
+                try:
+                    text += str(self.read_channel_timing(
+                        last_read=1.0, read_timeout=max(1.0, remaining)))
+                except Exception:  # noqa: BLE001 — read timeout / channel error
+                    return "timeout", text
+                verdict = _icx_enable_verdict(text, str(getattr(self, "base_prompt", "")))
+                if verdict in ("priv", "unpriv"):
+                    return verdict, text
+                if verdict in ("user", "pass"):
+                    if cred_seen_at == len(text):  # nothing new since: it is waiting
+                        return verdict, text
+                    cred_seen_at = len(text)
+
         def enable(
             self,
             cmd: str = "enable",
-            pattern: str = r"(?:ssword|User Name|Login|No password has been assigned)",
+            pattern: str = "",
             enable_pattern: str | None = None,
             check_state: bool = True,
             re_flags: int = re.IGNORECASE,
         ) -> str:
+            # Before `enable` we sit at the login prompt, so check_enable_mode()'s
+            # RETURN is harmless here — and nowhere after.
             if check_state and self.check_enable_mode():
                 return ""
-            # Armed BEFORE `enable` is sent, cleared only at a confirmed prompt: any
-            # exception from here on (a read timeout while the switch waits for a
-            # credential included) must leave cleanup() unable to type into it.
+            # Armed BEFORE `enable` is sent, cleared only at a whole prompt line:
+            # any exception from here on must leave cleanup() unable to type into a
+            # waiting credential prompt.
             self._icx_unresolved = True
             self.write_channel(self.normalize_cmd(cmd))
-            out = str(self.read_until_prompt_or_pattern(
-                pattern=pattern, re_flags=re_flags, read_entire_line=True))
-            low = out.lower()
-            asks_user = "user name" in low or "login" in low
-            if "no password has been assigned" in low:
-                # A switch with no super-user password prints this and then GRANTS
-                # privileged mode (the stock driver treats it as success too). No
-                # credential is pending, so the RETURN check_enable_mode() sends is
-                # harmless; a prompt that is still `>` is a dead end.
-                self._icx_unresolved = False
-                if not self.check_enable_mode():
-                    raise IcxNoEnableAccess("no enable path for this account")
-                return ""
-            if asks_user:
-                self.write_channel(self.normalize_cmd(self.username))
-                out = str(self.read_until_prompt_or_pattern(
-                    pattern=pattern, re_flags=re_flags, read_entire_line=True))
-                low = out.lower()
-                if "ssword" not in low:
-                    # Asked for a username and then not for a password: nothing
-                    # sensible to answer, and a RETURN here would be an empty login
-                    # attempt.
-                    raise IcxEnableRejected("no password prompt after the username")
-            if "ssword" in low:
-                self.write_channel(self.normalize_cmd(self.secret))
-                # After the ONE credential nothing more is written — not even the
-                # RETURN check_enable_mode() sends, which at a re-prompt would be a
-                # second (empty) login attempt. Read until the output settles on a
-                # whole prompt line and let that line decide (_icx_enable_verdict).
-                # A device that never settles is a rejection, NOT a reach timeout:
-                # that ReadTimeout would otherwise classify as reach.ssh_timeout,
-                # which the auth breaker never counts.
-                after = ""
-                reprompt_seen_at = -1
-                deadline = time.monotonic() + _ICX_ENABLE_SETTLE_SEC
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise IcxEnableRejected("enable never settled on a prompt")
-                    try:
-                        after += str(self.read_channel_timing(
-                            last_read=1.0, read_timeout=max(1.0, remaining)))
-                    except Exception as exc:  # noqa: BLE001 — read timeout / channel error
-                        raise IcxEnableRejected("no prompt after the enable credential") from exc
-                    verdict = _icx_enable_verdict(after, str(getattr(self, "base_prompt", "")))
-                    if verdict == "priv":
-                        self._icx_unresolved = False
-                        return ""
-                    if verdict == "unpriv":
-                        # Back at `>`: nothing pending, normal cleanup is safe again.
-                        self._icx_unresolved = False
+            sent_user = sent_secret = False
+            while True:
+                verdict, _text = self._icx_settle()
+                if verdict == "priv":
+                    # Includes "No password has been assigned yet..." followed by `#`:
+                    # a switch with no super-user password grants privileged mode.
+                    self._icx_unresolved = False
+                    return ""
+                if verdict == "unpriv":
+                    self._icx_unresolved = False  # at `>`: nothing pending any more
+                    if sent_user or sent_secret:
                         raise IcxEnableRejected("enable refused")
-                    if verdict == "reprompt":
-                        if reprompt_seen_at == len(after):  # nothing new since: waiting
-                            raise IcxEnableRejected("enable re-prompted for a credential")
-                        reprompt_seen_at = len(after)
-            # No credential was asked for, so the read ended at a prompt and the
-            # RETURN check_enable_mode() sends is safe.
-            self._icx_unresolved = False
-            if not self.check_enable_mode():
-                raise IcxEnableRejected("enable refused")
-            return ""
+                    # Back at `>` without being asked for anything: no enable path
+                    # for this account. No credential was offered, nothing can lock.
+                    raise IcxNoEnableAccess("no enable path for this account")
+                if verdict == "user" and not sent_user and not sent_secret:
+                    sent_user = True
+                    self.write_channel(self.normalize_cmd(self.username))
+                    continue
+                if verdict == "pass" and not sent_secret:
+                    # The ONE credential. After it nothing more is written: a second
+                    # prompt is a refusal, never answered.
+                    sent_secret = True
+                    self.write_channel(self.normalize_cmd(self.secret))
+                    continue
+                # A re-prompt, a timeout, or something we will not answer. Always
+                # stage `auth` (the breaker counts it): erring that way can only stop
+                # a run early, never lock an account.
+                raise IcxEnableRejected(f"enable did not complete ({verdict})")
 
     return _IcxReadOnlySSH
 

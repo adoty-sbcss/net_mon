@@ -400,30 +400,26 @@ def test_icx_preamble_strip_leaves_unrecognised_output_alone() -> None:
 
 
 class _FakeChannel:
-    """Drives the ICX enable() override without a socket: scripted reads, logged writes.
+    """A scripted FastIron transcript for the ICX enable() override — no socket.
 
-    Before the credential, reads come from `reads` (read_until_prompt_or_pattern).
-    After it, they come from `after_chunks` (read_channel_timing), one chunk per call,
-    and BOTH check_enable_mode() and read_until_prompt_or_pattern() fail the test —
-    after the one credential the override must write nothing and decide from the text.
+    `script` maps what the override WRITES to the chunks the switch then sends, one
+    chunk per read_channel_timing() call (an Exception chunk is raised). Writing
+    anything the script does not expect fails the test, as does the RETURN that
+    check_enable_mode() would send once `enable` is in flight.
     """
 
     def __init__(
         self,
-        reads: list[str],
+        script: dict[str, list[str | Exception]],
         *,
-        after_chunks: list[str | Exception] | None = None,
         start_enabled: bool = False,
-        enabled_after_warning: bool = False,
         base_prompt: str = "SSH@ICX7150-IDF1",
     ) -> None:
-        self.reads = list(reads)
-        self.after_chunks = list(after_chunks or [])
+        self.script = {k: list(v) for k, v in script.items()}
         self.writes: list[str] = []
+        self.pending: list[str | Exception] = []
         self.enabled = start_enabled
-        self.enabled_after_warning = enabled_after_warning
         self.base_prompt = base_prompt
-        self.secret_sent = False
 
     def install(self, obj: Any) -> None:
         obj.username = "netmon"
@@ -431,38 +427,28 @@ class _FakeChannel:
         obj.base_prompt = self.base_prompt
         obj.write_channel = self._write
         obj.normalize_cmd = lambda cmd: cmd + "\n"
-        obj.read_until_prompt_or_pattern = self._read
-        obj.read_until_prompt = lambda **kw: pytest.fail("must not wait on the prompt alone")
+        obj.read_until_prompt_or_pattern = lambda **kw: pytest.fail("stream-matched")
+        obj.read_until_prompt = lambda **kw: pytest.fail("waited on the prompt alone")
         obj.read_channel_timing = self._timing
         obj.check_enable_mode = self._check
 
     def _write(self, data: str) -> None:
-        if self.secret_sent:
-            pytest.fail(f"wrote {data!r} after the one credential")
+        if data not in self.script:
+            pytest.fail(f"unexpected write {data!r} (after {self.writes})")
         self.writes.append(data)
-        if data == "the-ssh-password\n":
-            self.secret_sent = True
-
-    def _read(self, **kw: Any) -> str:
-        if self.secret_sent:
-            pytest.fail("stream-matched after the credential")
-        out = self.reads.pop(0) if self.reads else ""
-        if "No password has been assigned" in out:
-            self.enabled = self.enabled_after_warning
-        return out
+        self.pending = self.script.pop(data)
 
     def _timing(self, **kw: Any) -> str:
-        assert self.secret_sent
-        if not self.after_chunks:
+        if not self.pending:
             return ""
-        nxt = self.after_chunks.pop(0)
+        nxt = self.pending.pop(0)
         if isinstance(nxt, Exception):
             raise nxt
         return nxt
 
     def _check(self, *a: Any, **kw: Any) -> bool:
-        if self.secret_sent:
-            pytest.fail("check_enable_mode() after the credential sends a RETURN")
+        if self.writes:
+            pytest.fail("check_enable_mode() after `enable` sends a RETURN")
         return self.enabled
 
 
@@ -475,140 +461,147 @@ def _icx_instance(chan: _FakeChannel) -> Any:
 
 _PRIV = "SSH@ICX7150-IDF1#"
 _UNPRIV = "SSH@ICX7150-IDF1>"
+_EN, _USER, _PW = "enable\n", "netmon\n", "the-ssh-password\n"
+_BAD = "Error - Incorrect username or password.\n"
 
 
 def test_icx_enable_skipped_when_already_privileged() -> None:
-    chan = _FakeChannel([], start_enabled=True)
+    chan = _FakeChannel({}, start_enabled=True)
     _icx_instance(chan).enable()
     assert chan.writes == [], "privilege-mode login must send nothing"
 
 
 def test_icx_enable_answers_username_then_password_once() -> None:
-    chan = _FakeChannel(["User Name:", "Password:"], after_chunks=[_PRIV])
+    chan = _FakeChannel({_EN: ["User Name:"], _USER: ["Password:"], _PW: [_PRIV]})
+    obj = _icx_instance(chan)
+    obj.enable()
+    assert chan.writes == [_EN, _USER, _PW]
+    assert obj._icx_unresolved is False
+
+
+def test_icx_enable_password_only() -> None:
+    chan = _FakeChannel({_EN: ["Password:"], _PW: [_PRIV]})
     _icx_instance(chan).enable()
-    assert chan.writes == ["enable\n", "netmon\n", "the-ssh-password\n"]
-
-
-def test_icx_enable_rejection_is_one_attempt_then_raises() -> None:
-    chan = _FakeChannel(["User Name:", "Password:"],
-                        after_chunks=["Error - Incorrect username or password.\n" + _UNPRIV])
-    with pytest.raises(device_config.IcxEnableRejected):
-        _icx_instance(chan).enable()
-    assert chan.writes.count("enable\n") == 1, f"retried enable: {chan.writes}"
-    assert chan.writes.count("the-ssh-password\n") == 1
+    assert chan.writes == [_EN, _PW]
 
 
 @pytest.mark.parametrize(
-    "chunks",
+    "after_pw",
     [
-        ["Error - Incorrect username or password.\nPassword:"],
+        [_BAD + _UNPRIV],
+        [_BAD + "Password:"],
         ["SSH@ICX7150-IDF1: Error - RADIUS authentication failed\nPassword:"],
         ["User Name:"],
         ["SSH@ICX7150-IDF1: Error - RADIUS rejected\nPolicy #17 denies SSH@ICX7150-IDF1 access\n" + _UNPRIV],
-        # Slow AAA: nothing, then the rejection.
-        ["", "Error - Incorrect username or password.\n" + _UNPRIV],
-        # A refusal line that merely ENDS with the privileged prompt text.
+        ["", _BAD + _UNPRIV],  # slow AAA
         ["Access denied for SSH@ICX7150-IDF1#", "\nPassword:"],
         ["Access denied for SSH@ICX7150-IDF1#\nPassword:"],
+        [TimeoutError("read timeout")],
     ],
 )
-def test_icx_enable_failures_are_rejections_with_no_second_write(chunks: list[str | Exception]) -> None:
-    chan = _FakeChannel(["Password:"], after_chunks=chunks)
+def test_icx_enable_failures_are_one_credential_then_rejected(after_pw: list[str | Exception]) -> None:
+    chan = _FakeChannel({_EN: ["User Name:"], _USER: ["Password:"], _PW: after_pw})
+    obj = _icx_instance(chan)
     with pytest.raises(device_config.IcxEnableRejected):
-        _icx_instance(chan).enable()
-    assert chan.writes == ["enable\n", "the-ssh-password\n"]
+        obj.enable()
+    assert chan.writes == [_EN, _USER, _PW], "exactly one credential, nothing after it"
+    if obj._icx_unresolved:  # still at a credential prompt: cleanup must stay silent
+        obj.cleanup()  # an unexpected write fails the test
+    else:
+        assert after_pw[-1] == _BAD + _UNPRIV or str(after_pw[-1]).endswith('>')
+    assert chan.writes == [_EN, _USER, _PW]
 
 
 @pytest.mark.parametrize(
-    "chunks, prompt",
+    "after_pw, prompt",
     [
         (["Authorized login only.\n" + _PRIV], "SSH@ICX7150-IDF1"),
         (["Report errors to IT.\n" + _PRIV], "SSH@ICX7150-IDF1"),
         (["Login: use your district account\n" + _PRIV], "SSH@ICX7150-IDF1"),
         (["Notice: Login: use your district account\nPassword: never share it\n" + _PRIV], "SSH@ICX7150-IDF1"),
         (["Help with incorrect password: call IT\n" + _PRIV], "SSH@ICX7150-IDF1"),
-        # Banner arrives in pieces; the first piece ends on a credential-looking word.
         (["Login:", " use your district account\n", _PRIV], "SSH@ICX7150-IDF1"),
-        # Slow RADIUS: an empty read first.
         (["", _PRIV], "SSH@ICX7150-IDF1"),
         (["SSH@error-switch#"], "SSH@error-switch"),
         (["SSH@login-switch#"], "SSH@login-switch"),
-        # Terminal escapes after the prompt, also split across reads.
         (["SSH@ICX7150-IDF1#\x1b[K"], "SSH@ICX7150-IDF1"),
         (["SSH@ICX7150-IDF1#\x1b[", "K"], "SSH@ICX7150-IDF1"),
         (["\r\nSSH@ICX7150-IDF1# \r"], "SSH@ICX7150-IDF1"),
+        (["\x1b[?25hSSH@sw#"], "\x1b[?25hSSH@sw"),
     ],
 )
-def test_icx_enable_success_is_decided_by_the_final_prompt(chunks: list[str | Exception], prompt: str) -> None:
-    chan = _FakeChannel(["Password:"], after_chunks=chunks, base_prompt=prompt)
-    _icx_instance(chan).enable()
-    assert chan.writes == ["enable\n", "the-ssh-password\n"]
-
-
-def test_icx_cleanup_after_a_refused_enable_writes_nothing() -> None:
-    # netmiko's disconnect() runs cleanup() after session_preparation fails; the
-    # Cisco cleanup would send RETURN + `exit` into the waiting Password: prompt.
-    chan = _FakeChannel(["Password:"], after_chunks=["Error - Incorrect username or password.\nPassword:"])
+def test_icx_enable_success_is_decided_by_the_final_prompt(after_pw: list[str | Exception], prompt: str) -> None:
+    chan = _FakeChannel({_EN: ["Password:"], _PW: after_pw}, base_prompt=prompt)
     obj = _icx_instance(chan)
-    with pytest.raises(device_config.IcxEnableRejected):
-        obj.enable()
-    obj.cleanup()  # _FakeChannel fails the test on any write after the credential
-    assert chan.writes == ["enable\n", "the-ssh-password\n"]
+    obj.enable()
+    assert chan.writes == [_EN, _PW]
+    assert obj._icx_unresolved is False
+
+
+@pytest.mark.parametrize(
+    "after_enable, prompt",
+    [
+        # Immediate success, hostname containing "login" (AAA method `none`).
+        (["SSH@login-switch#"], "SSH@login-switch"),
+        # No super-user password: warning, then privileged.
+        (["No password has been assigned yet...\nSSH@ICX7150-IDF1#"], "SSH@ICX7150-IDF1"),
+        (["\x1b[?25hSSH@sw#"], "\x1b[?25hSSH@sw"),
+    ],
+)
+def test_icx_enable_granted_without_any_credential(after_enable: list[str | Exception], prompt: str) -> None:
+    chan = _FakeChannel({_EN: after_enable}, base_prompt=prompt)
+    _icx_instance(chan).enable()
+    assert chan.writes == [_EN], "nothing may be typed when no credential was asked for"
+
+
+def test_icx_text_containing_the_prompt_above_a_password_prompt_is_not_a_prompt() -> None:
+    # Codex N9: "Notice: SSH@sw" above "Password:" disarmed the guard and sent RETURN.
+    chan = _FakeChannel({_EN: ["Notice: SSH@sw\nPassword:"], _PW: ["SSH@sw#"]}, base_prompt="SSH@sw")
+    _icx_instance(chan).enable()
+    assert chan.writes == [_EN, _PW]
+
+
+@pytest.mark.parametrize(
+    "after_enable",
+    [
+        ["No password has been assigned"],  # nothing more: never settles
+        ["No password has been assigned yet...\n" + _UNPRIV],
+        [_UNPRIV],
+    ],
+)
+def test_icx_enable_with_no_path_is_no_access_without_a_credential(
+    after_enable: list[str | Exception], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(device_config, "_ICX_ENABLE_SETTLE_SEC", 0.05)
+    chan = _FakeChannel({_EN: after_enable})
+    with pytest.raises((device_config.IcxNoEnableAccess, device_config.IcxEnableRejected)) as ei:
+        _icx_instance(chan).enable()
+    if after_enable[-1].endswith(">"):
+        assert isinstance(ei.value, device_config.IcxNoEnableAccess)
+    assert chan.writes == [_EN]
 
 
 def test_icx_cleanup_writes_nothing_if_the_first_enable_read_fails() -> None:
-    chan = _FakeChannel([])
+    chan = _FakeChannel({_EN: [TimeoutError("prompt arrived after the read deadline")]})
     obj = _icx_instance(chan)
-
-    def boom(**kw: Any) -> str:
-        raise TimeoutError("prompt arrived after the read deadline")
-
-    obj.read_until_prompt_or_pattern = boom
-    with pytest.raises(TimeoutError):
+    with pytest.raises(device_config.IcxEnableRejected):
         obj.enable()
-    assert obj._icx_unresolved is True, "an unresolved exchange must keep cleanup silent"
-    writes_before = list(chan.writes)
+    assert obj._icx_unresolved is True
     obj.cleanup()
-    assert chan.writes == writes_before == ["enable\n"]
+    assert chan.writes == [_EN]
 
 
 def test_icx_enable_uppercase_prompts_are_recognised() -> None:
-    chan = _FakeChannel(["USER NAME:", "PASSWORD:"], after_chunks=[_PRIV])
-    obj = _icx_instance(chan)
-    obj.enable()
-    assert chan.writes == ["enable\n", "netmon\n", "the-ssh-password\n"]
-    assert obj._icx_unresolved is False
-
-
-def test_icx_enable_prompt_with_escape_prefix_is_matched() -> None:
-    chan = _FakeChannel(["Password:"], after_chunks=["\x1b[?25hSSH@sw#"], base_prompt="\x1b[?25hSSH@sw")
+    chan = _FakeChannel({_EN: ["USER NAME:"], _USER: ["PASSWORD:"], _PW: [_PRIV]})
     _icx_instance(chan).enable()
-
-
-def test_icx_cleanup_is_normal_once_privileged() -> None:
-    chan = _FakeChannel(["Password:"], after_chunks=[_PRIV])
-    obj = _icx_instance(chan)
-    obj.enable()
-    assert obj._icx_unresolved is False
-
-
-def test_icx_enable_read_error_after_the_credential_is_a_rejection() -> None:
-    chan = _FakeChannel(["Password:"], after_chunks=[TimeoutError("read timeout")])
-    with pytest.raises(device_config.IcxEnableRejected):
-        _icx_instance(chan).enable()
+    assert chan.writes == [_EN, _USER, _PW]
 
 
 def test_icx_enable_that_never_settles_is_a_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(device_config, "_ICX_ENABLE_SETTLE_SEC", 0.05)
-    chan = _FakeChannel(["Password:"], after_chunks=["banner text\n"] * 1000)
+    chan = _FakeChannel({_EN: ["Password:"], _PW: ["banner text\n"] * 1000})
     with pytest.raises(device_config.IcxEnableRejected):
         _icx_instance(chan).enable()
-
-
-def test_icx_enable_no_password_warning_then_privileged_is_success() -> None:
-    chan = _FakeChannel(["No password has been assigned yet...\n" + _PRIV], enabled_after_warning=True)
-    _icx_instance(chan).enable()
-    assert chan.writes == ["enable\n"]
 
 
 def test_netmiko_channel_logging_is_kept_above_debug(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -622,13 +615,6 @@ def test_netmiko_channel_logging_is_kept_above_debug(monkeypatch: pytest.MonkeyP
     logging.getLogger("netmiko").setLevel(logging.NOTSET)
     device_config._connect("ruckus_fastiron", host="h", password="p")
     assert not logging.getLogger("netmiko").isEnabledFor(logging.DEBUG)
-
-
-def test_icx_enable_with_no_path_raises_no_access_without_sending_a_password() -> None:
-    chan = _FakeChannel(["No password has been assigned"])
-    with pytest.raises(device_config.IcxNoEnableAccess):
-        _icx_instance(chan).enable()
-    assert chan.writes == ["enable\n"]
 
 
 # --------------------------------------------------------------------------------------
