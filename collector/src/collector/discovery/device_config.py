@@ -264,11 +264,12 @@ _ICX_REDACT_PATTERNS = [
         # Current OSPFv2/v3 + virtual-link form:
         # `[ipv6 ospf|area N virtual-link IP] authentication md5|hmac-sha-1|hmac-sha-256
         # key-id N key <k>`.
-        r"(\bauthentication (?:md5|hmac-sha-1|hmac-sha-256) key-id \d+ key (?:[0-9] )?)(?P<sec>\S+)",
-        # key-chain body: `key-id N` / `password <k>`.
-        r"^(\s*password (?:[0-9] )?)(?P<sec>\S+)",
+        r"^(\s*(?:ip ospf |ipv6 ospf |area \S+ virtual-link \S+ )authentication (?:md5|hmac-sha-1|hmac-sha-256) key-id \d+ key (?:[0-9] )?)(?P<sec>\S+)",
+        # key-chain body (`key-id N` / `  password <k>`): INDENTED only, so a banner
+        # line that merely starts with the word "password" is left alone.
+        r"^(\s+password (?:[0-9] )?)(?P<sec>\S+)",
         # OSPF interface / virtual-link plain-text auth (08.0.70+).
-        r"(\bauthentication plain-text (?:[0-9] )?)(?P<sec>\S+)",
+        r"^(\s*(?:ip ospf |area \S+ virtual-link \S+ )authentication plain-text (?:[0-9] )?)(?P<sec>\S+)",
         # VRRP / VRRP-E `auth-type simple-text-auth|md5-auth <pw>` and VSRP-aware
         # `vsrp-aware vrid N simple-text-auth <pw>`.
         r"(\b(?:simple-text-auth|md5-auth) (?:[0-9] )?)(?P<sec>\S+)",
@@ -502,12 +503,43 @@ class IcxNoEnableAccess(Exception):
     """ICX signed us in, but offers no way into privileged mode for this account."""
 
 
-# What may follow the one enable credential on ICX, besides the prompt.
-_ICX_ENABLE_AFTER_RE = r"(?:ssword:|User Name:|Login:|incorrect (?:username or )?password)"
-# A credential prompt the device is still waiting at (end of the read).
+# A credential prompt the device is waiting at, as the LAST line of its output.
 _ICX_REPROMPT_RE = re.compile(r"(?:ssword|User Name|Login):\s*$", re.I)
-# FastIron's rejection: "Error - Incorrect username or password."
-_ICX_REJECTED_RE = re.compile(r"incorrect (?:username or )?password", re.I)
+# How long to wait for the switch to settle after the one enable credential (a
+# RADIUS/TACACS round trip can pause the reply for several seconds).
+_ICX_ENABLE_SETTLE_SEC = 20.0
+
+
+def _icx_last_line(text: str) -> str:
+    lines = [ln.strip() for ln in text.replace("\r", "\n").split("\n") if ln.strip()]
+    return lines[-1] if lines else ""
+
+
+def _icx_enable_verdict(after: str, base_prompt: str) -> str | None:
+    """Classify the output that followed the enable credential, from its LAST line.
+
+    "priv"     = sitting at the privileged prompt (`<base_prompt>#`): enable worked.
+    "unpriv"   = back at the unprivileged `<base_prompt>>`: refused.
+    "reprompt" = the last line is a credential prompt. Only a refusal if it is STILL
+                 the last line after another quiet read — a banner can arrive in
+                 pieces and pause on "Login:".
+    None       = not settled yet (banner text still arriving, or nothing yet).
+
+    Only the final line is read, and only a whole prompt counts. Everything above it
+    is banner, MOTD or AAA chatter whose words prove nothing: "Authorized login only",
+    "Help with incorrect password: call IT", "Policy #17 denies SSH@sw access" have
+    all been reviewer-constructed false verdicts for a stream-matching approach.
+    """
+    last = _icx_last_line(after)
+    if not last:
+        return None
+    if base_prompt and last.endswith(base_prompt + "#"):
+        return "priv"
+    if base_prompt and last.endswith(base_prompt + ">"):
+        return "unpriv"
+    if _ICX_REPROMPT_RE.search(last):
+        return "reprompt"
+    return None
 
 
 def _icx_connection_class() -> Any:
@@ -556,25 +588,42 @@ def _icx_connection_class() -> Any:
                 self.write_channel(self.normalize_cmd(self.username))
                 out = str(self.read_until_prompt_or_pattern(
                     pattern=pattern, re_flags=re_flags, read_entire_line=True))
+                if "ssword" not in out:
+                    # Asked for a username and then not for a password: nothing
+                    # sensible to answer, and a RETURN here would be an empty login
+                    # attempt.
+                    raise IcxEnableRejected("no password prompt after the username")
             if "ssword" in out:
                 self.write_channel(self.normalize_cmd(self.secret))
-                # Stop at the prompt OR at a fresh credential prompt / the FastIron
-                # rejection message. Waiting for the prompt alone would hang on a
-                # device that re-prompts after a wrong password, and the ReadTimeout
-                # would classify as a reach timeout the auth breaker never counts.
-                # Only a credential prompt AT THE END of the read, or the specific
-                # rejection text, is a refusal: an EXEC banner ("Authorized login
-                # only") or a hostname ("SSH@login-sw#") must not be. Never answer a
-                # re-prompt — check_enable_mode() sends a RETURN, which at a password
-                # prompt would be a second (empty) login attempt.
-                try:
-                    after = str(self.read_until_prompt_or_pattern(
-                        pattern=_ICX_ENABLE_AFTER_RE, re_flags=re.IGNORECASE,
-                        read_entire_line=True))
-                except Exception as exc:  # noqa: BLE001 — timeout after the credential
-                    raise IcxEnableRejected("no prompt after the enable credential") from exc
-                if _ICX_REPROMPT_RE.search(after) or _ICX_REJECTED_RE.search(after):
-                    raise IcxEnableRejected("enable refused")
+                # After the ONE credential nothing more is written — not even the
+                # RETURN check_enable_mode() sends, which at a re-prompt would be a
+                # second (empty) login attempt. Read until the output settles on a
+                # whole prompt line and let that line decide (_icx_enable_verdict).
+                # A device that never settles is a rejection, NOT a reach timeout:
+                # that ReadTimeout would otherwise classify as reach.ssh_timeout,
+                # which the auth breaker never counts.
+                after = ""
+                reprompt_seen_at = -1
+                deadline = time.monotonic() + _ICX_ENABLE_SETTLE_SEC
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise IcxEnableRejected("enable never settled on a prompt")
+                    try:
+                        after += str(self.read_channel_timing(
+                            last_read=1.0, read_timeout=max(1.0, remaining)))
+                    except Exception as exc:  # noqa: BLE001 — read timeout / channel error
+                        raise IcxEnableRejected("no prompt after the enable credential") from exc
+                    verdict = _icx_enable_verdict(after, str(getattr(self, "base_prompt", "")))
+                    if verdict == "priv":
+                        return ""
+                    if verdict == "unpriv":
+                        raise IcxEnableRejected("enable refused")
+                    if verdict == "reprompt":
+                        if reprompt_seen_at == len(after):  # nothing new since: waiting
+                            raise IcxEnableRejected("enable re-prompted for a credential")
+                        reprompt_seen_at = len(after)
+            # No credential was asked for: we are at a prompt, so this check is safe.
             if not self.check_enable_mode():
                 raise IcxEnableRejected("enable refused")
             return ""
