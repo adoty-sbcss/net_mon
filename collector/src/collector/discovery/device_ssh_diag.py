@@ -82,6 +82,7 @@ _AUTHZ_MARKERS = (
     "% permission denied",
     "% authorization failed",
     "invalid input detected",
+    "invalid input ->",  # FastIron: `Invalid input -> show running-config`
     "command authorization failed",
     "% incomplete command",
     "insufficient privilege",

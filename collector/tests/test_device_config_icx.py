@@ -179,8 +179,8 @@ _TOKEN_RE = re.compile(r"<REDACTED:[^>\s]*>")
 _ANY_DOLLAR_BLOB = re.compile(r"\$[A-Za-z0-9+/=.$]{3,}")
 
 
-def _redact(text: str) -> tuple[str, int]:
-    out, suspects = _redact_config(text, _KEY)
+def _redact(text: str, platform: str | None = "ruckus_fastiron") -> tuple[str, int]:
+    out, suspects = _redact_config(text, _KEY, platform)
     assert out is not None
     return out, suspects
 
@@ -234,6 +234,17 @@ def test_icx_startup_config_is_redacted_too() -> None:
         (f"snmp-server user u1 g1 v3 encrypted auth md5 {_SNMPV3_AUTH} priv encrypted des {_SNMPV3_PRIV}", _SNMPV3_PRIV),
         (f"snmp-server user u1 g1 v3 encrypted auth md5 {_SNMPV3_AUTH} priv encrypted des {_SNMPV3_PRIV}", _SNMPV3_AUTH),
         (f"mac-authentication password-override {_MAC_OVERRIDE}", _MAC_OVERRIDE),
+        # Short plaintext forms the backstop cannot catch (not credential-shaped).
+        (" ip ospf authentication plain-text mystring", "mystring"),
+        (" area 1 virtual-link 20.1.1.1 authentication plain-text vlpw1", "vlpw1"),
+        (" vsrp-aware vrid 3 simple-text-auth pri-key", "pri-key"),
+        ("  ip vrrp auth-type simple-text-auth vrrp1", "vrrp1"),
+        (" auth-mode passcode static 1234", "1234"),
+        ("radius-client coa host 10.0.0.5 key CoaPlain99", "CoaPlain99"),
+        ("radius-client coa host 10.0.0.5 key 2 $Y29ha2V5MQ==", "$Y29ha2V5MQ=="),
+        # Unencrypted SNMPv3 display form: `priv des <pw>` used to mask `des`.
+        ("snmp-server user u1 g1 v3 auth md5 Auth1Pass9 priv des Priv1Pass9", "Priv1Pass9"),
+        ("snmp-server user u1 g1 v3 auth md5 Auth1Pass9 priv des Priv1Pass9", "Auth1Pass9"),
         # A command this file has never heard of, in the type-2 form: the
         # `<digit> $blob` catch-all must still claim it.
         ("some-future-command secret-thing 2 $ZnV0dXJla2V5", "$ZnV0dXJla2V5"),
@@ -282,6 +293,54 @@ def test_icx_non_secret_lines_pass_through_unchanged(line: str) -> None:
     assert suspects == 0
 
 
+def test_icx_view_name_over_mask_stays_visible() -> None:
+    # The same deliberate trade as test_known_over_mask_of_mixed_case_trailing_identifiers
+    # in test_redact_secrets.py: a digit-bearing view name is shaped like a community,
+    # so it is masked as a SUSPECT (loud), never silently kept or silently dropped.
+    out, suspects = _redact(f"snmp-server community 2 {_COMM_RO} ro view v1default")
+    assert _COMM_RO not in out
+    assert out.endswith(" ro view <REDACTED:suspect>"), out
+    assert suspects == 1
+
+
+def test_icx_trap_host_and_ntp_keep_their_keywords() -> None:
+    out, _ = _redact(f"snmp-server host 10.0.0.30 version v2c 2 {_TRAP_COMM} port 162")
+    # The type digit is masked too (the Cisco host pattern takes it as the community):
+    # harmless over-mask. What matters is the keyword and the port survive.
+    assert out.startswith("snmp-server host 10.0.0.30 version v2c <REDACTED:"), out
+    assert out.endswith(" port 162") and _TRAP_COMM not in out, out
+    out, _ = _redact(f" authentication-key key-id 1 sha1 2 {_NTP_KEY}")
+    assert out.startswith(" authentication-key key-id 1 sha1 2 <REDACTED:"), out
+
+
+# --------------------------------------------------------------------------------------
+# The ICX patterns must not reach other vendors (a changed redaction = a phantom config
+# change on every existing device's next backup).
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Room 5 $100",
+        " description Room 2 $5 per hour kiosk",
+        "snmp-server location Bldg 2 $Annex",
+        " ip ospf authentication plain-text-mode-note",
+        "logging host 10.0.0.1 transport udp port 2 $foo",
+    ],
+)
+@pytest.mark.parametrize("platform", [None, "cisco_ios", "aruba_aoscx", "juniper_junos", "extreme_exos"])
+def test_icx_only_patterns_do_not_touch_other_platforms(line: str, platform: str | None) -> None:
+    out, _ = _redact(line, platform)
+    assert out == line
+
+
+def test_platform_argument_defaults_to_the_pre_icx_behaviour() -> None:
+    text = "snmp-server community 0 ro\nRoom 5 $100\nhostname x"
+    assert _redact_config(text, _KEY) == _redact_config(text, _KEY, "cisco_ios")
+    assert "Room 5 $100" in (_redact_config(text, _KEY)[0] or "")
+
+
 def test_icx_keeps_the_access_mode_and_trap_port() -> None:
     out, _ = _redact(f"snmp-server community 2 {_COMM_RW} rw\nsnmp-server host 10.0.0.30 version v2c 2 {_TRAP_COMM} port 162")
     lines = out.split("\n")
@@ -325,24 +384,50 @@ def test_icx_preamble_strip_leaves_unrecognised_output_alone() -> None:
 class _FakeChannel:
     """Drives the ICX enable() override without a socket: scripted reads, logged writes."""
 
-    def __init__(self, reads: list[str], *, enabled_after: bool, start_enabled: bool = False) -> None:
+    def __init__(
+        self,
+        reads: list[str],
+        *,
+        enabled_after: bool,
+        start_enabled: bool = False,
+        after_secret: str | Exception | None = None,
+    ) -> None:
         self.reads = list(reads)
         self.writes: list[str] = []
         self.enabled_after = enabled_after
         self.enabled = start_enabled
+        if after_secret is None:
+            after_secret = (
+                "SSH@ICX7150-IDF1#" if enabled_after
+                else "Error - Incorrect username or password.\nSSH@ICX7150-IDF1>"
+            )
+        self.after_secret = after_secret
+        self.secret_sent = False
 
     def install(self, obj: Any) -> None:
         obj.username = "netmon"
         obj.secret = "the-ssh-password"
-        obj.write_channel = lambda data: self.writes.append(data)
+        obj.write_channel = self._write
         obj.normalize_cmd = lambda cmd: cmd + "\n"
-        obj.read_until_prompt_or_pattern = lambda **kw: self.reads.pop(0) if self.reads else ""
-        obj.read_until_prompt = self._after_secret
+        obj.read_until_prompt_or_pattern = self._read
+        obj.read_until_prompt = lambda **kw: pytest.fail("must not wait on the prompt alone")
         obj.check_enable_mode = lambda *a, **kw: self.enabled
 
-    def _after_secret(self, **kw: Any) -> str:
-        self.enabled = self.enabled_after
-        return "SSH@ICX7150-IDF1#" if self.enabled_after else "Error - Incorrect username or password.\nSSH@ICX7150-IDF1>"
+    def _write(self, data: str) -> None:
+        self.writes.append(data)
+        if data == "the-ssh-password\n":
+            self.secret_sent = True
+
+    def _read(self, **kw: Any) -> str:
+        if self.secret_sent:
+            self.enabled = self.enabled_after
+            if isinstance(self.after_secret, Exception):
+                raise self.after_secret
+            return self.after_secret
+        out = self.reads.pop(0) if self.reads else ""
+        if "No password has been assigned" in out:
+            self.enabled = self.enabled_after
+        return out
 
 
 def _icx_instance(chan: _FakeChannel) -> Any:
@@ -370,6 +455,39 @@ def test_icx_enable_rejection_is_one_attempt_then_raises() -> None:
         _icx_instance(chan).enable()
     assert chan.writes.count("enable\n") == 1, f"retried enable: {chan.writes}"
     assert chan.writes.count("the-ssh-password\n") == 1
+
+
+def test_icx_enable_reprompt_after_wrong_password_is_a_rejection_not_a_hang() -> None:
+    chan = _FakeChannel(["Password:"], enabled_after=False,
+                        after_secret="Error - Incorrect username or password.\nPassword:")
+    with pytest.raises(device_config.IcxEnableRejected):
+        _icx_instance(chan).enable()
+    assert chan.writes.count("the-ssh-password\n") == 1
+
+
+def test_icx_enable_timeout_after_the_credential_is_a_rejection() -> None:
+    chan = _FakeChannel(["Password:"], enabled_after=False, after_secret=TimeoutError("read timeout"))
+    with pytest.raises(device_config.IcxEnableRejected):
+        _icx_instance(chan).enable()
+
+
+def test_icx_enable_no_password_warning_then_privileged_is_success() -> None:
+    chan = _FakeChannel(["No password has been assigned yet...\nSSH@ICX7150-IDF1#"], enabled_after=True)
+    _icx_instance(chan).enable()
+    assert chan.writes == ["enable\n"]
+
+
+def test_netmiko_channel_logging_is_kept_above_debug(monkeypatch: pytest.MonkeyPatch) -> None:
+    import logging
+
+    class _Stub:
+        def __init__(self, **kw: Any) -> None:
+            pass
+
+    monkeypatch.setattr(device_config, "_icx_connection_class", lambda: _Stub)
+    logging.getLogger("netmiko").setLevel(logging.NOTSET)
+    device_config._connect("ruckus_fastiron", host="h", password="p")
+    assert not logging.getLogger("netmiko").isEnabledFor(logging.DEBUG)
 
 
 def test_icx_enable_with_no_path_raises_no_access_without_sending_a_password() -> None:

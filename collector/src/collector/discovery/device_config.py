@@ -49,6 +49,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import threading
@@ -135,9 +136,9 @@ _REDACT_PATTERNS = [
     for p in (
         # -- Cisco IOS / IOS-XE / NX-OS --
         r"^(\s*snmp-server community )(?P<sec>\"[^\"]*\"|\S+)",
-        r"^(\s*snmp-server host \S+ (?:vrf \S+ )?(?:informs |traps )?(?:version (?:1|2c|3 (?:auth|noauth|priv)) )?(?:community )?)(?P<sec>\S+)",
+        r"^(\s*snmp-server host \S+ (?:vrf \S+ )?(?:informs |traps )?(?:version (?:v?1|v?2c|v?3 (?:auth|noauth|priv)) )?(?:community )?)(?P<sec>\S+)",
         r"(\bsnmp-server user \S+ \S+ .*?\bauth (?:md5|sha(?:-?(?:224|256|384|512))?) )(?P<sec>\S+)",
-        r"(\bsnmp-server user \S+ .*?\bpriv (?:aes[ -]?(?:128|192|256)? |des56? |3des )?)(?P<sec>(?!localizedkey\b|access\b)\S+)",
+        r"(\bsnmp-server user \S+ .*?\bpriv (?:aes[ -]?(?:128|192|256)? |des(?:56)? |3des )?)(?P<sec>(?!localizedkey\b|access\b)\S+)",
         r"^(\s*key config-key password-encrypt )(?P<sec>.+?)\s*$",
         r"^(\s*crypto isakmp key (?:[06] )?)(?P<sec>.+?)(?=\s+(?:address|hostname)\b|\s*$)",
         r"^(\s*(?:ikev[12] (?:local-authentication |remote-authentication )?)?pre-shared-key (?:address \S+ |hostname \S+ )?(?:local |remote )?(?:key |hex )?(?:[06] )?)(?P<sec>.+?)\s*$",
@@ -220,28 +221,6 @@ _REDACT_PATTERNS = [
         r"^(\s*configure snmpv3 add user .*?\bprivacy (?:(?:3?des|aes\d*) )?(?:privacy-encrypted |encrypted )?(?:localized-key |hex )?)(?P<sec>\"[^\"]*\"|\S+)",
         r"(\bshared-secret (?:encrypted )?)(?P<sec>\"[^\"]*\"|\S+)",
         r"(\bsimple-password )(?P<sec>\"[^\"]*\"|[^\s;]+)",
-        # -- Ruckus / Brocade ICX (FastIron) --
-        # FastIron prints most secrets as `<type-digit> <value>`: `8 $1$salt$hash`
-        # (md5-crypt, which _DOLLAR_RE already claims) or `2 $<base64>` — a
-        # REVERSIBLE encoding with public decoders and NO second `$`, so _DOLLAR_RE
-        # does not see it. The Cisco-shaped patterns above mask the type DIGIT as if it
-        # were the secret (`snmp-server community 2 $x ro` -> the `2`) and the real
-        # value would be left to the backstop — the FASTPATH failure shape. Hence the
-        # digit-aware forms here, plus a catch-all for ANY `<digit> $blob` pair below.
-        r"^(\s*enable (?:super-user|read-only|port-config)-password (?:[0-9] )?)(?P<sec>.+?)\s*$",
-        r"^(\s*enable telnet password )(?P<sec>.+?)\s*$",
-        r"^(\s*snmp-server community [0-9] )(?P<sec>\"[^\"]*\"|\S+)",
-        r"^(\s*snmp-server host \S+ version v(?:1|2c) (?:[0-9] )?)(?P<sec>\"[^\"]*\"|\S+)",
-        r"(\bsnmp-server user .*?\bpriv encrypted (?:des|aes\S*) )(?P<sec>\S+)",
-        r"(\bmd5-authentication key-id \d+ key (?:[0-9] )?)(?P<sec>\S+)",
-        r"(\bauth-type (?:simple-text-auth|md5-auth) (?:[0-9] )?)(?P<sec>\S+)",
-        r"^(\s*authentication-key key-id \d+ (?:md5|sha1|sha256) (?:[0-9] )?)(?P<sec>\S+)",
-        r"^(\s*mac-authentication password-override )(?P<sec>\S+)",
-        # Any `<type-digit> $<blob>` pair, on any command: the ICX encoded form is
-        # always written this way, so a command this list has never heard of still
-        # masks. Unanchored on purpose; on other vendors it only ever re-claims a
-        # `5 $1$...` hash _DOLLAR_RE already masked.
-        r"((?:^|\s)[0-9] )(?P<sec>\$[^\s\"';]+)",
         # -- Juniper Junos (set-form) --
         r"^(\s*set .*\bencrypted-password )(?P<sec>\"[^\"]*\"|\S+)",
         r"^(\s*set .*\bsecret )(?P<sec>\"[^\"]*\"|\S+)",
@@ -254,12 +233,50 @@ _REDACT_PATTERNS = [
         r"^(\s*encrypted-password )(?P<sec>\"[^\"]*\"|[^\s;]+)",
         r"^(\s*secret )(?P<sec>\"[^\"]*\"|[^\s;]+)",
         r"^(\s*community )(?P<sec>(?!r[ow]\b|read\b|write\b|encrypted\b|ciphertext\b|plaintext\b)(?:\"[^\"]*\"|[^\s;{]+))(?=\s*[;{]|\s*$)",
-        r"^(\s*(?:authentication-key|privacy-key|authentication-password|privacy-password|chap-secret) )(?P<sec>(?!\d+ type\b)(?:\"[^\"]*\"|[^\s;]+))",
+        r"^(\s*(?:authentication-key|privacy-key|authentication-password|privacy-password|chap-secret) )(?P<sec>(?!\d+ type\b|key-id\b)(?:\"[^\"]*\"|[^\s;]+))",
         # -- Cross-vendor backstops --
         r"(\b(?:ftp|sftp|scp|tftp|https?)://[^:/@\s]+:)(?P<sec>[^@\s]+)(?=@)",
         r"(\b(?:passphrase|wpa-passphrase|presharedkey|psk|auth-password|priv-password|wep-key\d?) )(?P<sec>\"[^\"]*\"|\S+)",
     )
 ]
+# Ruckus / Brocade ICX (FastIron) — applied ON TOP OF the list above, and ONLY when
+# the target's platform is `ruckus_fastiron`. Scoped on purpose: the `<digit> $blob`
+# catch-all below would also mask free text on other vendors ("Room 2 $5" in a
+# description or banner), and any change to their redacted output re-versions every
+# existing device's backup with a phantom config change.
+#
+# FastIron prints most secrets as `<type-digit> <value>`: `8 $1$salt$hash` (md5-crypt,
+# which _DOLLAR_RE already claims) or `2 $<base64>` — a REVERSIBLE encoding with public
+# decoders and NO second `$`, so _DOLLAR_RE does not see it. The Cisco-shaped patterns
+# above mask the type DIGIT as if it were the secret (`snmp-server community 2 $x ro`
+# -> the `2`) and leave the real value to the backstop — the FASTPATH failure shape.
+# The plaintext forms (`no service password-encryption`) matter as much: a short
+# password is not credential-shaped enough for the backstop to catch.
+_ICX_REDACT_PATTERNS = [
+    re.compile(p, re.M | re.I)
+    for p in (
+        r"^(\s*enable (?:super-user|read-only|port-config)-password (?:[0-9] )?)(?P<sec>.+?)\s*$",
+        r"^(\s*enable telnet password )(?P<sec>.+?)\s*$",
+        r"^(\s*snmp-server community [0-9] )(?P<sec>\"[^\"]*\"|\S+)",
+        r"^(\s*snmp-server host \S+ version v(?:1|2c) (?:[0-9] )?)(?P<sec>\"[^\"]*\"|\S+)",
+        r"(\bsnmp-server user .*?\bpriv encrypted (?:des|aes\S*) )(?P<sec>\S+)",
+        r"(\bmd5-authentication key-id \d+ key (?:[0-9] )?)(?P<sec>\S+)",
+        # OSPF interface / virtual-link plain-text auth (08.0.70+).
+        r"(\bauthentication plain-text (?:[0-9] )?)(?P<sec>\S+)",
+        # VRRP / VRRP-E `auth-type simple-text-auth|md5-auth <pw>` and VSRP-aware
+        # `vsrp-aware vrid N simple-text-auth <pw>`.
+        r"(\b(?:simple-text-auth|md5-auth) (?:[0-9] )?)(?P<sec>\S+)",
+        r"^(\s*authentication-key key-id \d+ (?:md5|sha1|sha256) (?:[0-9] )?)(?P<sec>\S+)",
+        r"^(\s*mac-authentication password-override (?:[0-9] )?)(?P<sec>\S+)",
+        r"(\bauth-mode passcode static )(?P<sec>\S+)",
+        r"^(\s*radius-client coa host \S+ .*?\bkey (?:[0-9] )?)(?P<sec>\S+)",
+        # Any `<type-digit> $<blob>` pair, on any ICX command: the encoded form is
+        # always written this way, so a command this list has never heard of still
+        # masks.
+        r"((?:^|\s)[0-9] )(?P<sec>\$[^\s\"';]+)",
+    )
+]
+
 # G1: any $-format hash / reversible blob anywhere on any line — the highest-value
 # catch-all (Cisco type-5/8/9, Junos $9$, Linux $5$/$6$, apr1, bcrypt). Whole match
 # IS the secret.
@@ -376,8 +393,14 @@ def _backstop_line(line: str) -> tuple[str, int]:
     return line, len(spans)
 
 
-def _redact_config(text: str | None, key: bytes) -> tuple[str | None, int]:
+def _redact_config(
+    text: str | None, key: bytes, platform: str | None = None
+) -> tuple[str | None, int]:
     """Mask every recognized secret. Returns (redacted_text, suspect_count).
+
+    `platform` adds that platform's own patterns on top of the cross-vendor list
+    (today only `ruckus_fastiron`, see _ICX_REDACT_PATTERNS). Omitting it is the
+    pre-ICX behaviour, byte for byte.
 
     Architecture (per the Fable adversarial review): collect the (?P<sec>) spans of
     ALL patterns against the SAME text, union overlaps, and replace in ONE right-to
@@ -407,7 +430,8 @@ def _redact_config(text: str | None, key: bytes) -> tuple[str | None, int]:
 
     # 2. Collect all secret spans over the (block-redacted) text.
     spans: list[list[int]] = []
-    for rx in (*_REDACT_PATTERNS, _DOLLAR_RE):
+    extra = _ICX_REDACT_PATTERNS if platform == "ruckus_fastiron" else []
+    for rx in (*_REDACT_PATTERNS, *extra, _DOLLAR_RE):
         for m in rx.finditer(text):
             if m.groupdict().get("sec"):
                 spans.append([m.start("sec"), m.end("sec")])
@@ -507,14 +531,32 @@ def _icx_connection_class() -> Any:
             out = str(self.read_until_prompt_or_pattern(
                 pattern=pattern, re_flags=re_flags, read_entire_line=True))
             if "No password has been assigned" in out:
-                raise IcxNoEnableAccess("no enable path for this account")
+                # A switch with no super-user password prints this and then GRANTS
+                # privileged mode (the stock driver treats it as success too). Only
+                # a prompt that is still `>` is a dead end — and no password was
+                # sent, so nothing can lock.
+                if not self.check_enable_mode():
+                    raise IcxNoEnableAccess("no enable path for this account")
+                return ""
             if "User Name" in out or "Login" in out:
                 self.write_channel(self.normalize_cmd(self.username))
                 out = str(self.read_until_prompt_or_pattern(
                     pattern=pattern, re_flags=re_flags, read_entire_line=True))
             if "ssword" in out:
                 self.write_channel(self.normalize_cmd(self.secret))
-                self.read_until_prompt(read_entire_line=True)
+                # Stop at the prompt OR at a fresh credential prompt / error. Waiting
+                # for the prompt alone would hang on a device that re-prompts after a
+                # wrong password, and the ReadTimeout would classify as a reach
+                # timeout that the auth breaker never counts. Anything but a clean
+                # privileged prompt after the ONE credential is a rejection.
+                try:
+                    after = str(self.read_until_prompt_or_pattern(
+                        pattern=r"(?:ssword|User Name|Login|incorrect|error)",
+                        re_flags=re.IGNORECASE, read_entire_line=True))
+                except Exception as exc:  # noqa: BLE001 — timeout after the credential
+                    raise IcxEnableRejected("no prompt after the enable credential") from exc
+                if re.search(r"ssword|user name|login|incorrect|error", after, re.I):
+                    raise IcxEnableRejected("enable refused")
             if not self.check_enable_mode():
                 raise IcxEnableRejected("enable refused")
             return ""
@@ -523,7 +565,15 @@ def _icx_connection_class() -> Any:
 
 
 def _connect(platform: str, **kwargs: Any) -> Any:
-    """Open a netmiko session for `platform` (ICX gets its one-attempt driver)."""
+    """Open a netmiko session for `platform` (ICX gets its one-attempt driver).
+
+    netmiko logs every channel write and read at DEBUG — on ICX that includes the
+    enable password, on every platform the raw UNREDACTED config — and the
+    collector's root logger runs at DEBUG whenever an operator sets
+    NETMON_LOG_LEVEL=DEBUG, into a file `collect-logs` ships to the dashboard. Pin
+    netmiko above DEBUG regardless.
+    """
+    logging.getLogger("netmiko").setLevel(max(logging.INFO, logging.getLogger("netmiko").level))
     if platform == "ruckus_fastiron":
         return _icx_connection_class()(device_type=platform, secret=kwargs.get("password", ""), **kwargs)
     from netmiko import ConnectHandler
@@ -697,8 +747,8 @@ def _fetch_one(
             "has_startup": startup is not None,
         }
 
-    red_run, sus_run = _redact_config(running, key)
-    red_start, sus_start = _redact_config(startup, key)
+    red_run, sus_run = _redact_config(running, key, platform)
+    red_start, sus_start = _redact_config(startup, key, platform)
     # Fail closed: if a private-key body survived redaction (e.g. a truncated PEM
     # whose END fence never arrived), do NOT ship the config — a leaked key is
     # unacceptable, so surface it as an error the operator sees instead.
