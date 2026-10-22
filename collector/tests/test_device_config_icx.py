@@ -270,6 +270,7 @@ def test_icx_plaintext_secrets_never_leave_the_lan(secret: str) -> None:
     "line",
     [
         "password resets go through IT",
+        "\npassword resets go through IT",
         " port-name authentication md5 key-id 10 key example",
         " port-name ospf authentication plain-text note",
     ],
@@ -506,6 +507,9 @@ def test_icx_enable_rejection_is_one_attempt_then_raises() -> None:
         ["SSH@ICX7150-IDF1: Error - RADIUS rejected\nPolicy #17 denies SSH@ICX7150-IDF1 access\n" + _UNPRIV],
         # Slow AAA: nothing, then the rejection.
         ["", "Error - Incorrect username or password.\n" + _UNPRIV],
+        # A refusal line that merely ENDS with the privileged prompt text.
+        ["Access denied for SSH@ICX7150-IDF1#", "\nPassword:"],
+        ["Access denied for SSH@ICX7150-IDF1#\nPassword:"],
     ],
 )
 def test_icx_enable_failures_are_rejections_with_no_second_write(chunks: list[str | Exception]) -> None:
@@ -529,12 +533,34 @@ def test_icx_enable_failures_are_rejections_with_no_second_write(chunks: list[st
         (["", _PRIV], "SSH@ICX7150-IDF1"),
         (["SSH@error-switch#"], "SSH@error-switch"),
         (["SSH@login-switch#"], "SSH@login-switch"),
+        # Terminal escapes after the prompt, also split across reads.
+        (["SSH@ICX7150-IDF1#\x1b[K"], "SSH@ICX7150-IDF1"),
+        (["SSH@ICX7150-IDF1#\x1b[", "K"], "SSH@ICX7150-IDF1"),
+        (["\r\nSSH@ICX7150-IDF1# \r"], "SSH@ICX7150-IDF1"),
     ],
 )
 def test_icx_enable_success_is_decided_by_the_final_prompt(chunks: list[str | Exception], prompt: str) -> None:
     chan = _FakeChannel(["Password:"], after_chunks=chunks, base_prompt=prompt)
     _icx_instance(chan).enable()
     assert chan.writes == ["enable\n", "the-ssh-password\n"]
+
+
+def test_icx_cleanup_after_a_refused_enable_writes_nothing() -> None:
+    # netmiko's disconnect() runs cleanup() after session_preparation fails; the
+    # Cisco cleanup would send RETURN + `exit` into the waiting Password: prompt.
+    chan = _FakeChannel(["Password:"], after_chunks=["Error - Incorrect username or password.\nPassword:"])
+    obj = _icx_instance(chan)
+    with pytest.raises(device_config.IcxEnableRejected):
+        obj.enable()
+    obj.cleanup()  # _FakeChannel fails the test on any write after the credential
+    assert chan.writes == ["enable\n", "the-ssh-password\n"]
+
+
+def test_icx_cleanup_is_normal_once_privileged() -> None:
+    chan = _FakeChannel(["Password:"], after_chunks=[_PRIV])
+    obj = _icx_instance(chan)
+    obj.enable()
+    assert obj._icx_unresolved is False
 
 
 def test_icx_enable_read_error_after_the_credential_is_a_rejection() -> None:

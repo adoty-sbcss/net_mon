@@ -267,7 +267,7 @@ _ICX_REDACT_PATTERNS = [
         r"^(\s*(?:ip ospf |ipv6 ospf |area \S+ virtual-link \S+ )authentication (?:md5|hmac-sha-1|hmac-sha-256) key-id \d+ key (?:[0-9] )?)(?P<sec>\S+)",
         # key-chain body (`key-id N` / `  password <k>`): INDENTED only, so a banner
         # line that merely starts with the word "password" is left alone.
-        r"^(\s+password (?:[0-9] )?)(?P<sec>\S+)",
+        r"^([ \t]+password (?:[0-9] )?)(?P<sec>\S+)",
         # OSPF interface / virtual-link plain-text auth (08.0.70+).
         r"^(\s*(?:ip ospf |area \S+ virtual-link \S+ )authentication plain-text (?:[0-9] )?)(?P<sec>\S+)",
         # VRRP / VRRP-E `auth-type simple-text-auth|md5-auth <pw>` and VSRP-aware
@@ -510,7 +510,12 @@ _ICX_REPROMPT_RE = re.compile(r"(?:ssword|User Name|Login):\s*$", re.I)
 _ICX_ENABLE_SETTLE_SEC = 20.0
 
 
+# CSI / charset-select escapes a terminal may append to a prompt (`\x1b[K`, ...).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][A-Za-z0-9]|\x1b[=>]")
+
+
 def _icx_last_line(text: str) -> str:
+    text = _ANSI_RE.sub("", text)
     lines = [ln.strip() for ln in text.replace("\r", "\n").split("\n") if ln.strip()]
     return lines[-1] if lines else ""
 
@@ -533,9 +538,10 @@ def _icx_enable_verdict(after: str, base_prompt: str) -> str | None:
     last = _icx_last_line(after)
     if not last:
         return None
-    if base_prompt and last.endswith(base_prompt + "#"):
+    # The WHOLE line must be the prompt: "Access denied for SSH@sw#" ends with it too.
+    if base_prompt and last == base_prompt + "#":
         return "priv"
-    if base_prompt and last.endswith(base_prompt + ">"):
+    if base_prompt and last == base_prompt + ">":
         return "unpriv"
     if _ICX_REPROMPT_RE.search(last):
         return "reprompt"
@@ -563,6 +569,18 @@ def _icx_connection_class() -> Any:
     from netmiko.ruckus import RuckusFastironSSH  # lazy, like ConnectHandler
 
     class _IcxReadOnlySSH(RuckusFastironSSH):  # type: ignore[misc]
+        # True from the moment the switch asks for a credential until it shows the
+        # privileged prompt. While True, nothing may be written: a refused enable
+        # raises into netmiko's _try_session_preparation -> disconnect() -> the
+        # Cisco cleanup(), which sends a RETURN (check_config_mode) and `exit` —
+        # at a waiting `Password:` that is a second, empty login attempt.
+        _icx_unresolved = False
+
+        def cleanup(self, command: str = "exit") -> None:
+            if self._icx_unresolved:
+                return  # close the transport only (disconnect does that next)
+            super().cleanup(command=command)
+
         def enable(
             self,
             cmd: str = "enable",
@@ -584,6 +602,8 @@ def _icx_connection_class() -> Any:
                 if not self.check_enable_mode():
                     raise IcxNoEnableAccess("no enable path for this account")
                 return ""
+            if "User Name" in out or "Login" in out or "ssword" in out:
+                self._icx_unresolved = True
             if "User Name" in out or "Login" in out:
                 self.write_channel(self.normalize_cmd(self.username))
                 out = str(self.read_until_prompt_or_pattern(
@@ -616,6 +636,7 @@ def _icx_connection_class() -> Any:
                         raise IcxEnableRejected("no prompt after the enable credential") from exc
                     verdict = _icx_enable_verdict(after, str(getattr(self, "base_prompt", "")))
                     if verdict == "priv":
+                        self._icx_unresolved = False
                         return ""
                     if verdict == "unpriv":
                         raise IcxEnableRejected("enable refused")
