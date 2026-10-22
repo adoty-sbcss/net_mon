@@ -509,6 +509,9 @@ _ICX_PASS_PROMPT_RE = re.compile(r"ssword:\s*$", re.I)
 # How long to wait for the switch to settle after the one enable credential (a
 # RADIUS/TACACS round trip can pause the reply for several seconds).
 _ICX_ENABLE_SETTLE_SEC = 20.0
+# "Quiet" = no new bytes for this long; polled every _ICX_POLL_SEC.
+_ICX_QUIET_SEC = 1.0
+_ICX_POLL_SEC = 0.1
 
 
 # CSI / charset-select escapes a terminal may append to a prompt (`\x1b[K`, ...).
@@ -587,33 +590,51 @@ def _icx_connection_class() -> Any:
                 return  # close the transport only (disconnect does that next)
             super().cleanup(command=command)
 
+        def _icx_read_quiet(self, deadline: float) -> str:
+            """Bytes that arrive until the channel has been quiet _ICX_QUIET_SEC.
+
+            Returns "" when nothing arrives in that window. Deliberately NOT netmiko's
+            read_channel_timing(): that one never returns empty — on a silent channel
+            it waits out read_timeout and RAISES — so "the switch is waiting at its
+            Password: prompt" would read as a timeout and every healthy ICX would be
+            reported as a refused enable (Codex N12).
+            """
+            data = ""
+            last_new = time.monotonic()
+            while time.monotonic() < deadline:
+                time.sleep(_ICX_POLL_SEC)
+                new = str(self.read_channel() or "")
+                if new:
+                    data += new
+                    last_new = time.monotonic()
+                elif time.monotonic() - last_new >= _ICX_QUIET_SEC:
+                    break
+            return data
+
         def _icx_settle(self) -> tuple[str, str]:
             """Read without writing until the output settles on a whole prompt line.
 
             Returns (verdict, text). A credential prompt must STILL be the last line
-            after one more quiet read before it counts (a banner can arrive in pieces
-            and pause on "Login:"). "timeout" after _ICX_ENABLE_SETTLE_SEC or on any
-            read error.
+            after a quiet window with nothing new (a banner can arrive in pieces and
+            pause on "Login:"). "timeout" after _ICX_ENABLE_SETTLE_SEC or on any read
+            error.
             """
             text = ""
-            cred_seen_at = -1
             deadline = time.monotonic() + _ICX_ENABLE_SETTLE_SEC
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return "timeout", text
+            while time.monotonic() < deadline:
                 try:
-                    text += str(self.read_channel_timing(
-                        last_read=1.0, read_timeout=max(1.0, remaining)))
-                except Exception:  # noqa: BLE001 — read timeout / channel error
+                    new = self._icx_read_quiet(deadline)
+                except Exception:  # noqa: BLE001 — channel error
                     return "timeout", text
+                text += new
                 verdict = _icx_enable_verdict(text, str(getattr(self, "base_prompt", "")))
                 if verdict in ("priv", "unpriv"):
                     return verdict, text
-                if verdict in ("user", "pass"):
-                    if cred_seen_at == len(text):  # nothing new since: it is waiting
-                        return verdict, text
-                    cred_seen_at = len(text)
+                if verdict in ("user", "pass") and not new.strip():
+                    # Already the last line before this window, and the window
+                    # brought nothing: the switch is waiting for it.
+                    return verdict, text
+            return "timeout", text
 
         def enable(
             self,

@@ -410,16 +410,17 @@ class _FakeChannel:
 
     def __init__(
         self,
-        script: dict[str, list[str | Exception]],
+        script: dict[str, list[str | Exception | None]],
         *,
         start_enabled: bool = False,
         base_prompt: str = "SSH@ICX7150-IDF1",
     ) -> None:
         self.script = {k: list(v) for k, v in script.items()}
         self.writes: list[str] = []
-        self.pending: list[str | Exception] = []
+        self.pending: list[str | Exception | None] = []
         self.enabled = start_enabled
         self.base_prompt = base_prompt
+        self.silent_until = 0.0
 
     def install(self, obj: Any) -> None:
         obj.username = "netmon"
@@ -429,7 +430,9 @@ class _FakeChannel:
         obj.normalize_cmd = lambda cmd: cmd + "\n"
         obj.read_until_prompt_or_pattern = lambda **kw: pytest.fail("stream-matched")
         obj.read_until_prompt = lambda **kw: pytest.fail("waited on the prompt alone")
-        obj.read_channel_timing = self._timing
+        obj.read_channel = self._read_channel
+        obj.read_channel_timing = lambda **kw: pytest.fail(
+            "read_channel_timing() raises on a silent channel; it cannot detect a waiting prompt")
         obj.check_enable_mode = self._check
 
     def _write(self, data: str) -> None:
@@ -438,10 +441,17 @@ class _FakeChannel:
         self.writes.append(data)
         self.pending = self.script.pop(data)
 
-    def _timing(self, **kw: Any) -> str:
+    def _read_channel(self) -> str:
+        # Real channel semantics: "" when no bytes are waiting. A None chunk is a
+        # pause longer than the quiet window (the switch goes silent mid-output).
+        if _CLOCK.monotonic() < self.silent_until:
+            return ""
         if not self.pending:
             return ""
         nxt = self.pending.pop(0)
+        if nxt is None:
+            self.silent_until = _CLOCK.monotonic() + 3 * device_config._ICX_QUIET_SEC
+            return ""
         if isinstance(nxt, Exception):
             raise nxt
         return nxt
@@ -459,10 +469,56 @@ def _icx_instance(chan: _FakeChannel) -> Any:
     return obj
 
 
+class _VirtualClock:
+    """Deterministic time for the enable exchange: sleep() advances monotonic().
+
+    Real sleeps made the pause cases nondeterministic (Windows sleep granularity is
+    ~15 ms, so a "pause" could fall anywhere) — a timing test that can pass for the
+    wrong reason proves nothing.
+    """
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, dt: float) -> None:
+        self.now += dt
+
+
+_CLOCK = _VirtualClock()
+
+
+@pytest.fixture(autouse=True)
+def _virtual_icx_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    import types
+
+    monkeypatch.setattr(device_config, "time", types.SimpleNamespace(
+        monotonic=_CLOCK.monotonic, sleep=_CLOCK.sleep))
+
+
 _PRIV = "SSH@ICX7150-IDF1#"
 _UNPRIV = "SSH@ICX7150-IDF1>"
 _EN, _USER, _PW = "enable\n", "netmon\n", "the-ssh-password\n"
 _BAD = "Error - Incorrect username or password.\n"
+
+
+def test_icx_a_waiting_password_prompt_is_answered_on_a_silent_channel() -> None:
+    # Codex N12: the switch prints "Password:" and then sends NOTHING while it waits.
+    # That silence must read as "waiting", and get exactly one answer.
+    chan = _FakeChannel({_EN: ["Pass", "word:"], _PW: [_PRIV]})
+    _icx_instance(chan).enable()
+    assert chan.writes == [_EN, _PW]
+
+
+def test_icx_a_long_pause_on_a_credential_word_after_the_secret_is_a_refusal() -> None:
+    # Indistinguishable from a real re-prompt, so it must take the SAFE branch:
+    # refuse (counted), never answer a second time.
+    chan = _FakeChannel({_EN: ["Password:"], _PW: ["Login:", None, " use your district account\n", _PRIV]})
+    with pytest.raises(device_config.IcxEnableRejected):
+        _icx_instance(chan).enable()
+    assert chan.writes == [_EN, _PW]
 
 
 def test_icx_enable_skipped_when_already_privileged() -> None:
@@ -493,8 +549,8 @@ def test_icx_enable_password_only() -> None:
         ["SSH@ICX7150-IDF1: Error - RADIUS authentication failed\nPassword:"],
         ["User Name:"],
         ["SSH@ICX7150-IDF1: Error - RADIUS rejected\nPolicy #17 denies SSH@ICX7150-IDF1 access\n" + _UNPRIV],
-        ["", _BAD + _UNPRIV],  # slow AAA
-        ["Access denied for SSH@ICX7150-IDF1#", "\nPassword:"],
+        [None, _BAD + _UNPRIV],  # slow AAA
+        ["Access denied for SSH@ICX7150-IDF1#", None, "\nPassword:"],
         ["Access denied for SSH@ICX7150-IDF1#\nPassword:"],
         [TimeoutError("read timeout")],
     ],
@@ -521,11 +577,11 @@ def test_icx_enable_failures_are_one_credential_then_rejected(after_pw: list[str
         (["Notice: Login: use your district account\nPassword: never share it\n" + _PRIV], "SSH@ICX7150-IDF1"),
         (["Help with incorrect password: call IT\n" + _PRIV], "SSH@ICX7150-IDF1"),
         (["Login:", " use your district account\n", _PRIV], "SSH@ICX7150-IDF1"),
-        (["", _PRIV], "SSH@ICX7150-IDF1"),
+        ([None, _PRIV], "SSH@ICX7150-IDF1"),  # slow AAA: silence, then the prompt
         (["SSH@error-switch#"], "SSH@error-switch"),
         (["SSH@login-switch#"], "SSH@login-switch"),
         (["SSH@ICX7150-IDF1#\x1b[K"], "SSH@ICX7150-IDF1"),
-        (["SSH@ICX7150-IDF1#\x1b[", "K"], "SSH@ICX7150-IDF1"),
+        (["SSH@ICX7150-IDF1#\x1b[", None, "K"], "SSH@ICX7150-IDF1"),
         (["\r\nSSH@ICX7150-IDF1# \r"], "SSH@ICX7150-IDF1"),
         (["\x1b[?25hSSH@sw#"], "\x1b[?25hSSH@sw"),
     ],
