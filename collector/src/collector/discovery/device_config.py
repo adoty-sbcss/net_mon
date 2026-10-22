@@ -261,6 +261,12 @@ _ICX_REDACT_PATTERNS = [
         r"^(\s*snmp-server host \S+ version v(?:1|2c) (?:[0-9] )?)(?P<sec>\"[^\"]*\"|\S+)",
         r"(\bsnmp-server user .*?\bpriv encrypted (?:des|aes\S*) )(?P<sec>\S+)",
         r"(\bmd5-authentication key-id \d+ key (?:[0-9] )?)(?P<sec>\S+)",
+        # Current OSPFv2/v3 + virtual-link form:
+        # `[ipv6 ospf|area N virtual-link IP] authentication md5|hmac-sha-1|hmac-sha-256
+        # key-id N key <k>`.
+        r"(\bauthentication (?:md5|hmac-sha-1|hmac-sha-256) key-id \d+ key (?:[0-9] )?)(?P<sec>\S+)",
+        # key-chain body: `key-id N` / `password <k>`.
+        r"^(\s*password (?:[0-9] )?)(?P<sec>\S+)",
         # OSPF interface / virtual-link plain-text auth (08.0.70+).
         r"(\bauthentication plain-text (?:[0-9] )?)(?P<sec>\S+)",
         # VRRP / VRRP-E `auth-type simple-text-auth|md5-auth <pw>` and VSRP-aware
@@ -496,6 +502,14 @@ class IcxNoEnableAccess(Exception):
     """ICX signed us in, but offers no way into privileged mode for this account."""
 
 
+# What may follow the one enable credential on ICX, besides the prompt.
+_ICX_ENABLE_AFTER_RE = r"(?:ssword:|User Name:|Login:|incorrect (?:username or )?password)"
+# A credential prompt the device is still waiting at (end of the read).
+_ICX_REPROMPT_RE = re.compile(r"(?:ssword|User Name|Login):\s*$", re.I)
+# FastIron's rejection: "Error - Incorrect username or password."
+_ICX_REJECTED_RE = re.compile(r"incorrect (?:username or )?password", re.I)
+
+
 def _icx_connection_class() -> Any:
     """netmiko's FastIron driver with ONE enable attempt instead of three.
 
@@ -544,18 +558,22 @@ def _icx_connection_class() -> Any:
                     pattern=pattern, re_flags=re_flags, read_entire_line=True))
             if "ssword" in out:
                 self.write_channel(self.normalize_cmd(self.secret))
-                # Stop at the prompt OR at a fresh credential prompt / error. Waiting
-                # for the prompt alone would hang on a device that re-prompts after a
-                # wrong password, and the ReadTimeout would classify as a reach
-                # timeout that the auth breaker never counts. Anything but a clean
-                # privileged prompt after the ONE credential is a rejection.
+                # Stop at the prompt OR at a fresh credential prompt / the FastIron
+                # rejection message. Waiting for the prompt alone would hang on a
+                # device that re-prompts after a wrong password, and the ReadTimeout
+                # would classify as a reach timeout the auth breaker never counts.
+                # Only a credential prompt AT THE END of the read, or the specific
+                # rejection text, is a refusal: an EXEC banner ("Authorized login
+                # only") or a hostname ("SSH@login-sw#") must not be. Never answer a
+                # re-prompt — check_enable_mode() sends a RETURN, which at a password
+                # prompt would be a second (empty) login attempt.
                 try:
                     after = str(self.read_until_prompt_or_pattern(
-                        pattern=r"(?:ssword|User Name|Login|incorrect|error)",
-                        re_flags=re.IGNORECASE, read_entire_line=True))
+                        pattern=_ICX_ENABLE_AFTER_RE, re_flags=re.IGNORECASE,
+                        read_entire_line=True))
                 except Exception as exc:  # noqa: BLE001 — timeout after the credential
                     raise IcxEnableRejected("no prompt after the enable credential") from exc
-                if re.search(r"ssword|user name|login|incorrect|error", after, re.I):
+                if _ICX_REPROMPT_RE.search(after) or _ICX_REJECTED_RE.search(after):
                     raise IcxEnableRejected("enable refused")
             if not self.check_enable_mode():
                 raise IcxEnableRejected("enable refused")

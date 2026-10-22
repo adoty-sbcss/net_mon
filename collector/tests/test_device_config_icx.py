@@ -241,6 +241,10 @@ def test_icx_startup_config_is_redacted_too() -> None:
         ("  ip vrrp auth-type simple-text-auth vrrp1", "vrrp1"),
         (" auth-mode passcode static 1234", "1234"),
         ("radius-client coa host 10.0.0.5 key CoaPlain99", "CoaPlain99"),
+        (" ip ospf authentication md5 key-id 10 key mykey1", "mykey1"),
+        (" ipv6 ospf authentication hmac-sha-256 key-id 10 key mykey2", "mykey2"),
+        (" area 1 virtual-link 192.0.2.1 authentication hmac-sha-1 key-id 10 key mykey3", "mykey3"),
+        ("  password kcpw4", "kcpw4"),
         ("radius-client coa host 10.0.0.5 key 2 $Y29ha2V5MQ==", "$Y29ha2V5MQ=="),
         # Unencrypted SNMPv3 display form: `priv des <pw>` used to mask `des`.
         ("snmp-server user u1 g1 v3 auth md5 Auth1Pass9 priv des Priv1Pass9", "Priv1Pass9"),
@@ -463,6 +467,29 @@ def test_icx_enable_reprompt_after_wrong_password_is_a_rejection_not_a_hang() ->
     with pytest.raises(device_config.IcxEnableRejected):
         _icx_instance(chan).enable()
     assert chan.writes.count("the-ssh-password\n") == 1
+
+
+@pytest.mark.parametrize(
+    "after",
+    [
+        "Authorized login only.\nSSH@ICX7150-IDF1#",
+        "Report errors to IT.\nSSH@ICX7150-IDF1#",
+        "Login: use your district account\nSSH@ICX7150-IDF1#",
+        "SSH@error-switch#",
+        "SSH@login-switch#",
+    ],
+)
+def test_icx_enable_success_with_banner_or_hostname_words_is_not_a_rejection(after: str) -> None:
+    chan = _FakeChannel(["Password:"], enabled_after=True, after_secret=after)
+    _icx_instance(chan).enable()
+    assert chan.writes.count("the-ssh-password\n") == 1
+
+
+def test_icx_enable_rejection_message_is_a_rejection_even_back_at_the_prompt() -> None:
+    chan = _FakeChannel(["Password:"], enabled_after=True,
+                        after_secret="Error - Incorrect username or password.\nSSH@ICX7150-IDF1#")
+    with pytest.raises(device_config.IcxEnableRejected):
+        _icx_instance(chan).enable()
 
 
 def test_icx_enable_timeout_after_the_credential_is_a_rejection() -> None:
