@@ -17,9 +17,13 @@ Security / robustness posture (mirrors dhcp_server.py):
     records a status/error and never crashes the poll loop.
   * Bounded by a per-device SSH timeout AND a whole-pass wall-clock budget.
   * netmiko is imported lazily so a box without the dep (feature off) imports clean.
-  * READ-ONLY: only `show`-class commands are ever sent and enable/config mode is
-    NEVER entered — the contract is a show-only account (IOS parser view /
-    NX-OS network-operator / AOS-CX operators). See the SEC threat model.
+  * READ-ONLY: only `show`-class commands are ever sent and config mode is NEVER
+    entered — the contract is a show-only account (IOS parser view / NX-OS
+    network-operator / AOS-CX operators / ICX `privilege 5`). See the SEC threat
+    model. Enable mode is NEVER entered EXCEPT on Ruckus ICX, where `show
+    running-config` exists only in privileged EXEC; there it is entered once, with
+    the same credential, and a read-only account stays read-only. See
+    _icx_connection_class.
   * REDACTION: secrets (snmp communities, local password hashes, enable secret,
     radius/tacacs keys, PSKs, private-key blocks) are masked with a deterministic
     keyed token BEFORE the config is written, so the plaintext secret never leaves
@@ -45,6 +49,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import threading
@@ -73,8 +78,9 @@ _MAX_CONFIG_BYTES = 4 * 1024 * 1024
 
 # Per-platform fetch commands (netmiko device_type -> running / startup show cmds).
 # netmiko disables paging automatically in session_preparation, and we NEVER enter
-# enable/config mode. Juniper/EXOS have no separate startup (single committed/running
-# config), so startup is None there.
+# config mode (enable only on ICX — see _icx_connection_class). Juniper/EXOS have no
+# separate startup (single committed/running config), so startup is None there.
+# ICX (FastIron) is Cisco-like, but `show configuration` is its STARTUP config.
 _PLATFORM_CMDS: dict[str, dict[str, str | None]] = {
     "cisco_ios": {"running": "show running-config", "startup": "show startup-config"},
     "cisco_xe": {"running": "show running-config", "startup": "show startup-config"},
@@ -85,6 +91,7 @@ _PLATFORM_CMDS: dict[str, dict[str, str | None]] = {
     "ubiquiti_edgeswitch": {"running": "show running-config", "startup": "show startup-config"},
     "netgear_prosafe": {"running": "show running-config", "startup": "show startup-config"},
     "extreme_exos": {"running": "show configuration", "startup": None},
+    "ruckus_fastiron": {"running": "show running-config", "startup": "show configuration"},
 }
 
 
@@ -129,9 +136,9 @@ _REDACT_PATTERNS = [
     for p in (
         # -- Cisco IOS / IOS-XE / NX-OS --
         r"^(\s*snmp-server community )(?P<sec>\"[^\"]*\"|\S+)",
-        r"^(\s*snmp-server host \S+ (?:vrf \S+ )?(?:informs |traps )?(?:version (?:1|2c|3 (?:auth|noauth|priv)) )?(?:community )?)(?P<sec>\S+)",
+        r"^(\s*snmp-server host \S+ (?:vrf \S+ )?(?:informs |traps )?(?:version (?:v?1|v?2c|v?3 (?:auth|noauth|priv)) )?(?:community )?)(?P<sec>\S+)",
         r"(\bsnmp-server user \S+ \S+ .*?\bauth (?:md5|sha(?:-?(?:224|256|384|512))?) )(?P<sec>\S+)",
-        r"(\bsnmp-server user \S+ .*?\bpriv (?:aes[ -]?(?:128|192|256)? |des56? |3des )?)(?P<sec>(?!localizedkey\b|access\b)\S+)",
+        r"(\bsnmp-server user \S+ .*?\bpriv (?:aes[ -]?(?:128|192|256)? |des(?:56)? |3des )?)(?P<sec>(?!localizedkey\b|access\b)\S+)",
         r"^(\s*key config-key password-encrypt )(?P<sec>.+?)\s*$",
         r"^(\s*crypto isakmp key (?:[06] )?)(?P<sec>.+?)(?=\s+(?:address|hostname)\b|\s*$)",
         r"^(\s*(?:ikev[12] (?:local-authentication |remote-authentication )?)?pre-shared-key (?:address \S+ |hostname \S+ )?(?:local |remote )?(?:key |hex )?(?:[06] )?)(?P<sec>.+?)\s*$",
@@ -226,12 +233,57 @@ _REDACT_PATTERNS = [
         r"^(\s*encrypted-password )(?P<sec>\"[^\"]*\"|[^\s;]+)",
         r"^(\s*secret )(?P<sec>\"[^\"]*\"|[^\s;]+)",
         r"^(\s*community )(?P<sec>(?!r[ow]\b|read\b|write\b|encrypted\b|ciphertext\b|plaintext\b)(?:\"[^\"]*\"|[^\s;{]+))(?=\s*[;{]|\s*$)",
-        r"^(\s*(?:authentication-key|privacy-key|authentication-password|privacy-password|chap-secret) )(?P<sec>(?!\d+ type\b)(?:\"[^\"]*\"|[^\s;]+))",
+        r"^(\s*(?:authentication-key|privacy-key|authentication-password|privacy-password|chap-secret) )(?P<sec>(?!\d+ type\b|key-id\b)(?:\"[^\"]*\"|[^\s;]+))",
         # -- Cross-vendor backstops --
         r"(\b(?:ftp|sftp|scp|tftp|https?)://[^:/@\s]+:)(?P<sec>[^@\s]+)(?=@)",
         r"(\b(?:passphrase|wpa-passphrase|presharedkey|psk|auth-password|priv-password|wep-key\d?) )(?P<sec>\"[^\"]*\"|\S+)",
     )
 ]
+# Ruckus / Brocade ICX (FastIron) — applied ON TOP OF the list above, and ONLY when
+# the target's platform is `ruckus_fastiron`. Scoped on purpose: the `<digit> $blob`
+# catch-all below would also mask free text on other vendors ("Room 2 $5" in a
+# description or banner), and any change to their redacted output re-versions every
+# existing device's backup with a phantom config change.
+#
+# FastIron prints most secrets as `<type-digit> <value>`: `8 $1$salt$hash` (md5-crypt,
+# which _DOLLAR_RE already claims) or `2 $<base64>` — a REVERSIBLE encoding with public
+# decoders and NO second `$`, so _DOLLAR_RE does not see it. The Cisco-shaped patterns
+# above mask the type DIGIT as if it were the secret (`snmp-server community 2 $x ro`
+# -> the `2`) and leave the real value to the backstop — the FASTPATH failure shape.
+# The plaintext forms (`no service password-encryption`) matter as much: a short
+# password is not credential-shaped enough for the backstop to catch.
+_ICX_REDACT_PATTERNS = [
+    re.compile(p, re.M | re.I)
+    for p in (
+        r"^(\s*enable (?:super-user|read-only|port-config)-password (?:[0-9] )?)(?P<sec>.+?)\s*$",
+        r"^(\s*enable telnet password )(?P<sec>.+?)\s*$",
+        r"^(\s*snmp-server community [0-9] )(?P<sec>\"[^\"]*\"|\S+)",
+        r"^(\s*snmp-server host \S+ version v(?:1|2c) (?:[0-9] )?)(?P<sec>\"[^\"]*\"|\S+)",
+        r"(\bsnmp-server user .*?\bpriv encrypted (?:des|aes\S*) )(?P<sec>\S+)",
+        r"(\bmd5-authentication key-id \d+ key (?:[0-9] )?)(?P<sec>\S+)",
+        # Current OSPFv2/v3 + virtual-link form:
+        # `[ipv6 ospf|area N virtual-link IP] authentication md5|hmac-sha-1|hmac-sha-256
+        # key-id N key <k>`.
+        r"^(\s*(?:ip ospf |ipv6 ospf |area \S+ virtual-link \S+ )authentication (?:md5|hmac-sha-1|hmac-sha-256) key-id \d+ key (?:[0-9] )?)(?P<sec>\S+)",
+        # key-chain body (`key-id N` / `  password <k>`): INDENTED only, so a banner
+        # line that merely starts with the word "password" is left alone.
+        r"^([ \t]+password (?:[0-9] )?)(?P<sec>\S+)",
+        # OSPF interface / virtual-link plain-text auth (08.0.70+).
+        r"^(\s*(?:ip ospf |area \S+ virtual-link \S+ )authentication plain-text (?:[0-9] )?)(?P<sec>\S+)",
+        # VRRP / VRRP-E `auth-type simple-text-auth|md5-auth <pw>` and VSRP-aware
+        # `vsrp-aware vrid N simple-text-auth <pw>`.
+        r"(\b(?:simple-text-auth|md5-auth) (?:[0-9] )?)(?P<sec>\S+)",
+        r"^(\s*authentication-key key-id \d+ (?:md5|sha1|sha256) (?:[0-9] )?)(?P<sec>\S+)",
+        r"^(\s*mac-authentication password-override (?:[0-9] )?)(?P<sec>\S+)",
+        r"(\bauth-mode passcode static )(?P<sec>\S+)",
+        r"^(\s*radius-client coa host \S+ .*?\bkey (?:[0-9] )?)(?P<sec>\S+)",
+        # Any `<type-digit> $<blob>` pair, on any ICX command: the encoded form is
+        # always written this way, so a command this list has never heard of still
+        # masks.
+        r"((?:^|\s)[0-9] )(?P<sec>\$[^\s\"';]+)",
+    )
+]
+
 # G1: any $-format hash / reversible blob anywhere on any line — the highest-value
 # catch-all (Cisco type-5/8/9, Junos $9$, Linux $5$/$6$, apr1, bcrypt). Whole match
 # IS the secret.
@@ -348,8 +400,14 @@ def _backstop_line(line: str) -> tuple[str, int]:
     return line, len(spans)
 
 
-def _redact_config(text: str | None, key: bytes) -> tuple[str | None, int]:
+def _redact_config(
+    text: str | None, key: bytes, platform: str | None = None
+) -> tuple[str | None, int]:
     """Mask every recognized secret. Returns (redacted_text, suspect_count).
+
+    `platform` adds that platform's own patterns on top of the cross-vendor list
+    (today only `ruckus_fastiron`, see _ICX_REDACT_PATTERNS). Omitting it is the
+    pre-ICX behaviour, byte for byte.
 
     Architecture (per the Fable adversarial review): collect the (?P<sec>) spans of
     ALL patterns against the SAME text, union overlaps, and replace in ONE right-to
@@ -379,7 +437,8 @@ def _redact_config(text: str | None, key: bytes) -> tuple[str | None, int]:
 
     # 2. Collect all secret spans over the (block-redacted) text.
     spans: list[list[int]] = []
-    for rx in (*_REDACT_PATTERNS, _DOLLAR_RE):
+    extra = _ICX_REDACT_PATTERNS if platform == "ruckus_fastiron" else []
+    for rx in (*_REDACT_PATTERNS, *extra, _DOLLAR_RE):
         for m in rx.finditer(text):
             if m.groupdict().get("sec"):
                 spans.append([m.start("sec"), m.end("sec")])
@@ -434,6 +493,232 @@ def _redact_key() -> bytes:
 # ---------------------------------------------------------------------------
 # Per-device fetch
 # ---------------------------------------------------------------------------
+
+
+class IcxEnableRejected(Exception):
+    """ICX signed us in, then refused privileged (enable) mode for the credential."""
+
+
+class IcxNoEnableAccess(Exception):
+    """ICX signed us in, but offers no way into privileged mode for this account."""
+
+
+# Credential prompts the device is waiting at, as the LAST line of its output.
+_ICX_USER_PROMPT_RE = re.compile(r"(?:User Name|Login):\s*$", re.I)
+_ICX_PASS_PROMPT_RE = re.compile(r"ssword:\s*$", re.I)
+# How long to wait for the switch to settle after the one enable credential (a
+# RADIUS/TACACS round trip can pause the reply for several seconds).
+_ICX_ENABLE_SETTLE_SEC = 20.0
+# "Quiet" = no new bytes for this long; polled every _ICX_POLL_SEC.
+_ICX_QUIET_SEC = 1.0
+_ICX_POLL_SEC = 0.1
+
+
+# CSI / charset-select escapes a terminal may append to a prompt (`\x1b[K`, ...).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][A-Za-z0-9]|\x1b[=>]")
+
+
+def _icx_last_line(text: str) -> str:
+    text = _ANSI_RE.sub("", text)
+    lines = [ln.strip() for ln in text.replace("\r", "\n").split("\n") if ln.strip()]
+    return lines[-1] if lines else ""
+
+
+def _icx_enable_verdict(after: str, base_prompt: str) -> str | None:
+    """Classify switch output from its LAST line (used at every step of `enable`).
+
+    "priv"   = the last line IS the privileged prompt `<base_prompt>#`.
+    "unpriv" = the last line IS the unprivileged prompt `<base_prompt>>`.
+    "user"   = the last line ends in a username prompt (`User Name:` / `Login:`).
+    "pass"   = the last line ends in a password prompt (`Password:`).
+    None     = not settled (banner / AAA text still arriving, or nothing yet).
+
+    Only the final line is read, and only a WHOLE prompt line counts. Everything
+    above it is banner, MOTD or AAA chatter whose words prove nothing — reviewers
+    built false verdicts for every stream-matching variant: "Authorized login only",
+    "Notice: SSH@sw" above a `Password:`, a hostname `SSH@login-switch#`, "Access
+    denied for SSH@sw#", "Policy #17 denies ...".
+    """
+    last = _icx_last_line(after)
+    if not last:
+        return None
+    # Normalise the prompt the same way as the reply: netmiko captured it raw, and a
+    # prompt that arrived with an escape prefix (`\x1b[?25hSSH@sw>`) would otherwise
+    # never equal the stripped reply.
+    base_prompt = _ANSI_RE.sub("", base_prompt).strip()
+    if base_prompt and last == base_prompt + "#":
+        return "priv"
+    if base_prompt and last == base_prompt + ">":
+        return "unpriv"
+    if _ICX_PASS_PROMPT_RE.search(last):
+        return "pass"
+    if _ICX_USER_PROMPT_RE.search(last):
+        return "user"
+    return None
+
+
+def _icx_connection_class() -> Any:
+    """netmiko's FastIron driver with ONE enable attempt instead of three.
+
+    `show running-config` exists only in ICX privileged EXEC, so the stock driver's
+    session_preparation always runs `enable`. Its enable() retries a rejected
+    password up to three times per device, and the failure surfaces as a ValueError
+    raised before ConnectHandler returns — which classify_exception cannot tell from
+    any other pre-auth error, so the auth breaker never counts it. A district-wide
+    enable mismatch would be three failed logins per switch, all night, uncounted:
+    exactly the lockout the breaker exists to prevent.
+
+    Here: one attempt, using the SSH credential itself (netmiko answers ICX's
+    `User Name:` prompt with the username, then `secret`). That is the supported
+    setup — `aaa authentication enable default local` (enable re-checks the same
+    account) or `aaa authentication login privilege-mode` (the account lands in
+    privileged mode and nothing is sent). A rejection raises IcxEnableRejected, which
+    _fetch_one reports as stage `auth` so the breaker counts it.
+    """
+    from netmiko.ruckus import RuckusFastironSSH  # lazy, like ConnectHandler
+
+    class _IcxReadOnlySSH(RuckusFastironSSH):  # type: ignore[misc]
+        # True from the moment the switch asks for a credential until it shows the
+        # privileged prompt. While True, nothing may be written: a refused enable
+        # raises into netmiko's _try_session_preparation -> disconnect() -> the
+        # Cisco cleanup(), which sends a RETURN (check_config_mode) and `exit` —
+        # at a waiting `Password:` that is a second, empty login attempt.
+        _icx_unresolved = False
+
+        def cleanup(self, command: str = "exit") -> None:
+            if self._icx_unresolved:
+                return  # close the transport only (disconnect does that next)
+            super().cleanup(command=command)
+
+        def _icx_read_quiet(self, deadline: float) -> str:
+            """Bytes that arrive until the channel has been quiet _ICX_QUIET_SEC.
+
+            Returns "" when nothing arrives in that window. Deliberately NOT netmiko's
+            read_channel_timing(): that one never returns empty — on a silent channel
+            it waits out read_timeout and RAISES — so "the switch is waiting at its
+            Password: prompt" would read as a timeout and every healthy ICX would be
+            reported as a refused enable (Codex N12).
+            """
+            data = ""
+            last_new = time.monotonic()
+            while time.monotonic() < deadline:
+                time.sleep(_ICX_POLL_SEC)
+                new = str(self.read_channel() or "")
+                if new:
+                    data += new
+                    last_new = time.monotonic()
+                elif time.monotonic() - last_new >= _ICX_QUIET_SEC:
+                    break
+            return data
+
+        def _icx_settle(self) -> tuple[str, str]:
+            """Read without writing until the output settles on a whole prompt line.
+
+            Returns (verdict, text). A credential prompt must STILL be the last line
+            after a quiet window with nothing new (a banner can arrive in pieces and
+            pause on "Login:"). "timeout" after _ICX_ENABLE_SETTLE_SEC or on any read
+            error.
+            """
+            text = ""
+            deadline = time.monotonic() + _ICX_ENABLE_SETTLE_SEC
+            while time.monotonic() < deadline:
+                try:
+                    new = self._icx_read_quiet(deadline)
+                except Exception:  # noqa: BLE001 — channel error
+                    return "timeout", text
+                text += new
+                verdict = _icx_enable_verdict(text, str(getattr(self, "base_prompt", "")))
+                if verdict in ("priv", "unpriv"):
+                    return verdict, text
+                if verdict in ("user", "pass") and not new.strip():
+                    # Already the last line before this window, and the window
+                    # brought nothing: the switch is waiting for it.
+                    return verdict, text
+            return "timeout", text
+
+        def enable(
+            self,
+            cmd: str = "enable",
+            pattern: str = "",
+            enable_pattern: str | None = None,
+            check_state: bool = True,
+            re_flags: int = re.IGNORECASE,
+        ) -> str:
+            # Before `enable` we sit at the login prompt, so check_enable_mode()'s
+            # RETURN is harmless here — and nowhere after.
+            if check_state and self.check_enable_mode():
+                return ""
+            # Armed BEFORE `enable` is sent, cleared only at a whole prompt line:
+            # any exception from here on must leave cleanup() unable to type into a
+            # waiting credential prompt.
+            self._icx_unresolved = True
+            self.write_channel(self.normalize_cmd(cmd))
+            sent_user = sent_secret = False
+            while True:
+                verdict, _text = self._icx_settle()
+                if verdict == "priv":
+                    # Includes "No password has been assigned yet..." followed by `#`:
+                    # a switch with no super-user password grants privileged mode.
+                    self._icx_unresolved = False
+                    return ""
+                if verdict == "unpriv":
+                    self._icx_unresolved = False  # at `>`: nothing pending any more
+                    if sent_user or sent_secret:
+                        raise IcxEnableRejected("enable refused")
+                    # Back at `>` without being asked for anything: no enable path
+                    # for this account. No credential was offered, nothing can lock.
+                    raise IcxNoEnableAccess("no enable path for this account")
+                if verdict == "user" and not sent_user and not sent_secret:
+                    sent_user = True
+                    self.write_channel(self.normalize_cmd(self.username))
+                    continue
+                if verdict == "pass" and not sent_secret:
+                    # The ONE credential. After it nothing more is written: a second
+                    # prompt is a refusal, never answered.
+                    sent_secret = True
+                    self.write_channel(self.normalize_cmd(self.secret))
+                    continue
+                # A re-prompt, a timeout, or something we will not answer. Always
+                # stage `auth` (the breaker counts it): erring that way can only stop
+                # a run early, never lock an account.
+                raise IcxEnableRejected(f"enable did not complete ({verdict})")
+
+    return _IcxReadOnlySSH
+
+
+def _connect(platform: str, **kwargs: Any) -> Any:
+    """Open a netmiko session for `platform` (ICX gets its one-attempt driver).
+
+    netmiko logs every channel write and read at DEBUG — on ICX that includes the
+    enable password, on every platform the raw UNREDACTED config — and the
+    collector's root logger runs at DEBUG whenever an operator sets
+    NETMON_LOG_LEVEL=DEBUG, into a file `collect-logs` ships to the dashboard. Pin
+    netmiko above DEBUG regardless.
+    """
+    logging.getLogger("netmiko").setLevel(max(logging.INFO, logging.getLogger("netmiko").level))
+    if platform == "ruckus_fastiron":
+        return _icx_connection_class()(device_type=platform, secret=kwargs.get("password", ""), **kwargs)
+    from netmiko import ConnectHandler
+
+    return ConnectHandler(device_type=platform, **kwargs)
+
+
+# FastIron prints a header above the config — `Current configuration:` for running,
+# `Startup-config data location is flash memory` / `Startup configuration:` and
+# extra `!` separators for startup. They name the COMMAND, not the config, so left in
+# they make every ICX read as permanently drifted (the ArubaOS-CX banner bug). The
+# config proper always opens with its `ver <release>` line.
+_ICX_VER_RE = re.compile(r"^ver\s+\S", re.M)
+
+
+def _strip_icx_preamble(text: str | None) -> str | None:
+    """Drop everything above the `ver` line (only if it is in the first 20 lines)."""
+    if not text:
+        return text
+    m = _ICX_VER_RE.search(text)
+    if m is None or text.count("\n", 0, m.start()) > 20:
+        return text
+    return text[m.start():]
 
 
 def _fetch_one(
@@ -495,7 +780,7 @@ def _fetch_one(
     port = int(target.get("port") or 22)
 
     try:
-        from netmiko import ConnectHandler  # lazy: only when a device is fetched
+        import netmiko  # noqa: F401 — lazy: only when a device is fetched
     except Exception as exc:  # pragma: no cover — dep-missing guard
         # The detail goes to the log, not the payload: this result renders in a
         # browser, and "only codes and numbers" has no useful exceptions.
@@ -507,8 +792,8 @@ def _fetch_one(
     startup: str | None = None
     authenticated = False
     try:
-        conn = ConnectHandler(
-            device_type=platform,
+        conn = _connect(
+            platform,
             host=host,
             port=port,
             username=user,
@@ -528,6 +813,16 @@ def _fetch_one(
                 startup = str(conn.send_command(start_cmd, read_timeout=ssh_timeout * 2))
             except Exception:  # noqa: BLE001 — startup is optional (may be unset)
                 startup = None
+    except IcxEnableRejected:
+        # Signed in, then enable refused the same credential. Stage `auth` on purpose:
+        # it IS a failed login attempt on the device, so the breaker must count it.
+        log.info("device ssh failed", host=host, stage="auth", code="auth.enable_rejected")
+        return _fail("auth", "auth.enable_rejected")
+    except IcxNoEnableAccess:
+        # Signed in; the switch has no enable path for this account. No password was
+        # tried, nothing can lock — the account just needs privileged read access.
+        log.info("device ssh failed", host=host, stage="authz", code="authz.no_read_access")
+        return _fail("authz", "authz.no_read_access")
     except Exception as exc:  # noqa: BLE001 — connect / auth / timeout / read
         # Probe liveness ONLY for a pre-auth failure, and only to split the two
         # reach timeouts: "answers but SSH is filtered/off" vs "nothing there at
@@ -547,6 +842,10 @@ def _fetch_one(
     # Signed in, but the account isn't permitted to read the config. The password is
     # RIGHT — the least-privilege role was never applied to this box — and calling
     # this an auth failure sends the operator to rotate working credentials.
+    if platform == "ruckus_fastiron":
+        running = _strip_icx_preamble(running)
+        startup = _strip_icx_preamble(startup)
+
     if ssh_diag.looks_like_authz_denial(running):
         return _fail("authz", "authz.no_read_access")
 
@@ -570,8 +869,8 @@ def _fetch_one(
             "has_startup": startup is not None,
         }
 
-    red_run, sus_run = _redact_config(running, key)
-    red_start, sus_start = _redact_config(startup, key)
+    red_run, sus_run = _redact_config(running, key, platform)
+    red_start, sus_start = _redact_config(startup, key, platform)
     # Fail closed: if a private-key body survived redaction (e.g. a truncated PEM
     # whose END fence never arrived), do NOT ship the config — a leaked key is
     # unacceptable, so surface it as an error the operator sees instead.
