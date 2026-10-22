@@ -556,6 +556,35 @@ def test_icx_cleanup_after_a_refused_enable_writes_nothing() -> None:
     assert chan.writes == ["enable\n", "the-ssh-password\n"]
 
 
+def test_icx_cleanup_writes_nothing_if_the_first_enable_read_fails() -> None:
+    chan = _FakeChannel([])
+    obj = _icx_instance(chan)
+
+    def boom(**kw: Any) -> str:
+        raise TimeoutError("prompt arrived after the read deadline")
+
+    obj.read_until_prompt_or_pattern = boom
+    with pytest.raises(TimeoutError):
+        obj.enable()
+    assert obj._icx_unresolved is True, "an unresolved exchange must keep cleanup silent"
+    writes_before = list(chan.writes)
+    obj.cleanup()
+    assert chan.writes == writes_before == ["enable\n"]
+
+
+def test_icx_enable_uppercase_prompts_are_recognised() -> None:
+    chan = _FakeChannel(["USER NAME:", "PASSWORD:"], after_chunks=[_PRIV])
+    obj = _icx_instance(chan)
+    obj.enable()
+    assert chan.writes == ["enable\n", "netmon\n", "the-ssh-password\n"]
+    assert obj._icx_unresolved is False
+
+
+def test_icx_enable_prompt_with_escape_prefix_is_matched() -> None:
+    chan = _FakeChannel(["Password:"], after_chunks=["\x1b[?25hSSH@sw#"], base_prompt="\x1b[?25hSSH@sw")
+    _icx_instance(chan).enable()
+
+
 def test_icx_cleanup_is_normal_once_privileged() -> None:
     chan = _FakeChannel(["Password:"], after_chunks=[_PRIV])
     obj = _icx_instance(chan)

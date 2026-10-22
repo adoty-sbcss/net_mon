@@ -538,6 +538,10 @@ def _icx_enable_verdict(after: str, base_prompt: str) -> str | None:
     last = _icx_last_line(after)
     if not last:
         return None
+    # Normalise the prompt the same way as the reply: netmiko captured it raw, and a
+    # prompt that arrived with an escape prefix (`\x1b[?25hSSH@sw>`) would otherwise
+    # never equal the stripped reply.
+    base_prompt = _ANSI_RE.sub("", base_prompt).strip()
     # The WHOLE line must be the prompt: "Access denied for SSH@sw#" ends with it too.
     if base_prompt and last == base_prompt + "#":
         return "priv"
@@ -591,29 +595,35 @@ def _icx_connection_class() -> Any:
         ) -> str:
             if check_state and self.check_enable_mode():
                 return ""
+            # Armed BEFORE `enable` is sent, cleared only at a confirmed prompt: any
+            # exception from here on (a read timeout while the switch waits for a
+            # credential included) must leave cleanup() unable to type into it.
+            self._icx_unresolved = True
             self.write_channel(self.normalize_cmd(cmd))
             out = str(self.read_until_prompt_or_pattern(
                 pattern=pattern, re_flags=re_flags, read_entire_line=True))
-            if "No password has been assigned" in out:
+            low = out.lower()
+            asks_user = "user name" in low or "login" in low
+            if "no password has been assigned" in low:
                 # A switch with no super-user password prints this and then GRANTS
-                # privileged mode (the stock driver treats it as success too). Only
-                # a prompt that is still `>` is a dead end — and no password was
-                # sent, so nothing can lock.
+                # privileged mode (the stock driver treats it as success too). No
+                # credential is pending, so the RETURN check_enable_mode() sends is
+                # harmless; a prompt that is still `>` is a dead end.
+                self._icx_unresolved = False
                 if not self.check_enable_mode():
                     raise IcxNoEnableAccess("no enable path for this account")
                 return ""
-            if "User Name" in out or "Login" in out or "ssword" in out:
-                self._icx_unresolved = True
-            if "User Name" in out or "Login" in out:
+            if asks_user:
                 self.write_channel(self.normalize_cmd(self.username))
                 out = str(self.read_until_prompt_or_pattern(
                     pattern=pattern, re_flags=re_flags, read_entire_line=True))
-                if "ssword" not in out:
+                low = out.lower()
+                if "ssword" not in low:
                     # Asked for a username and then not for a password: nothing
                     # sensible to answer, and a RETURN here would be an empty login
                     # attempt.
                     raise IcxEnableRejected("no password prompt after the username")
-            if "ssword" in out:
+            if "ssword" in low:
                 self.write_channel(self.normalize_cmd(self.secret))
                 # After the ONE credential nothing more is written — not even the
                 # RETURN check_enable_mode() sends, which at a re-prompt would be a
@@ -639,12 +649,16 @@ def _icx_connection_class() -> Any:
                         self._icx_unresolved = False
                         return ""
                     if verdict == "unpriv":
+                        # Back at `>`: nothing pending, normal cleanup is safe again.
+                        self._icx_unresolved = False
                         raise IcxEnableRejected("enable refused")
                     if verdict == "reprompt":
                         if reprompt_seen_at == len(after):  # nothing new since: waiting
                             raise IcxEnableRejected("enable re-prompted for a credential")
                         reprompt_seen_at = len(after)
-            # No credential was asked for: we are at a prompt, so this check is safe.
+            # No credential was asked for, so the read ended at a prompt and the
+            # RETURN check_enable_mode() sends is safe.
+            self._icx_unresolved = False
             if not self.check_enable_mode():
                 raise IcxEnableRejected("enable refused")
             return ""
