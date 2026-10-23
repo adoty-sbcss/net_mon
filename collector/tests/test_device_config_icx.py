@@ -718,6 +718,21 @@ def test_fetch_one_icx_backs_up_redacted_and_trimmed(monkeypatch: pytest.MonkeyP
     assert res["redaction_suspects"] == 0
 
 
+def test_fetch_one_reports_suspects_per_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The dashboard stored the running + startup total on BOTH snapshots, so every
+    # device page claimed twice the masked lines. Per-kind counts fix that; the total
+    # stays for dashboards that predate them. (Lives here for _FakeConn; not ICX.)
+    running = "hostname sw1\nauthentication abcdefghijklmnop\n"
+    startup = "hostname sw1\n"
+    conn = _FakeConn({"show running-config": running, "show startup-config": startup})
+    monkeypatch.setattr(device_config, "_connect", lambda platform, **kw: conn)
+    res = device_config._fetch_one({**_TARGET, "platform": "cisco_ios"}, key=_KEY, ssh_timeout=5)
+    assert res["status"] == "ok", res
+    assert res["redaction_suspects_running"] == 1
+    assert res["redaction_suspects_startup"] == 0
+    assert res["redaction_suspects"] == 1
+
+
 def test_fetch_one_icx_enable_rejection_is_auth_and_trips_the_breaker(monkeypatch: pytest.MonkeyPatch) -> None:
     attempts: list[str] = []
 

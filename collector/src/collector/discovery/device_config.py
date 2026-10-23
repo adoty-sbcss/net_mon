@@ -312,6 +312,19 @@ _IPV4_LITERAL_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?")
 # Letters in ONE case, no digits — a grammar keyword (Junos `authorization`), not the
 # base64/hex blob _SECRET_TAIL_RE's {12,} alternative is hunting. See below.
 _PLAIN_WORD_RE = re.compile(r"[a-z]+|[A-Z]+")
+# Fixed 802.1X / AAA grammar words that sit right after the bare `authentication`
+# keyword and are long enough to trip the {12,} blob alternative. Unlike the
+# single-case guard these are exact vendor keywords, so they are stepped over
+# ANYWHERE on the line, token or not. Every `<REDACTED:suspect>` in the stored
+# production snapshots (2026-10-23: 340 lines, 22 snapshots, two platforms) was one
+# of the first two, i.e. 100% false positives that also corrupted the stored config:
+#   cisco_ios    `authentication timer reauthenticate server`
+#   aruba_aoscx  `aaa authentication port-access dot1x authenticator`
+# The other two are the same IOS command family (`authentication event server alive
+# action reinitialize`, `authentication port-control force-unauthorized`).
+# Exact, lowercase, whole-candidate matches only: a credential-shaped tail that is
+# not literally one of these words is still masked and counted.
+_AUTH_GRAMMAR_WORDS = frozenset({"reauthenticate", "authenticator", "reinitialize", "unauthorized"})
 
 
 def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[str] | None:
@@ -341,10 +354,14 @@ def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[s
       secret: `set snmp community <TOK> authorization read-only` otherwise masks
       Junos's `authorization` on every device that has an SNMP community.
 
-    The trade in both cases — a secret that is literally a dotted quad, or literally
-    12+ same-case letters with no digit sitting after another masked value — is
-    deliberate and narrow. The ~60 named patterns still claim such a value on every
-    grammar we support; this is the catch-all behind them, not the only guard.
+    * **One of `_AUTH_GRAMMAR_WORDS`, at any offset** — vendor keywords, not a
+      heuristic, so no offset guard is needed.
+
+    The trade in all cases — a secret that is literally a dotted quad, literally
+    12+ same-case letters with no digit sitting after another masked value, or
+    literally one of four 802.1X keywords — is deliberate and narrow. The ~60 named
+    patterns still claim such a value on every grammar we support; this is the
+    catch-all behind them, not the only guard.
     """
     at = start
     while True:
@@ -352,9 +369,9 @@ def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[s
         if tm is None:
             return None
         cand = tm.group(0)
-        if tm.start() >= run_on_from and (
+        if cand in _AUTH_GRAMMAR_WORDS or (tm.start() >= run_on_from and (
             _IPV4_LITERAL_RE.fullmatch(cand) or _PLAIN_WORD_RE.fullmatch(cand)
-        ):
+        )):
             at = tm.end()  # run-on argument text, not the grammar's secret slot
         else:
             return tm
@@ -882,7 +899,11 @@ def _fetch_one(
         "status": "ok",
         "running_config": red_run,
         "startup_config": red_start,
+        # The total is kept for dashboards that predate the per-kind fields; it is
+        # NOT a per-config count, and storing it on each snapshot read double.
         "redaction_suspects": sus_run + sus_start,
+        "redaction_suspects_running": sus_run,
+        "redaction_suspects_startup": sus_start,
         "fetched_at": datetime.now(UTC).isoformat(),
     }
 
