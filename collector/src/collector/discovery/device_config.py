@@ -312,9 +312,58 @@ _IPV4_LITERAL_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?")
 # Letters in ONE case, no digits — a grammar keyword (Junos `authorization`), not the
 # base64/hex blob _SECRET_TAIL_RE's {12,} alternative is hunting. See below.
 _PLAIN_WORD_RE = re.compile(r"[a-z]+|[A-Z]+")
+# Fixed 802.1X / AAA grammar words that sit right after the bare `authentication`
+# keyword and are long enough to trip the {12,} blob alternative. Unlike the
+# single-case guard these are exact vendor keywords, so they are stepped over
+# ANYWHERE on the line, token or not. Every `<REDACTED:suspect>` in the stored
+# production snapshots (2026-10-23: 340 lines, 22 snapshots, two platforms) was one
+# of the first two, i.e. 100% false positives that also corrupted the stored config:
+#   cisco_ios    `authentication timer reauthenticate server`
+#   aruba_aoscx  `aaa authentication port-access dot1x authenticator`
+# The rest are the same command families: IOS `authentication event server alive
+# action reinitialize` / `authentication port-control force-unauthorized`, and the
+# keyword words themselves on a second mention — NX-OS `aaa authentication login
+# ascii-authentication`, IOS `ip http authentication aaa login-authentication X` /
+# `exec-authorization X`.
+# Exact, lowercase, whole-candidate matches only: a credential-shaped tail that is
+# not literally one of these words is still masked and counted.
+# ⚠️ The trade: on a line NO named pattern claims, a secret that is literally one of
+# these words now ships unmasked (e.g. an EXOS `configure snmpv3 add community
+# reauthenticate ...`, which only the backstop guards). Implausible, and accepted.
+_AUTH_GRAMMAR_WORDS = frozenset({
+    "reauthenticate", "authenticator", "reinitialize", "unauthorized",
+    "authentication", "authorization",
+})
+# The only hyphenated forms accepted: the whole token must equal one of these.
+_AUTH_GRAMMAR_COMPOUNDS = frozenset({
+    "force-unauthorized", "ascii-authentication", "login-authentication", "exec-authorization",
+})
 
 
-def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[str] | None:
+def _is_auth_grammar_word(line: str, tm: re.Match[str]) -> bool:
+    """`tm` is one of `_AUTH_GRAMMAR_WORDS` AND the whole whitespace-delimited token
+    around it is exactly that word or one of `_AUTH_GRAMMAR_COMPOUNDS`. The tail
+    regex can return a SUBSTRING of a longer value — `reauthenticate!foo`,
+    `x-reauthenticate-y`, `secret-authentication` — and skipping that would ship the
+    whole value unmasked (Codex review, 2026-10-23).
+
+    ⚠️ `line` is the ORIGINAL line, not the token-blanked scan: `tm` was found in
+    the scan, whose blanked `<REDACTED:…>` spaces would make `reauthenticate<T>!foo`
+    look like a bare word. Offsets are identical in both (same-length blanking)."""
+    if tm.group(0) not in _AUTH_GRAMMAR_WORDS:
+        return False
+    s, e = tm.start(), tm.end()
+    while s > 0 and not line[s - 1].isspace():
+        s -= 1
+    while e < len(line) and not line[e].isspace():
+        e += 1
+    token = line[s:e]
+    return token in _AUTH_GRAMMAR_WORDS or token in _AUTH_GRAMMAR_COMPOUNDS
+
+
+def _next_credential_tail(
+    scan: str, start: int, run_on_from: int, line: str | None = None
+) -> re.Match[str] | None:
     """First credential-shaped tail at/after `start`, skipping known non-credentials.
 
     Two candidates are stepped over — SKIPPED AND CONTINUED past, never abandoning
@@ -341,10 +390,15 @@ def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[s
       secret: `set snmp community <TOK> authorization read-only` otherwise masks
       Junos's `authorization` on every device that has an SNMP community.
 
-    The trade in both cases — a secret that is literally a dotted quad, or literally
-    12+ same-case letters with no digit sitting after another masked value — is
-    deliberate and narrow. The ~60 named patterns still claim such a value on every
-    grammar we support; this is the catch-all behind them, not the only guard.
+    * **One of `_AUTH_GRAMMAR_WORDS`, at any offset** — vendor keywords, not a
+      heuristic. Unlike the two above this also applies on an UNTOKENED line, where
+      the backstop is the only guard; see that set's note for the accepted trade.
+
+    The trade in all cases — a secret that is literally a dotted quad, literally
+    12+ same-case letters with no digit sitting after another masked value, or
+    literally one of six AAA / 802.1X keywords — is deliberate and narrow. The ~60 named
+    patterns still claim such a value on every grammar we support; this is the
+    catch-all behind them, not the only guard.
     """
     at = start
     while True:
@@ -352,9 +406,9 @@ def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[s
         if tm is None:
             return None
         cand = tm.group(0)
-        if tm.start() >= run_on_from and (
+        if _is_auth_grammar_word(scan if line is None else line, tm) or (tm.start() >= run_on_from and (
             _IPV4_LITERAL_RE.fullmatch(cand) or _PLAIN_WORD_RE.fullmatch(cand)
-        ):
+        )):
             at = tm.end()  # run-on argument text, not the grammar's secret slot
         else:
             return tm
@@ -390,7 +444,7 @@ def _backstop_line(line: str) -> tuple[str, int]:
         km = _SECRET_KEYWORD_RE.search(scan, pos)
         if km is None:
             break
-        tm = _next_credential_tail(scan, km.end(), run_on_from)
+        tm = _next_credential_tail(scan, km.end(), run_on_from, line)
         if tm is None:
             break
         spans.append((tm.start(), tm.end()))
@@ -882,7 +936,11 @@ def _fetch_one(
         "status": "ok",
         "running_config": red_run,
         "startup_config": red_start,
+        # The total is kept for dashboards that predate the per-kind fields; it is
+        # NOT a per-config count, and storing it on each snapshot read double.
         "redaction_suspects": sus_run + sus_start,
+        "redaction_suspects_running": sus_run,
+        "redaction_suspects_startup": sus_start,
         "fetched_at": datetime.now(UTC).isoformat(),
     }
 

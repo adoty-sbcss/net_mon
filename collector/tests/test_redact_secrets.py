@@ -405,6 +405,76 @@ def test_backstop_keeps_a_grammar_keyword_after_a_masked_value() -> None:
     assert suspects == 0
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        # Every <REDACTED:suspect> in the stored production snapshots (2026-10-23, 340
+        # lines) was one of the first two lines, global or interface-indented.
+        "authentication timer reauthenticate server",
+        " authentication timer reauthenticate server",
+        "aaa authentication port-access dot1x authenticator",
+        "    aaa authentication port-access dot1x authenticator",
+        " authentication event server alive action reinitialize",
+        " authentication port-control force-unauthorized",
+        "aaa authentication login ascii-authentication",
+        "ip http authentication aaa login-authentication LOCAL",
+        "ip http authentication aaa exec-authorization LOCAL",
+    ],
+)
+def test_8021x_grammar_words_are_not_suspects(line: str) -> None:
+    # The backstop masked the keyword, so the stored config lost a real setting and
+    # the device page warned about "secret-like" lines that held no secret.
+    out, suspects = _redact(line)
+    assert out == line, f"an 802.1X keyword was masked: {out}"
+    assert suspects == 0
+
+
+def test_backstop_keeps_scanning_past_an_8021x_grammar_word() -> None:
+    # Stepped over, never a reason to abandon the line: a credential further right
+    # is still caught and counted.
+    out, suspects = _redact(f"authentication reauthenticate {_COMMUNITY}")
+    assert _COMMUNITY not in out
+    assert out.startswith("authentication reauthenticate ")
+    assert suspects == 1
+
+
+@pytest.mark.parametrize(
+    "line, secret",
+    [
+        # Not literally a grammar word -> still the full-strength heuristic.
+        ("authentication reauthenticatex", "reauthenticatex"),
+        ("authentication Authenticator", "Authenticator"),
+        ("authentication abcdefghijklmnop", "abcdefghijklmnop"),
+        # A grammar word INSIDE a longer value: the tail regex returns only the
+        # word, and skipping it would ship the whole value (Codex review).
+        ("configure snmpv3 add community reauthenticate!foo name ncm user ncm", "reauthenticate!foo"),
+        ("password x-reauthenticate-y", "x-reauthenticate-y"),
+        ("password secret-authentication", "secret-authentication"),
+        ('password "reauthenticate"', "reauthenticate"),
+    ],
+)
+def test_near_miss_of_a_grammar_word_is_still_masked(line: str, secret: str) -> None:
+    out, suspects = _redact(line)
+    assert secret not in out
+    assert suspects == 1
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # A grammar word touching an existing token: the backstop scans a copy with
+        # tokens blanked to spaces, so judged there it looked like a bare word and
+        # the whole value shipped with zero suspects (Codex review, pass 2).
+        "configure snmpv3 add community reauthenticate<REDACTED:x>!foo user netmon",
+        "set system authentication-order reauthenticate$9$JunosHash12",
+    ],
+)
+def test_grammar_word_glued_to_a_token_is_still_masked(line: str) -> None:
+    out, suspects = _redact(line)
+    assert "reauthenticate" not in out, out
+    assert suspects >= 1
+
+
 # --------------------------------------------------------------------------------------
 # Cross-vendor regression guard — the ~60 named patterns must keep working.
 # --------------------------------------------------------------------------------------
