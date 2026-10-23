@@ -334,6 +334,27 @@ _AUTH_GRAMMAR_WORDS = frozenset({
     "reauthenticate", "authenticator", "reinitialize", "unauthorized",
     "authentication", "authorization",
 })
+# The only hyphenated forms accepted: the whole token must equal one of these.
+_AUTH_GRAMMAR_COMPOUNDS = frozenset({
+    "force-unauthorized", "ascii-authentication", "login-authentication", "exec-authorization",
+})
+
+
+def _is_auth_grammar_word(scan: str, tm: re.Match[str]) -> bool:
+    """`tm` is one of `_AUTH_GRAMMAR_WORDS` AND the whole whitespace-delimited token
+    around it is exactly that word or one of `_AUTH_GRAMMAR_COMPOUNDS`. The tail
+    regex can return a SUBSTRING of a longer value — `reauthenticate!foo`,
+    `x-reauthenticate-y`, `secret-authentication` — and skipping that would ship the
+    whole value unmasked (Codex review, 2026-10-23)."""
+    if tm.group(0) not in _AUTH_GRAMMAR_WORDS:
+        return False
+    s, e = tm.start(), tm.end()
+    while s > 0 and not scan[s - 1].isspace():
+        s -= 1
+    while e < len(scan) and not scan[e].isspace():
+        e += 1
+    token = scan[s:e]
+    return token in _AUTH_GRAMMAR_WORDS or token in _AUTH_GRAMMAR_COMPOUNDS
 
 
 def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[str] | None:
@@ -379,7 +400,7 @@ def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[s
         if tm is None:
             return None
         cand = tm.group(0)
-        if cand in _AUTH_GRAMMAR_WORDS or (tm.start() >= run_on_from and (
+        if _is_auth_grammar_word(scan, tm) or (tm.start() >= run_on_from and (
             _IPV4_LITERAL_RE.fullmatch(cand) or _PLAIN_WORD_RE.fullmatch(cand)
         )):
             at = tm.end()  # run-on argument text, not the grammar's secret slot

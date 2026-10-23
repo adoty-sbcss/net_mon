@@ -445,6 +445,12 @@ def test_backstop_keeps_scanning_past_an_8021x_grammar_word() -> None:
         ("authentication reauthenticatex", "reauthenticatex"),
         ("authentication Authenticator", "Authenticator"),
         ("authentication abcdefghijklmnop", "abcdefghijklmnop"),
+        # A grammar word INSIDE a longer value: the tail regex returns only the
+        # word, and skipping it would ship the whole value (Codex review).
+        ("configure snmpv3 add community reauthenticate!foo name ncm user ncm", "reauthenticate!foo"),
+        ("password x-reauthenticate-y", "x-reauthenticate-y"),
+        ("password secret-authentication", "secret-authentication"),
+        ('password "reauthenticate"', "reauthenticate"),
     ],
 )
 def test_near_miss_of_a_grammar_word_is_still_masked(line: str, secret: str) -> None:
