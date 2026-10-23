@@ -416,6 +416,9 @@ def test_backstop_keeps_a_grammar_keyword_after_a_masked_value() -> None:
         "    aaa authentication port-access dot1x authenticator",
         " authentication event server alive action reinitialize",
         " authentication port-control force-unauthorized",
+        "aaa authentication login ascii-authentication",
+        "ip http authentication aaa login-authentication LOCAL",
+        "ip http authentication aaa exec-authorization LOCAL",
     ],
 )
 def test_8021x_grammar_words_are_not_suspects(line: str) -> None:

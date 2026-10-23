@@ -320,11 +320,20 @@ _PLAIN_WORD_RE = re.compile(r"[a-z]+|[A-Z]+")
 # of the first two, i.e. 100% false positives that also corrupted the stored config:
 #   cisco_ios    `authentication timer reauthenticate server`
 #   aruba_aoscx  `aaa authentication port-access dot1x authenticator`
-# The other two are the same IOS command family (`authentication event server alive
-# action reinitialize`, `authentication port-control force-unauthorized`).
+# The rest are the same command families: IOS `authentication event server alive
+# action reinitialize` / `authentication port-control force-unauthorized`, and the
+# keyword words themselves on a second mention — NX-OS `aaa authentication login
+# ascii-authentication`, IOS `ip http authentication aaa login-authentication X` /
+# `exec-authorization X`.
 # Exact, lowercase, whole-candidate matches only: a credential-shaped tail that is
 # not literally one of these words is still masked and counted.
-_AUTH_GRAMMAR_WORDS = frozenset({"reauthenticate", "authenticator", "reinitialize", "unauthorized"})
+# ⚠️ The trade: on a line NO named pattern claims, a secret that is literally one of
+# these words now ships unmasked (e.g. an EXOS `configure snmpv3 add community
+# reauthenticate ...`, which only the backstop guards). Implausible, and accepted.
+_AUTH_GRAMMAR_WORDS = frozenset({
+    "reauthenticate", "authenticator", "reinitialize", "unauthorized",
+    "authentication", "authorization",
+})
 
 
 def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[str] | None:
@@ -355,11 +364,12 @@ def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[s
       Junos's `authorization` on every device that has an SNMP community.
 
     * **One of `_AUTH_GRAMMAR_WORDS`, at any offset** — vendor keywords, not a
-      heuristic, so no offset guard is needed.
+      heuristic. Unlike the two above this also applies on an UNTOKENED line, where
+      the backstop is the only guard; see that set's note for the accepted trade.
 
     The trade in all cases — a secret that is literally a dotted quad, literally
     12+ same-case letters with no digit sitting after another masked value, or
-    literally one of four 802.1X keywords — is deliberate and narrow. The ~60 named
+    literally one of six AAA / 802.1X keywords — is deliberate and narrow. The ~60 named
     patterns still claim such a value on every grammar we support; this is the
     catch-all behind them, not the only guard.
     """
