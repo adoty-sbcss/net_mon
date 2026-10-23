@@ -459,6 +459,22 @@ def test_near_miss_of_a_grammar_word_is_still_masked(line: str, secret: str) -> 
     assert suspects == 1
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        # A grammar word touching an existing token: the backstop scans a copy with
+        # tokens blanked to spaces, so judged there it looked like a bare word and
+        # the whole value shipped with zero suspects (Codex review, pass 2).
+        "configure snmpv3 add community reauthenticate<REDACTED:x>!foo user netmon",
+        "set system authentication-order reauthenticate$9$JunosHash12",
+    ],
+)
+def test_grammar_word_glued_to_a_token_is_still_masked(line: str) -> None:
+    out, suspects = _redact(line)
+    assert "reauthenticate" not in out, out
+    assert suspects >= 1
+
+
 # --------------------------------------------------------------------------------------
 # Cross-vendor regression guard — the ~60 named patterns must keep working.
 # --------------------------------------------------------------------------------------

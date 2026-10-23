@@ -340,24 +340,30 @@ _AUTH_GRAMMAR_COMPOUNDS = frozenset({
 })
 
 
-def _is_auth_grammar_word(scan: str, tm: re.Match[str]) -> bool:
+def _is_auth_grammar_word(line: str, tm: re.Match[str]) -> bool:
     """`tm` is one of `_AUTH_GRAMMAR_WORDS` AND the whole whitespace-delimited token
     around it is exactly that word or one of `_AUTH_GRAMMAR_COMPOUNDS`. The tail
     regex can return a SUBSTRING of a longer value — `reauthenticate!foo`,
     `x-reauthenticate-y`, `secret-authentication` — and skipping that would ship the
-    whole value unmasked (Codex review, 2026-10-23)."""
+    whole value unmasked (Codex review, 2026-10-23).
+
+    ⚠️ `line` is the ORIGINAL line, not the token-blanked scan: `tm` was found in
+    the scan, whose blanked `<REDACTED:…>` spaces would make `reauthenticate<T>!foo`
+    look like a bare word. Offsets are identical in both (same-length blanking)."""
     if tm.group(0) not in _AUTH_GRAMMAR_WORDS:
         return False
     s, e = tm.start(), tm.end()
-    while s > 0 and not scan[s - 1].isspace():
+    while s > 0 and not line[s - 1].isspace():
         s -= 1
-    while e < len(scan) and not scan[e].isspace():
+    while e < len(line) and not line[e].isspace():
         e += 1
-    token = scan[s:e]
+    token = line[s:e]
     return token in _AUTH_GRAMMAR_WORDS or token in _AUTH_GRAMMAR_COMPOUNDS
 
 
-def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[str] | None:
+def _next_credential_tail(
+    scan: str, start: int, run_on_from: int, line: str | None = None
+) -> re.Match[str] | None:
     """First credential-shaped tail at/after `start`, skipping known non-credentials.
 
     Two candidates are stepped over — SKIPPED AND CONTINUED past, never abandoning
@@ -400,7 +406,7 @@ def _next_credential_tail(scan: str, start: int, run_on_from: int) -> re.Match[s
         if tm is None:
             return None
         cand = tm.group(0)
-        if _is_auth_grammar_word(scan, tm) or (tm.start() >= run_on_from and (
+        if _is_auth_grammar_word(scan if line is None else line, tm) or (tm.start() >= run_on_from and (
             _IPV4_LITERAL_RE.fullmatch(cand) or _PLAIN_WORD_RE.fullmatch(cand)
         )):
             at = tm.end()  # run-on argument text, not the grammar's secret slot
@@ -438,7 +444,7 @@ def _backstop_line(line: str) -> tuple[str, int]:
         km = _SECRET_KEYWORD_RE.search(scan, pos)
         if km is None:
             break
-        tm = _next_credential_tail(scan, km.end(), run_on_from)
+        tm = _next_credential_tail(scan, km.end(), run_on_from, line)
         if tm is None:
             break
         spans.append((tm.start(), tm.end()))
