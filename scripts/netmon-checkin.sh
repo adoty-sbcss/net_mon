@@ -69,6 +69,12 @@ HOST_ACTION_REQUEST="/var/lib/netmon/host-action-request"
 HOST_ACTION_INFLIGHT="/var/lib/netmon/host-action-inflight"
 drain_leftover_host_actions() {
     [ -s "$HOST_ACTION_REQUEST" ] || [ -s "$HOST_ACTION_INFLIGHT" ] || return 0
+    # An update (exit 11) may still be pulling / rebuilding / health-checking; a
+    # reboot or rebuild queued alongside it waits for the next check-in.
+    if systemctl is-active --quiet netmon-update.service 2>/dev/null; then
+        log "leftover host action found; waiting — an update is in progress"
+        return 0
+    fi
     if [ -x "$REPO_DIR/scripts/host-action.sh" ]; then
         log "leftover host action found; draining"
         "$REPO_DIR/scripts/host-action.sh" --drain-leftover 2>&1 \

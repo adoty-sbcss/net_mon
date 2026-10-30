@@ -69,8 +69,13 @@ def _run(st: Path, body: str) -> subprocess.CompletedProcess:
 
 @pytest.fixture
 def st(tmp_path: Path) -> Path:
-    (tmp_path / "boot").write_text("boot-B\n")
+    _w((tmp_path / "boot"), "boot-B\n")
     return tmp_path
+
+
+def _w(p: Path, text: str) -> None:
+    """LF only, as the box writes it (Windows text mode would add CRs)."""
+    p.write_bytes(text.encode("utf-8"))
 
 
 def _result(st: Path) -> dict:
@@ -83,7 +88,7 @@ def _calls(st: Path) -> list[str]:
 
 
 def _inflight(st: Path, cid: str, action: str, boot: str, attempt: int) -> None:
-    (st / "host-action-inflight").write_text(
+    _w((st / "host-action-inflight"), 
         f"{cid}\t{action}\t{boot}\t{attempt}\t2026-10-30T17:24:50+00:00\n"
     )
 
@@ -93,7 +98,7 @@ def _empty(p: Path) -> bool:
 
 
 def test_a_normal_drain_reports_ok_with_the_command_id(st: Path) -> None:
-    (st / "host-action-request").write_text("121\thost-apply-vlan\n")
+    _w((st / "host-action-request"), "121\thost-apply-vlan\n")
     proc = _run(st, 'main --drain\n')
     assert proc.returncode == 0, proc.stderr
     assert _calls(st) == ["host-apply-vlan"]
@@ -105,8 +110,8 @@ def test_a_normal_drain_reports_ok_with_the_command_id(st: Path) -> None:
 
 def test_an_action_killed_mid_run_is_retried_on_the_next_boot(st: Path) -> None:
     """End to end: the first run really dies part-way; a drain after a reboot finds it."""
-    (st / "host-action-request").write_text("121\thost-apply-vlan\n")
-    (st / "boot").write_text("boot-A\n")
+    _w((st / "host-action-request"), "121\thost-apply-vlan\n")
+    _w((st / "boot"), "boot-A\n")
     (st / "die-host-apply-vlan").touch()
     _run(st, 'main --drain\n')  # killed inside run_action
     assert _calls(st) == ["host-apply-vlan"]
@@ -115,7 +120,7 @@ def test_an_action_killed_mid_run_is_retried_on_the_next_boot(st: Path) -> None:
     assert _empty(st / "host-action-request")          # the request itself was cleared
 
     (st / "die-host-apply-vlan").unlink()
-    (st / "boot").write_text("boot-B\n")               # the box rebooted
+    _w((st / "boot"), "boot-B\n")               # the box rebooted
     proc = _run(st, 'main --drain\n')
     assert proc.returncode == 0, proc.stderr
     assert _calls(st) == ["host-apply-vlan", "host-apply-vlan"]
@@ -154,7 +159,7 @@ def test_a_second_interruption_is_not_retried_again(st: Path) -> None:
 
 def test_a_newer_request_for_the_same_action_supersedes_the_retry(st: Path) -> None:
     _inflight(st, "121", "host-apply-vlan", "boot-A", 1)
-    (st / "host-action-request").write_text("130\thost-apply-vlan\n")
+    _w((st / "host-action-request"), "130\thost-apply-vlan\n")
     _run(st, 'main --drain\n')
     assert _calls(st) == ["host-apply-vlan"]               # once, for 130
     r = _result(st)
@@ -162,7 +167,7 @@ def test_a_newer_request_for_the_same_action_supersedes_the_retry(st: Path) -> N
 
 
 def test_a_failed_action_is_reported_and_leaves_no_inflight_record(st: Path) -> None:
-    (st / "host-action-request").write_text("5\thost-wifi-join\n")
+    _w((st / "host-action-request"), "5\thost-wifi-join\n")
     (st / "fail-host-wifi-join").touch()
     _run(st, 'main --drain\n')
     r = _result(st)
@@ -171,14 +176,14 @@ def test_a_failed_action_is_reported_and_leaves_no_inflight_record(st: Path) -> 
 
 
 def test_an_action_reading_stdin_does_not_eat_the_rest_of_the_queue(st: Path) -> None:
-    (st / "host-action-request").write_text("1\thost-restart\n2\thost-apply-vlan\n")
+    _w((st / "host-action-request"), "1\thost-restart\n2\thost-apply-vlan\n")
     (st / "stdin-host-restart").touch()
     _run(st, 'main --drain\n')
     assert _calls(st) == ["host-restart", "host-apply-vlan"]
 
 
 def test_the_result_stays_valid_json_for_hostile_strings(st: Path) -> None:
-    (st / "host-action-request").write_text('abc\tx"y\\z\n')
+    _w((st / "host-action-request"), 'abc\tx"y\\z\n')
     _run(st, 'main --drain\n')
     r = _result(st)  # json.loads must not raise
     assert r["action"] == 'x"y\\z'
@@ -225,7 +230,7 @@ run_action() {
 
 
 def test_a_failure_reports_the_actions_own_warnings(st: Path) -> None:
-    (st / "host-action-request").write_text("122\thost-apply-vlan\n")
+    _w((st / "host-action-request"), "122\thost-apply-vlan\n")
     proc = _run(st, LOUD + "export NETMON_LOG_DIR=\"$ST\"; HOST_ACTION_LOG=\"$ST/host-action.log\"\nmain --drain\n")
     assert proc.returncode == 0, proc.stderr
     r = _result(st)
@@ -273,7 +278,7 @@ def test_checkin_scrubs_and_bounds_the_reported_reason(monkeypatch, tmp_path) ->
     from collector import checkin
 
     f = tmp_path / "host-action-result"
-    f.write_text(json.dumps({"action": "host-wifi-join", "status": "failed",
+    _w(f, json.dumps({"action": "host-wifi-join", "status": "failed",
                              "reason": "action failed: psk=hunter2 " + "y" * 3000}))
     real_path = checkin.Path
     monkeypatch.setattr(checkin, "Path", lambda p: f if p == "/var/lib/netmon/host-action-result" else real_path(p))
@@ -303,7 +308,7 @@ def _age(p: Path, minutes: int) -> None:
 
 def test_a_fresh_leftover_request_runs(st: Path) -> None:
     req = st / "host-action-request"
-    req.write_text("121\thost-apply-vlan\n")
+    _w(req, "121\thost-apply-vlan\n")
     _age(req, 10)
     _run(st, "main --drain-leftover\n")
     assert _calls(st) == ["host-apply-vlan"]
@@ -313,7 +318,7 @@ def test_a_fresh_leftover_request_runs(st: Path) -> None:
 def test_a_stale_leftover_request_is_expired_not_run(st: Path) -> None:
     """A reboot request stuck in the file for days must not fire on the next check-in."""
     req = st / "host-action-request"
-    req.write_text("9\thost-reboot\n")
+    _w(req, "9\thost-reboot\n")
     _age(req, 3 * 24 * 60)
     _run(st, "main --drain-leftover\n")
     assert _calls(st) == []
@@ -325,7 +330,7 @@ def test_a_stale_leftover_request_is_expired_not_run(st: Path) -> None:
 def test_a_stale_request_still_runs_on_an_explicit_drain(st: Path) -> None:
     """--drain is exit 12: the agent queued it on this very check-in."""
     req = st / "host-action-request"
-    req.write_text("9\thost-restart\n")
+    _w(req, "9\thost-restart\n")
     _age(req, 3 * 24 * 60)
     _run(st, "main --drain\n")
     assert _calls(st) == ["host-restart"]
@@ -343,3 +348,171 @@ def test_checkin_uses_the_age_limited_drain_for_leftovers() -> None:
     fn = text[text.index("drain_leftover_host_actions() {"):]
     fn = fn[: fn.index("\n}\n")]
     assert "--drain-leftover" in fn and "--drain " not in fn
+
+
+
+# --- review round 1 (Fable + Codex, 2026-10-30) ----------------------------------
+
+
+def _history(st: Path) -> list[dict]:
+    p = st / "host-action-results"
+    if not p.exists():
+        return []
+    return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+
+def test_every_command_in_one_drain_is_settled_not_just_the_last(st: Path) -> None:
+    """The latest-result file holds one outcome; the history holds each command's."""
+    _w((st / "host-action-request"), "1\thost-restart\n2\thost-apply-vlan\n")
+    (st / "fail-host-restart").touch()
+    _run(st, "main --drain\n")
+    assert [(h["commandId"], h["status"]) for h in _history(st)] == [(1, "failed"), (2, "ok")]
+    assert all(h["status"] != "running" for h in _history(st))
+
+
+def test_a_superseded_interruption_is_still_reported_in_the_history(st: Path) -> None:
+    _inflight(st, "121", "host-apply-vlan", "boot-A", 1)
+    _w((st / "host-action-request"), "130\thost-apply-vlan\n")
+    _run(st, "main --drain\n")
+    assert [(h["commandId"], h["status"]) for h in _history(st)] == [(121, "interrupted"), (130, "ok")]
+
+
+def test_a_newer_remove_supersedes_retrying_an_interrupted_apply(st: Path) -> None:
+    _inflight(st, "121", "host-apply-vlan", "boot-A", 1)
+    _w((st / "host-action-request"), "130\thost-remove-vlan\n")
+    _run(st, "main --drain\n")
+    assert _calls(st) == ["host-remove-vlan"]
+    assert [(h["commandId"], h["status"]) for h in _history(st)] == [(121, "interrupted"), (130, "ok")]
+
+
+def test_power_loss_mid_queue_keeps_the_unstarted_requests(st: Path) -> None:
+    """A, B queued; the box dies during A. B must survive and run on the next boot."""
+    _w((st / "host-action-request"), "1\thost-restart\n2\thost-apply-vlan\n")
+    _w((st / "boot"), "boot-A\n")
+    (st / "die-host-restart").touch()
+    _run(st, "main --drain\n")
+    assert _calls(st) == ["host-restart"]
+    assert (st / "host-action-request").read_text().strip() == "2\thost-apply-vlan"
+    (st / "die-host-restart").unlink()
+    _w((st / "boot"), "boot-B\n")
+    _run(st, "main --drain-leftover\n")
+    assert _calls(st) == ["host-restart", "host-apply-vlan"]   # restart NOT re-run
+    assert [(h["commandId"], h["status"]) for h in _history(st)] == [(1, "interrupted"), (2, "ok")]
+
+
+def test_nothing_runs_when_the_request_cannot_be_removed(st: Path) -> None:
+    """A request that stays queued would run again on every check-in: a reboot loop."""
+    _w((st / "host-action-request"), "9\thost-reboot\n")
+    _run(st, '_queue_set() { return 1; }\nmain --drain\n')
+    assert _calls(st) == []
+    assert _empty(st / "host-action-inflight")
+    r = _result(st)
+    assert (r["status"], r["commandId"]) == ("failed", 9) and "could not remove" in r["reason"]
+
+
+def test_nothing_runs_when_the_inflight_record_cannot_be_written(st: Path) -> None:
+    _w((st / "host-action-request"), "9\thost-reboot\n")
+    body = (
+        'eval "orig_$(declare -f _write_state)"\n'
+        '_write_state() { [ "$1" = "$INFLIGHT_FILE" ] && return 1; orig__write_state "$@"; }\n'
+        "main --drain\n"
+    )
+    _run(st, body)
+    assert _calls(st) == []
+    assert (st / "host-action-request").read_text().strip() == "9\thost-reboot"   # left queued
+
+
+def test_the_retry_limit_holds_when_the_attempt_cannot_be_recorded(st: Path) -> None:
+    _inflight(st, "121", "host-apply-vlan", "boot-A", 1)
+    body = (
+        'eval "orig_$(declare -f _write_state)"\n'
+        '_write_state() { [ "$1" = "$INFLIGHT_FILE" ] && return 1; orig__write_state "$@"; }\n'
+        "main --drain\nmain --drain\n"
+    )
+    _run(st, body)
+    assert _calls(st) == []
+
+
+def test_recorded_but_never_claimed_runs_once_from_the_queue(st: Path) -> None:
+    """Stopped between the in-flight write and the queue removal: not an interruption."""
+    _inflight(st, "121", "host-apply-vlan", "boot-A", 1)
+    _w((st / "host-action-request"), "121\thost-apply-vlan\n")
+    _run(st, "main --drain\n")
+    assert _calls(st) == ["host-apply-vlan"]
+    assert [(h["commandId"], h["status"]) for h in _history(st)] == [(121, "ok")]
+
+
+def test_an_interrupted_manual_run_keeps_its_fields(st: Path) -> None:
+    """No command id: a leading empty field would shift the record (TAB is IFS whitespace)."""
+    _w((st / "boot"), "boot-A\n")
+    (st / "die-host-apply-vlan").touch()
+    _run(st, "main host-apply-vlan\n")
+    assert (st / "host-action-inflight").read_text().startswith("-\thost-apply-vlan\t")
+    (st / "die-host-apply-vlan").unlink()
+    _w((st / "boot"), "boot-B\n")
+    _run(st, "main --drain-leftover\n")
+    assert _calls(st) == ["host-apply-vlan", "host-apply-vlan"]
+    assert (_result(st)["action"], _result(st)["status"]) == ("host-apply-vlan", "ok")
+
+
+def test_control_characters_in_the_output_keep_the_result_parseable(st: Path) -> None:
+    body = r'''
+run_action() { printf 'step one\n\033[Kerror: \a broke\b here\f\n  !! bad \033]0;title\a thing\n'; return 1; }
+HOST_ACTION_LOG="$ST/host-action.log"
+main host-apply-vlan
+'''
+    _run(st, body)
+    raw = (st / "host-action-result").read_text(encoding="utf-8")
+    r = json.loads(raw)   # strict, like the collector used to be
+    assert r["status"] == "failed" and "bad" in r["reason"]
+    assert not any(ord(c) < 32 for c in r["reason"])
+
+
+@pytest.mark.parametrize(("action", "minutes", "runs"), [
+    ("host-reboot", 20, False),       # disruptive: 15-minute limit
+    ("host-reboot", 5, True),
+    ("host-apply-vlan", 20, True),    # convergent: 120-minute limit
+    ("host-apply-vlan", 130, False),
+])
+def test_leftover_age_limits_depend_on_the_action(st: Path, action: str, minutes: int, runs: bool) -> None:
+    req = st / "host-action-request"
+    _w(req, f"9\t{action}\n")
+    _age(req, minutes)
+    _run(st, "main --drain-leftover\n")
+    assert _calls(st) == ([action] if runs else [])
+    if not runs:
+        assert (_result(st)["status"], _result(st)["commandId"]) == ("expired", 9)
+
+
+def test_the_run_lock_lives_outside_the_checkout() -> None:
+    """git pull replaces the script file: a lock on its inode would not exclude a later run."""
+    text = HOST_ACTION.read_text(encoding="utf-8")
+    take = text[text.index("_take_lock() {"):]
+    take = take[: take.index("\n}\n")]
+    assert '9<"$LOCK_FILE"' in take and "BASH_SOURCE" not in take
+    assert 'LOCK_FILE="$STATE_DIR/host-action.lock"' in text
+
+
+def test_collector_reports_the_history_and_survives_odd_bytes(monkeypatch, tmp_path) -> None:
+    from collector import checkin
+
+    hist = tmp_path / "host-action-results"
+    hist.write_bytes(
+        b'{"action":"host-restart","status":"failed","reason":"x\x1b[K psk=hunter2","commandId":1}\n'
+        b"not json\n"
+        b'{"action":"host-apply-vlan","status":"ok","reason":"cut \xe2\x80","commandId":2}\n'
+    )
+    real_path = checkin.Path
+    monkeypatch.setattr(
+        checkin, "Path", lambda p: hist if p == "/var/lib/netmon/host-action-results" else real_path(p)
+    )
+    out = checkin._host_action_history()
+    assert [(r["commandId"], r["status"]) for r in out] == [(1, "failed"), (2, "ok")]
+    assert "hunter2" not in out[0]["reason"]
+
+
+def test_leftovers_wait_while_an_update_is_running() -> None:
+    text = CHECKIN_SH.read_text(encoding="utf-8")
+    fn = text[text.index("drain_leftover_host_actions() {"):]
+    fn = fn[: fn.index("\n}\n")]
+    assert fn.index("systemctl is-active --quiet netmon-update.service") < fn.index("--drain-leftover")

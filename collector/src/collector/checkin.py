@@ -2556,17 +2556,44 @@ def _last_host_action() -> dict | None:
     only feedback the dashboard gets. Without it, a failed VLAN apply (e.g. the
     netplan-on-NetworkManager crash) was invisible to the dashboard. Best-effort."""
     try:
-        raw = Path("/var/lib/netmon/host-action-result").read_text().strip()
-        data = json.loads(raw) if raw else None
-        if not isinstance(data, dict):
-            return None
-        # The reason now carries the action's own output lines (why it failed);
-        # scrub it like every other log text that leaves the box.
-        if isinstance(data.get("reason"), str):
-            data["reason"] = _redact_secrets(data["reason"])[:1000]
-        return data
+        raw = Path("/var/lib/netmon/host-action-result").read_text(errors="replace").strip()
+        return _host_action_record(raw)
     except Exception:
         return None
+
+
+def _host_action_record(raw: str) -> dict | None:
+    """One host-action outcome line, parsed leniently: the reason quotes the action's
+    own output, and a stray control character or a byte cut mid-character must not
+    make the whole report vanish (the dashboard would then keep showing "running").
+    The reason is scrubbed like every other log text that leaves the box."""
+    try:
+        data = json.loads(raw, strict=False) if raw else None
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if isinstance(data.get("reason"), str):
+        data["reason"] = _redact_secrets(data["reason"])[:1000]
+    return data
+
+
+def _host_action_history(limit: int = 20) -> list[dict]:
+    """Recent TERMINAL host-action outcomes that carry a command id, oldest first
+    (scripts/host-action.sh appends them). The latest-result file holds one outcome,
+    so a drain that ran two actions — or reported an interrupted one superseded by a
+    newer request — left the first command "scheduled" forever on the dashboard;
+    the dashboard settles each command in this list. Best-effort: [] on any failure."""
+    try:
+        lines = Path("/var/lib/netmon/host-action-results").read_text(errors="replace").splitlines()
+    except Exception:
+        return []
+    out: list[dict] = []
+    for line in lines[-limit:]:
+        rec = _host_action_record(line.strip())
+        if rec is not None:
+            out.append(rec)
+    return out
 
 
 def _interfaces() -> list[dict]:
@@ -2727,6 +2754,7 @@ def run_checkin() -> int:
             # Outcome of the last host-level action (apply-vlan / restart / …) so a
             # failed VLAN apply is visible on the dashboard, not just the box journal.
             "lastHostAction": _last_host_action(),
+            "hostActionResults": _host_action_history(),
             "localIp": local_ip,
             "interface": iface,
             "interfaceCidr": cidr,
