@@ -43,6 +43,7 @@ def _bash() -> str:
 PRELUDE = r'''
 set -uo pipefail
 export NETMON_STATE_DIR="$ST"
+export NETMON_LOCK_DIR="$ST"
 source "$HA"
 logger() { :; }
 log() { printf 'LOG %s\n' "$*"; }
@@ -399,7 +400,7 @@ def test_power_loss_mid_queue_keeps_the_unstarted_requests(st: Path) -> None:
     (st / "die-host-restart").touch()
     _run(st, "main --drain\n")
     assert _calls(st) == ["host-restart"]
-    assert (st / "host-action-request").read_text().startswith("2\thost-apply-vlan\t")
+    assert (st / "host-action-request").read_text().strip() == "2\thost-apply-vlan"
     (st / "die-host-restart").unlink()
     _w((st / "boot"), "boot-B\n")
     _run(st, "main --drain-leftover\n")
@@ -494,13 +495,23 @@ def test_leftover_age_limits_depend_on_the_action(st: Path, action: str, minutes
         assert (_result(st)["status"], _result(st)["commandId"]) == ("expired", 9)
 
 
-def test_the_run_lock_lives_outside_the_checkout() -> None:
-    """git pull replaces the script file: a lock on its inode would not exclude a later run."""
+def test_the_run_lock_is_never_replaced_and_fails_closed() -> None:
+    """git pull replaces the script file, and an atomic rename would replace a lock
+    file too: either way two starters lock different inodes. Open with >> only."""
     text = HOST_ACTION.read_text(encoding="utf-8")
     take = text[text.index("_take_lock() {"):]
     take = take[: take.index("\n}\n")]
-    assert '9<"$LOCK_FILE"' in take and "BASH_SOURCE" not in take
-    assert 'LOCK_FILE="$STATE_DIR/host-action.lock"' in text
+    assert 'exec 9>>"$LOCK_FILE"' in take
+    assert "BASH_SOURCE" not in take and "_write_state" not in take
+    assert "return 2" in take                              # can't open: fail closed
+    assert 'LOCK_FILE="${NETMON_LOCK_DIR:-/run/lock}/netmon-host-action.lock"' in text
+
+
+def test_an_unopenable_lock_runs_nothing(st: Path) -> None:
+    _w(st / "host-action-request", "1\thost-reboot\n")
+    proc = _run(st, "flock() { return 0; }\nLOCK_FILE=/nonexistent-dir/x.lock\nmain --drain\n")
+    assert _calls(st) == []
+    assert "cannot open" in proc.stdout
 
 
 def test_collector_reports_the_history_and_survives_odd_bytes(monkeypatch, tmp_path) -> None:
@@ -537,7 +548,8 @@ def test_each_request_keeps_its_own_age_through_a_claim(st: Path) -> None:
     import time
 
     old = int(time.time()) - 20 * 60
-    _w(st / "host-action-request", f"1\thost-apply-vlan\n2\thost-reboot\t{old}\n")
+    _w(st / "host-action-request", "1\thost-apply-vlan\n2\thost-reboot\n")
+    _w(st / "host-action-seen", f"2\t{old}\n")
     _run(st, "main --drain\n")
     assert _calls(st) == ["host-apply-vlan"]             # the fresh one ran
     assert [(h["commandId"], h["status"]) for h in _history(st)] == [(1, "ok"), (2, "expired")]
@@ -547,31 +559,51 @@ def test_a_claim_preserves_the_stamps_of_the_requests_behind_it(st: Path) -> Non
     import time
 
     old = int(time.time()) - 5 * 60
-    _w(st / "host-action-request", f"1\thost-restart\t{old}\n2\thost-reboot\t{old}\n")
+    _w(st / "host-action-request", "1\thost-restart\n2\thost-reboot\n")
+    _w(st / "host-action-seen", f"1\t{old}\n2\t{old}\n")
     (st / "boot").write_text("boot-A\n")
     (st / "die-host-restart").touch()
     _run(st, "main --drain\n")
-    assert (st / "host-action-request").read_text().strip() == f"2\thost-reboot\t{old}"
+    assert (st / "host-action-request").read_text().strip() == "2\thost-reboot"   # format unchanged
+    assert f"2\t{old}" in (st / "host-action-seen").read_text()
 
 
-def test_stamp_mode_dates_unstamped_lines_by_the_file_mtime(st: Path) -> None:
+def test_stamp_mode_dates_new_requests_by_the_file_mtime(st: Path) -> None:
     req = st / "host-action-request"
     _w(req, "1\thost-reboot\n")
     _age(req, 30)
     mtime = int(req.stat().st_mtime)
     _run(st, "main --stamp\n")
     assert _calls(st) == []
-    cid, action, ts = req.read_text().strip().split("\t")
-    assert (cid, action) == ("1", "host-reboot") and abs(int(ts) - mtime) <= 1
+    assert req.read_text() == "1\thost-reboot\n"                 # the queue is never rewritten
+    cid, ts = (st / "host-action-seen").read_text().strip().split("\t")
+    assert cid == "1" and abs(int(ts) - mtime) <= 1
 
 
-def test_a_failed_rewrite_leaves_the_queue_intact(st: Path) -> None:
-    """Atomic writes: a failed rename must not leave a truncated queue behind."""
+def test_a_failed_replacement_leaves_the_file_intact(st: Path) -> None:
+    """Atomic writes: a failed rename must not leave a truncated file behind."""
+    f = st / "host-action-request"
+    _w(f, "1\thost-restart\n2\thost-apply-vlan\n")
+    proc = _run(st, 'mv() { return 1; }\nSUDO=(false)\n_write_state "$REQUEST_FILE" "2\thost-apply-vlan"; echo "rc=$?"\n')
+    assert "rc=1" in proc.stdout
+    assert f.read_text() == "1\thost-restart\n2\thost-apply-vlan\n"
+    assert not list(st.glob("*.tmp.*"))                   # no temp files left behind
+
+
+def test_a_failed_queue_replacement_during_a_claim_runs_nothing(st: Path) -> None:
+    """Only the request-file replacement fails; the in-flight write before it succeeded."""
     _w(st / "host-action-request", "1\thost-restart\n2\thost-apply-vlan\n")
-    _run(st, "_stamp_queue() { :; }\nmv() { return 1; }\nSUDO=(false)\nmain --drain\n")
+    body = (
+        'eval "orig_$(declare -f _write_state)"\n'
+        '_write_state() { if [ "$1" = "$REQUEST_FILE" ]; then echo "QWRITE" >> "$ST/attempts"; return 1; fi; orig__write_state "$@"; }\n'
+        "main --drain\n"
+    )
+    _run(st, body)
+    assert (st / "attempts").read_text().split() == ["QWRITE"]   # the replacement WAS attempted
     assert _calls(st) == []
     assert (st / "host-action-request").read_text() == "1\thost-restart\n2\thost-apply-vlan\n"
-    assert not list(st.glob("*.tmp.*"))                   # no temp files left behind
+    assert _empty(st / "host-action-inflight")
+    assert (_result(st)["status"], _result(st)["commandId"]) == ("deferred", 1)
 
 
 def test_a_retry_that_cannot_be_recorded_is_deferred_not_failed(st: Path) -> None:
@@ -586,6 +618,17 @@ def test_a_retry_that_cannot_be_recorded_is_deferred_not_failed(st: Path) -> Non
     assert (_result(st)["status"], _result(st)["commandId"]) == ("deferred", 121)
     assert _history(st) == []
     assert "\t1\t" in (st / "host-action-inflight").read_text()   # retry still pending
+
+
+def test_checkin_stamps_before_the_checkin_and_serialises_itself() -> None:
+    text = CHECKIN_SH.read_text(encoding="utf-8")
+    lock = text.index('exec 8>>"${NETMON_LOCK_DIR:-/run/lock}/netmon-checkin.lock"')
+    stamp = text.index('host-action.sh" --stamp 8>&- >/dev/null 2>&1\n\nout=')
+    checkin = text.index("exec -T collector python -m collector checkin")
+    assert lock < stamp < checkin
+    # every host-action call drops the check-in lock fd
+    for call in ("--drain 8>&-", "--drain-leftover 8>&-"):
+        assert call in text
 
 
 def test_checkin_stamps_the_queue_when_it_leaves_it_for_later() -> None:
@@ -610,3 +653,49 @@ def test_the_queue_waits_while_a_deferred_retry_is_pending(st: Path) -> None:
     _run(st, body)
     assert _calls(st) == []
     assert (st / "host-action-request").read_text().startswith("130\thost-restart")
+
+
+
+# --- review round 3 (Codex pass 3) ------------------------------------------------
+
+
+def test_a_stuck_legacy_request_stays_old_after_a_new_append(st: Path) -> None:
+    """Stamped BEFORE the check-in appends, so the new append's mtime can't rejuvenate it."""
+    req = st / "host-action-request"
+    _w(req, "1\thost-reboot\n")
+    _age(req, 3 * 24 * 60)
+    _run(st, "main --stamp\n")                              # netmon-checkin.sh, pre-check-in
+    with req.open("ab") as fh:                                 # the check-in appends
+        fh.write(b"2\thost-apply-vlan\n")
+    _run(st, "main --drain\n")
+    assert _calls(st) == ["host-apply-vlan"]
+    assert [(h["commandId"], h["status"]) for h in _history(st)] == [(1, "expired"), (2, "ok")]
+    assert _empty(st / "host-action-seen")                     # nothing queued: pruned
+
+
+@pytest.mark.parametrize(("action", "runs"), [("host-reboot", False), ("host-apply-vlan", True)])
+def test_a_stamp_from_the_future_is_unknown_age(st: Path, action: str, runs: bool) -> None:
+    import time
+
+    _w(st / "host-action-request", f"1\t{action}\n")
+    _w(st / "host-action-seen", f"1\t{int(time.time()) + 3600}\n")
+    _run(st, "main --drain\n")
+    assert _calls(st) == ([action] if runs else [])
+
+
+def test_a_malformed_seen_entry_is_restamped_not_trusted(st: Path) -> None:
+    req = st / "host-action-request"
+    _w(req, "1\thost-reboot\n")
+    _w(st / "host-action-seen", "1\tgarbage\nxx\t5\n")
+    _run(st, "main --drain\n")
+    assert _calls(st) == ["host-reboot"]                       # dated by the fresh append
+
+
+def test_seen_keeps_the_in_flight_request(st: Path) -> None:
+    (st / "boot").write_text("boot-A\n")
+    _w(st / "host-action-request", "1\thost-restart\n2\thost-apply-vlan\n")
+    (st / "die-host-restart").touch()
+    _run(st, "main --drain\n")
+    seen = (st / "host-action-seen").read_text()
+    assert seen.startswith("1\t") or "\n1\t" in seen       # in flight: kept
+    assert "2\t" in seen                                      # still queued: kept

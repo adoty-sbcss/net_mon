@@ -74,12 +74,12 @@ drain_leftover_host_actions() {
     if systemctl is-active --quiet netmon-update.service 2>/dev/null; then
         log "leftover host action found; waiting — an update is in progress"
         # Date what was queued now, so its age is its own when it is finally drained.
-        [ -x "$REPO_DIR/scripts/host-action.sh" ] && "$REPO_DIR/scripts/host-action.sh" --stamp >/dev/null 2>&1
+        [ -x "$REPO_DIR/scripts/host-action.sh" ] && "$REPO_DIR/scripts/host-action.sh" --stamp 8>&- >/dev/null 2>&1
         return 0
     fi
     if [ -x "$REPO_DIR/scripts/host-action.sh" ]; then
         log "leftover host action found; draining"
-        "$REPO_DIR/scripts/host-action.sh" --drain-leftover 2>&1 \
+        "$REPO_DIR/scripts/host-action.sh" --drain-leftover 8>&- 2>&1 \
             | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done || true
     fi
 }
@@ -88,6 +88,23 @@ if ! "${DC[@]}" ps --status running 2>/dev/null | grep -q netmon-collector; then
     log "collector not running; skipping check-in"
     exit 0
 fi
+
+# One check-in at a time. The timer's oneshot already serialises itself, but a
+# manual run beside it would let two check-ins append host actions in interleaved
+# order while a drain rewrites the queue. /run/lock: world-writable, cleared at boot,
+# and the file is opened with >> so it is never replaced. Children of the long-lived
+# kind (the host-action drain) get 8>&- so they cannot hold it after we exit.
+if command -v flock >/dev/null 2>&1; then
+    if ! { exec 8>>"${NETMON_LOCK_DIR:-/run/lock}/netmon-checkin.lock"; } 2>/dev/null \
+        || ! flock -w 600 8; then
+        log "another check-in is running (or its lock is unavailable); skipping"
+        exit 0
+    fi
+fi
+
+# Date whatever is already queued BEFORE this check-in can append, so a request
+# left from an earlier cycle (or an old box's stuck one) keeps its own age.
+[ -x "$REPO_DIR/scripts/host-action.sh" ] && "$REPO_DIR/scripts/host-action.sh" --stamp 8>&- >/dev/null 2>&1
 
 out="$("${DC[@]}" exec -T collector python -m collector checkin 2>&1)"
 rc=$?
@@ -154,7 +171,7 @@ elif [ "$rc" = "12" ]; then
         mark_config_pending || true
     fi
     if [ -x "$REPO_DIR/scripts/host-action.sh" ]; then
-        "$REPO_DIR/scripts/host-action.sh" --drain 2>&1 \
+        "$REPO_DIR/scripts/host-action.sh" --drain 8>&- 2>&1 \
             | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done || true
     else
         log "scripts/host-action.sh missing; cannot run host action"

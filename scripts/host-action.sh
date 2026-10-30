@@ -41,9 +41,15 @@ REQUEST_FILE="$STATE_DIR/host-action-request"
 RESULT_FILE="$STATE_DIR/host-action-result"
 HISTORY_FILE="$STATE_DIR/host-action-results"
 INFLIGHT_FILE="$STATE_DIR/host-action-inflight"
+# When this script first saw each queued request ("<command-id>\t<epoch>"). Kept
+# BESIDE the queue, not in it: the queue's format stays what the agent writes and
+# what an older host-action.sh (after a rollback) can read, and this file has no
+# writer but this script, under its lock.
+SEEN_FILE="$STATE_DIR/host-action-seen"
 # Outside the checkout on purpose: git pull REPLACES this script's file, so a lock
-# on the script's own inode would not exclude a run started after the pull.
-LOCK_FILE="$STATE_DIR/host-action.lock"
+# on the script's own inode would not exclude a run started after the pull. Opened
+# with >> (created if missing, never replaced): two starters must share one inode.
+LOCK_FILE="${NETMON_LOCK_DIR:-/run/lock}/netmon-host-action.lock"
 LOG_TAG="netmon-host-action"
 # Runs per request: the first plus one automatic retry after an interruption.
 MAX_ATTEMPTS=2
@@ -410,23 +416,19 @@ _append_action_log() {  # action command-id attempt rc output-file
     fi
 }
 
-# --- the queue: one request per line, oldest first --------------------------------
-# "<command-id>\t<action>" as the agent appends it; this script adds a third field,
-# "\t<epoch>", the first time it sees the line (_stamp_queue), so each request
-# keeps its own age through every rewrite of the file. The file's mtime does not:
-# each claim rewrites it, and each later append refreshes it.
+# --- the queue: one request per line, "<command-id>\t<action>", oldest first ----
 
-# The first request: sets Q_CID, Q_ACTION, Q_TS and Q_REST (the lines after it).
+# The first request: sets Q_CID, Q_ACTION and Q_REST (the lines after it).
 # Returns 1 when the queue is empty.
 _queue_head() {
     local q line found=""
-    Q_CID=""; Q_ACTION=""; Q_TS=""; Q_REST=""
+    Q_CID=""; Q_ACTION=""; Q_REST=""
     q="$(_read_state "$REQUEST_FILE")"
     while IFS= read -r line; do
         line="${line%$'\r'}"
         [ -n "${line//[[:space:]]/}" ] || continue
         if [ -z "$found" ]; then
-            IFS=$'\t' read -r Q_CID Q_ACTION Q_TS <<< "$line"
+            IFS=$'\t' read -r Q_CID Q_ACTION _ <<< "$line"
             found=1
         else
             Q_REST+="${line}"$'\n'
@@ -435,28 +437,49 @@ _queue_head() {
     [ -n "$found" ]
 }
 
-# Give every unstamped line a time. A line appended during this check-in gets the
-# file's mtime — the append that just happened. A line left from before this code
-# (an old box's stuck request) gets the same mtime, which is how old it really is,
-# so it expires rather than firing. Run right after each check-in, before anything
-# else can append, so the mtime is that line's own.
+# Each request's age comes from SEEN_FILE, not the queue file's mtime (every claim
+# rewrites the file and every append refreshes it). A command id seen for the first
+# time is dated by the queue file's mtime — its last append. That is exact when
+# stamping runs at the right moments: netmon-checkin.sh stamps BEFORE each check-in
+# (so whatever was already queued keeps the time it was really appended — an old
+# box's stuck request stays old and expires) and the drain stamps again right after
+# (dating what this check-in appended). Entries for requests no longer queued or in
+# flight are dropped.
 _stamp_queue() {
-    local q line cid a ts out="" changed="" m
-    [ -s "$REQUEST_FILE" ] || return 0
+    local q line cid a seen keep="" m inflight_cid=""
     m="$(stat -c %Y "$REQUEST_FILE" 2>/dev/null)" || m=0
     q="$(_read_state "$REQUEST_FILE")"
+    seen="$(_read_state "$SEEN_FILE")"
+    IFS=$'\t' read -r inflight_cid _ <<< "$(_read_state "$INFLIGHT_FILE")"
+    local -A stamp=()
+    while IFS=$'\t' read -r cid a; do
+        [[ "${cid:-}" =~ ^[0-9]{1,18}$ && "${a:-}" =~ ^[0-9]{1,12}$ ]] && stamp[$cid]="$a"
+    done <<< "$seen"
     while IFS= read -r line; do
         line="${line%$'\r'}"
-        [ -n "${line//[[:space:]]/}" ] || continue
-        IFS=$'\t' read -r cid a ts <<< "$line"
-        if [[ ! "${ts:-}" =~ ^[0-9]{1,12}$ ]]; then
-            line="$(printf '%s\t%s\t%s' "$cid" "${a:-}" "$m")"
-            changed=1
-        fi
-        out+="${line}"$'\n'
+        IFS=$'\t' read -r cid a _ <<< "$line"
+        [[ "${cid:-}" =~ ^[0-9]{1,18}$ ]] || continue
+        [ -n "${stamp[$cid]:-}" ] || stamp[$cid]="$m"
+        keep+="${cid}"$'\t'"${stamp[$cid]}"$'\n'
+        unset 'stamp[$cid]'
     done <<< "$q"
-    [ -n "$changed" ] || return 0
-    _write_state "$REQUEST_FILE" "${out%$'\n'}"
+    if [[ "${inflight_cid:-}" =~ ^[0-9]{1,18}$ ]] && [ -n "${stamp[$inflight_cid]:-}" ]; then
+        keep+="${inflight_cid}"$'\t'"${stamp[$inflight_cid]}"$'\n'
+    fi
+    [ "${keep%$'\n'}" = "${seen%$'\n'}" ] && return 0
+    if [ -z "$keep" ]; then
+        _clear_state "$SEEN_FILE"
+    else
+        _write_state "$SEEN_FILE" "${keep%$'\n'}"
+    fi
+}
+# The stamp recorded for a command id ("" when none).
+_stamp_of() {  # command-id
+    local cid ts
+    while IFS=$'\t' read -r cid ts; do
+        [ "${cid:-}" = "$1" ] && { printf '%s' "${ts:-}"; return 0; }
+    done <<< "$(_read_state "$SEEN_FILE")"
+    return 0
 }
 _queue_set() {  # remaining-lines
     if [ -z "$1" ]; then
@@ -528,12 +551,18 @@ recover_interrupted() {
 
 # How old a request is, in whole minutes, from its own stamp — taken right before
 # it would run, not once per drain (a slow earlier action ages the ones behind it).
-# Undated reads as very old: a request we cannot date is not run. A stamp in the
-# future (the clock stepped back) reads as new.
-_request_age_min() {  # stamp
+# Undated reads as very old: a request we cannot date is not run. A stamp more than
+# five minutes in the future means the clock stepped back since: the true age is
+# unknown, so a disruptive action treats it as old (expires) and a convergent one
+# as new (runs — repeating a VLAN apply is harmless, a surprise reboot is not).
+_request_age_min() {  # stamp action
     [[ "${1:-}" =~ ^[0-9]{1,12}$ ]] || { echo 999999; return; }
     local now age
     now="$(date +%s)"
+    if (( 10#$1 > now + 300 )); then
+        if _retry_safe "${2:-}"; then echo 0; else echo 999999; fi
+        return
+    fi
     age=$(( (now - 10#$1) / 60 ))
     (( age < 0 )) && age=0
     echo "$age"
@@ -548,7 +577,7 @@ drain_queue() {  # mode
         # Every request is age-checked, on --drain too: a request queued this cycle is
         # seconds old, but one left from a skipped cycle (an update was running) can
         # be hours old by the next exit 12.
-        age="$(_request_age_min "$Q_TS")"
+        age="$(_request_age_min "$(_stamp_of "$cid")" "$action")"
         limit="$LEFTOVER_MAX_AGE_MIN"
         _retry_safe "$action" || limit="$DISRUPTIVE_MAX_AGE_MIN"
         if (( age > limit )); then
@@ -581,25 +610,28 @@ drain_queue() {  # mode
 }
 
 # One run at a time, so a drain never mistakes a live action (a manual run, say)
-# for an interrupted one.
+# for an interrupted one. Fails closed: no lock, no run. Returns 2 when the lock
+# cannot be opened at all, 1 when another run holds it.
 _take_lock() {
     command -v flock >/dev/null 2>&1 || return 0
-    [ -e "$LOCK_FILE" ] || _write_state "$LOCK_FILE" "" || true
-    if ! exec 9<"$LOCK_FILE"; then
-        log "WARN: cannot open ${LOCK_FILE}; running without the lock"
-        return 0
-    fi
-    flock -n 9
+    { exec 9>>"$LOCK_FILE"; } 2>/dev/null || return 2
+    flock -n 9 || return 1
 }
 
 main() {
-    if ! _take_lock; then
+    local lk=0
+    _take_lock || lk=$?
+    if (( lk == 2 )); then
+        log "cannot open ${LOCK_FILE}; not running host actions (the queue stays for the next check-in)"
+        return 1
+    elif (( lk != 0 )); then
         log "another host action is running; leaving the queue for the next check-in"
         return 0
     fi
 
     local mode="${1:-}"
-    # --- stamp only (netmon-checkin.sh, when it leaves the queue for later) --
+    # --- stamp only (netmon-checkin.sh: before each check-in, and when it ---
+    # leaves the queue for later) ------------------------------------------------
     if [ "$mode" = "--stamp" ]; then
         _stamp_queue || true
         return 0
@@ -616,17 +648,17 @@ main() {
     if [ ! -s "$REQUEST_FILE" ] && [ ! -s "$INFLIGHT_FILE" ]; then
         return 0
     fi
-    _stamp_queue || log "WARN: could not stamp ${REQUEST_FILE}; undated requests will expire"
+    _stamp_queue || log "WARN: could not record request times in ${SEEN_FILE}; undated requests will expire"
     recover_interrupted
     # An in-flight record still there means its retry is deferred (the record could
-    # not be rewritten). Hold the queue: the box runs requests strictly in order, and
-    # the dashboard relies on that — a newer command settling means every older one
-    # has finished here.
+    # not be rewritten). Hold the queue: requests run strictly in order, so a newer
+    # one never overtakes an older one still owed its retry.
     if [ -s "$INFLIGHT_FILE" ]; then
         log "an interrupted action is still pending; leaving the queue for the next check-in"
         return 0
     fi
     drain_queue "$mode" || true
+    _stamp_queue || true   # drop the ages of what was just claimed
     return 0
 }
 
