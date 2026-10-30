@@ -73,6 +73,8 @@ drain_leftover_host_actions() {
     # reboot or rebuild queued alongside it waits for the next check-in.
     if systemctl is-active --quiet netmon-update.service 2>/dev/null; then
         log "leftover host action found; waiting — an update is in progress"
+        # Date what was queued now, so its age is its own when it is finally drained.
+        [ -x "$REPO_DIR/scripts/host-action.sh" ] && "$REPO_DIR/scripts/host-action.sh" --stamp >/dev/null 2>&1
         return 0
     fi
     if [ -x "$REPO_DIR/scripts/host-action.sh" ]; then

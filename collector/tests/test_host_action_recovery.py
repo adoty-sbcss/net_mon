@@ -327,11 +327,18 @@ def test_a_stale_leftover_request_is_expired_not_run(st: Path) -> None:
     assert _empty(req)
 
 
-def test_a_stale_request_still_runs_on_an_explicit_drain(st: Path) -> None:
-    """--drain is exit 12: the agent queued it on this very check-in."""
+def test_a_stale_request_expires_on_an_explicit_drain_too(st: Path) -> None:
+    """Exit 12 drains whatever is queued — including one left from a skipped cycle."""
     req = st / "host-action-request"
     _w(req, "9\thost-restart\n")
     _age(req, 3 * 24 * 60)
+    _run(st, "main --drain\n")
+    assert _calls(st) == []
+    assert (_result(st)["status"], _result(st)["commandId"]) == ("expired", 9)
+
+
+def test_a_fresh_request_runs_on_an_explicit_drain(st: Path) -> None:
+    _w(st / "host-action-request", "9\thost-restart\n")
     _run(st, "main --drain\n")
     assert _calls(st) == ["host-restart"]
 
@@ -392,7 +399,7 @@ def test_power_loss_mid_queue_keeps_the_unstarted_requests(st: Path) -> None:
     (st / "die-host-restart").touch()
     _run(st, "main --drain\n")
     assert _calls(st) == ["host-restart"]
-    assert (st / "host-action-request").read_text().strip() == "2\thost-apply-vlan"
+    assert (st / "host-action-request").read_text().startswith("2\thost-apply-vlan\t")
     (st / "die-host-restart").unlink()
     _w((st / "boot"), "boot-B\n")
     _run(st, "main --drain-leftover\n")
@@ -407,7 +414,9 @@ def test_nothing_runs_when_the_request_cannot_be_removed(st: Path) -> None:
     assert _calls(st) == []
     assert _empty(st / "host-action-inflight")
     r = _result(st)
-    assert (r["status"], r["commandId"]) == ("failed", 9) and "could not remove" in r["reason"]
+    # Still queued, so NOT a terminal "failed" that its later run would contradict.
+    assert (r["status"], r["commandId"]) == ("deferred", 9) and "could not remove" in r["reason"]
+    assert _history(st) == []
 
 
 def test_nothing_runs_when_the_inflight_record_cannot_be_written(st: Path) -> None:
@@ -419,7 +428,8 @@ def test_nothing_runs_when_the_inflight_record_cannot_be_written(st: Path) -> No
     )
     _run(st, body)
     assert _calls(st) == []
-    assert (st / "host-action-request").read_text().strip() == "9\thost-reboot"   # left queued
+    assert (st / "host-action-request").read_text().startswith("9\thost-reboot")   # left queued
+    assert _result(st)["status"] == "deferred" and _history(st) == []
 
 
 def test_the_retry_limit_holds_when_the_attempt_cannot_be_recorded(st: Path) -> None:
@@ -516,3 +526,87 @@ def test_leftovers_wait_while_an_update_is_running() -> None:
     fn = text[text.index("drain_leftover_host_actions() {"):]
     fn = fn[: fn.index("\n}\n")]
     assert fn.index("systemctl is-active --quiet netmon-update.service") < fn.index("--drain-leftover")
+
+
+
+# --- review round 2 (Codex fix pass) ----------------------------------------------
+
+
+def test_each_request_keeps_its_own_age_through_a_claim(st: Path) -> None:
+    """The file's mtime is refreshed by every claim; a request's own stamp is not."""
+    import time
+
+    old = int(time.time()) - 20 * 60
+    _w(st / "host-action-request", f"1\thost-apply-vlan\n2\thost-reboot\t{old}\n")
+    _run(st, "main --drain\n")
+    assert _calls(st) == ["host-apply-vlan"]             # the fresh one ran
+    assert [(h["commandId"], h["status"]) for h in _history(st)] == [(1, "ok"), (2, "expired")]
+
+
+def test_a_claim_preserves_the_stamps_of_the_requests_behind_it(st: Path) -> None:
+    import time
+
+    old = int(time.time()) - 5 * 60
+    _w(st / "host-action-request", f"1\thost-restart\t{old}\n2\thost-reboot\t{old}\n")
+    (st / "boot").write_text("boot-A\n")
+    (st / "die-host-restart").touch()
+    _run(st, "main --drain\n")
+    assert (st / "host-action-request").read_text().strip() == f"2\thost-reboot\t{old}"
+
+
+def test_stamp_mode_dates_unstamped_lines_by_the_file_mtime(st: Path) -> None:
+    req = st / "host-action-request"
+    _w(req, "1\thost-reboot\n")
+    _age(req, 30)
+    mtime = int(req.stat().st_mtime)
+    _run(st, "main --stamp\n")
+    assert _calls(st) == []
+    cid, action, ts = req.read_text().strip().split("\t")
+    assert (cid, action) == ("1", "host-reboot") and abs(int(ts) - mtime) <= 1
+
+
+def test_a_failed_rewrite_leaves_the_queue_intact(st: Path) -> None:
+    """Atomic writes: a failed rename must not leave a truncated queue behind."""
+    _w(st / "host-action-request", "1\thost-restart\n2\thost-apply-vlan\n")
+    _run(st, "_stamp_queue() { :; }\nmv() { return 1; }\nSUDO=(false)\nmain --drain\n")
+    assert _calls(st) == []
+    assert (st / "host-action-request").read_text() == "1\thost-restart\n2\thost-apply-vlan\n"
+    assert not list(st.glob("*.tmp.*"))                   # no temp files left behind
+
+
+def test_a_retry_that_cannot_be_recorded_is_deferred_not_failed(st: Path) -> None:
+    _inflight(st, "121", "host-apply-vlan", "boot-A", 1)
+    body = (
+        'eval "orig_$(declare -f _write_state)"\n'
+        '_write_state() { [ "$1" = "$INFLIGHT_FILE" ] && return 1; orig__write_state "$@"; }\n'
+        "main --drain\n"
+    )
+    _run(st, body)
+    assert _calls(st) == []
+    assert (_result(st)["status"], _result(st)["commandId"]) == ("deferred", 121)
+    assert _history(st) == []
+    assert "\t1\t" in (st / "host-action-inflight").read_text()   # retry still pending
+
+
+def test_checkin_stamps_the_queue_when_it_leaves_it_for_later() -> None:
+    text = CHECKIN_SH.read_text(encoding="utf-8")
+    fn = text[text.index("drain_leftover_host_actions() {"):]
+    fn = fn[: fn.index("\n}\n")]
+    wait = fn[fn.index("systemctl is-active"):]
+    wait = wait[: wait.index("return 0")]
+    assert "--stamp" in wait
+
+
+
+def test_the_queue_waits_while_a_deferred_retry_is_pending(st: Path) -> None:
+    """Strict order: a newer command must not settle while an older one is still owed a run."""
+    _inflight(st, "121", "host-apply-vlan", "boot-A", 1)
+    _w(st / "host-action-request", "130\thost-restart\n")
+    body = (
+        'eval "orig_$(declare -f _write_state)"\n'
+        '_write_state() { [ "$1" = "$INFLIGHT_FILE" ] && return 1; orig__write_state "$@"; }\n'
+        "main --drain\n"
+    )
+    _run(st, body)
+    assert _calls(st) == []
+    assert (st / "host-action-request").read_text().startswith("130\thost-restart")

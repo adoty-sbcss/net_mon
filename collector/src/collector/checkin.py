@@ -2578,7 +2578,7 @@ def _host_action_record(raw: str) -> dict | None:
     return data
 
 
-def _host_action_history(limit: int = 20) -> list[dict]:
+def _host_action_history(limit: int = 50) -> list[dict]:
     """Recent TERMINAL host-action outcomes that carry a command id, oldest first
     (scripts/host-action.sh appends them). The latest-result file holds one outcome,
     so a drain that ran two actions — or reported an interrupted one superseded by a

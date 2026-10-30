@@ -53,7 +53,7 @@ MAX_ATTEMPTS=2
 LEFTOVER_MAX_AGE_MIN="${NETMON_LEFTOVER_MAX_AGE_MIN:-120}"
 [[ "$LEFTOVER_MAX_AGE_MIN" =~ ^[0-9]{1,5}$ ]] || LEFTOVER_MAX_AGE_MIN=120
 DISRUPTIVE_MAX_AGE_MIN=15
-HISTORY_KEEP=20
+HISTORY_KEEP=50
 
 log() {
     if command -v logger >/dev/null 2>&1; then
@@ -66,8 +66,10 @@ log() {
 # at check-in (checkin.py:_last_host_action) -> the dashboard. Mirrors auto-update.sh's
 # last-update-result so a failed host action (e.g. a VLAN apply that crashed netplan)
 # is visible on the dashboard, not just buried in the box journal.
-# status: running | ok | failed | interrupted | expired. commandId (the dashboard's
-# queue id, when numeric) lets the dashboard close that command's "scheduled" row.
+# status: running | ok | failed | interrupted | expired | deferred. commandId (the
+# dashboard's queue id, when numeric) lets the dashboard close that command's
+# "scheduled" row. "deferred" is NOT terminal: the request is still queued (or its
+# retry still pending) and runs at a later check-in, so it must not settle anything.
 # Every control character is removed, not just newlines: the reason now quotes the
 # action's own output, and one raw ESC or BEL makes the collector's json.loads
 # refuse the whole file — the report would silently vanish.
@@ -110,9 +112,21 @@ _append_history() {
 # directly when we can, else through sudo. These RETURN the real outcome: running
 # an action whose request could not be removed, or whose in-flight record could not
 # be written, is how a reboot request loops or a retry limit stops holding.
+# Atomic: a temp file in the same directory, then rename. Writing in place truncates
+# first, so power lost mid-write erased the queue's tail (the requests behind the
+# one being claimed) or left a half in-flight record.
 _write_state() {  # file content
-    { printf '%s\n' "$2" > "$1"; } 2>/dev/null && return 0
-    printf '%s\n' "$2" | "${SUDO[@]}" tee "$1" >/dev/null 2>&1
+    local tmp="$1.tmp.$$"
+    if { printf '%s\n' "$2" > "$tmp"; } 2>/dev/null && mv -f "$tmp" "$1" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null
+    if printf '%s\n' "$2" | "${SUDO[@]}" tee "$tmp" >/dev/null 2>&1 \
+        && "${SUDO[@]}" mv -f "$tmp" "$1" 2>/dev/null; then
+        return 0
+    fi
+    "${SUDO[@]}" rm -f "$tmp" 2>/dev/null
+    return 1
 }
 _read_state() {
     cat "$1" 2>/dev/null || "${SUDO[@]}" cat "$1" 2>/dev/null || true
@@ -350,7 +364,13 @@ run_tracked() {  # command-id action attempt
     local cid="$1" action="$2" attempt="${3:-1}"
     if ! _write_state "$INFLIGHT_FILE" "$(_inflight_rec "$cid" "$action" "$attempt")"; then
         log "cannot record '${action}' as in flight (${INFLIGHT_FILE} not writable); not running it"
-        write_result "$action" "failed" "not run: the box could not record it as in progress (state directory not writable)" "$cid" "$attempt"
+        if (( attempt > 1 )); then
+            # A retry: the earlier attempt's record is still there, so the next drain
+            # tries again. Not a terminal outcome — it must not settle the command.
+            write_result "$action" "deferred" "not retried yet: the box could not record it as in progress (state directory not writable); it tries again at the next check-in" "$cid" "$attempt"
+        else
+            write_result "$action" "failed" "not run: the box could not record it as in progress (state directory not writable)" "$cid" "$attempt"
+        fi
         return 1
     fi
     _run_claimed "$cid" "$action" "$attempt"
@@ -390,25 +410,53 @@ _append_action_log() {  # action command-id attempt rc output-file
     fi
 }
 
-# --- the queue: one request per line, "<command-id>\t<action>", oldest first ----
+# --- the queue: one request per line, oldest first --------------------------------
+# "<command-id>\t<action>" as the agent appends it; this script adds a third field,
+# "\t<epoch>", the first time it sees the line (_stamp_queue), so each request
+# keeps its own age through every rewrite of the file. The file's mtime does not:
+# each claim rewrites it, and each later append refreshes it.
 
-# The first request: sets Q_CID, Q_ACTION and Q_REST (the lines after it).
+# The first request: sets Q_CID, Q_ACTION, Q_TS and Q_REST (the lines after it).
 # Returns 1 when the queue is empty.
 _queue_head() {
     local q line found=""
-    Q_CID=""; Q_ACTION=""; Q_REST=""
+    Q_CID=""; Q_ACTION=""; Q_TS=""; Q_REST=""
     q="$(_read_state "$REQUEST_FILE")"
     while IFS= read -r line; do
         line="${line%$'\r'}"
         [ -n "${line//[[:space:]]/}" ] || continue
         if [ -z "$found" ]; then
-            IFS=$'\t' read -r Q_CID Q_ACTION <<< "$line"
+            IFS=$'\t' read -r Q_CID Q_ACTION Q_TS <<< "$line"
             found=1
         else
             Q_REST+="${line}"$'\n'
         fi
     done <<< "$q"
     [ -n "$found" ]
+}
+
+# Give every unstamped line a time. A line appended during this check-in gets the
+# file's mtime — the append that just happened. A line left from before this code
+# (an old box's stuck request) gets the same mtime, which is how old it really is,
+# so it expires rather than firing. Run right after each check-in, before anything
+# else can append, so the mtime is that line's own.
+_stamp_queue() {
+    local q line cid a ts out="" changed="" m
+    [ -s "$REQUEST_FILE" ] || return 0
+    m="$(stat -c %Y "$REQUEST_FILE" 2>/dev/null)" || m=0
+    q="$(_read_state "$REQUEST_FILE")"
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        [ -n "${line//[[:space:]]/}" ] || continue
+        IFS=$'\t' read -r cid a ts <<< "$line"
+        if [[ ! "${ts:-}" =~ ^[0-9]{1,12}$ ]]; then
+            line="$(printf '%s\t%s\t%s' "$cid" "${a:-}" "$m")"
+            changed=1
+        fi
+        out+="${line}"$'\n'
+    done <<< "$q"
+    [ -n "$changed" ] || return 0
+    _write_state "$REQUEST_FILE" "${out%$'\n'}"
 }
 _queue_set() {  # remaining-lines
     if [ -z "$1" ]; then
@@ -422,7 +470,7 @@ _queue_has_family() {  # action
     local fam line cid a
     fam="$(_family "$1")"
     while IFS= read -r line; do
-        IFS=$'\t' read -r cid a <<< "$line"
+        IFS=$'\t' read -r cid a _ <<< "$line"
         [ -n "${a:-}" ] && [ "$(_family "$a")" = "$fam" ] && return 0
     done <<< "$(_read_state "$REQUEST_FILE")"
     return 1
@@ -431,7 +479,7 @@ _queue_has_family() {  # action
 _queue_has_cid() {  # command-id
     local line cid a
     while IFS= read -r line; do
-        IFS=$'\t' read -r cid a <<< "$line"
+        IFS=$'\t' read -r cid a _ <<< "$line"
         [ "${cid:-}" = "$1" ] && return 0
     done <<< "$(_read_state "$REQUEST_FILE")"
     return 1
@@ -478,45 +526,52 @@ recover_interrupted() {
     fi
 }
 
-# How old the queue is, in whole minutes (it is rewritten at every claim, so this
-# is the age of the oldest unclaimed request). Unknown reads as very old: a
-# leftover we cannot date is not run.
-_queue_age_min() {
-    local m now
-    m="$(stat -c %Y "$REQUEST_FILE" 2>/dev/null)" || { echo 999999; return; }
+# How old a request is, in whole minutes, from its own stamp — taken right before
+# it would run, not once per drain (a slow earlier action ages the ones behind it).
+# Undated reads as very old: a request we cannot date is not run. A stamp in the
+# future (the clock stepped back) reads as new.
+_request_age_min() {  # stamp
+    [[ "${1:-}" =~ ^[0-9]{1,12}$ ]] || { echo 999999; return; }
+    local now age
     now="$(date +%s)"
-    echo $(( (now - m) / 60 ))
+    age=$(( (now - 10#$1) / 60 ))
+    (( age < 0 )) && age=0
+    echo "$age"
 }
 
 drain_queue() {  # mode
-    local mode="$1" age="" n=0 cid action limit
-    [ "$mode" = "--drain-leftover" ] && age="$(_queue_age_min)"
+    local mode="$1" age n=0 cid action limit
     while _queue_head; do
         (( ++n <= 64 )) || { log "the queue did not shrink; stopping"; return 1; }
         cid="$Q_CID"; action="$Q_ACTION"
         [ -n "${action:-}" ] || { _queue_set "$Q_REST" || return 1; continue; }
-        if [ -n "$age" ]; then
-            limit="$LEFTOVER_MAX_AGE_MIN"
-            _retry_safe "$action" || limit="$DISRUPTIVE_MAX_AGE_MIN"
-            if (( age > limit )); then
+        # Every request is age-checked, on --drain too: a request queued this cycle is
+        # seconds old, but one left from a skipped cycle (an update was running) can
+        # be hours old by the next exit 12.
+        age="$(_request_age_min "$Q_TS")"
+        limit="$LEFTOVER_MAX_AGE_MIN"
+        _retry_safe "$action" || limit="$DISRUPTIVE_MAX_AGE_MIN"
+        if (( age > limit )); then
                 _queue_set "$Q_REST" || { log "cannot update ${REQUEST_FILE}; stopping"; return 1; }
                 log "EXPIRED: host action id=${cid:-?} action=${action} was queued ${age} min ago (limit ${limit}); not running it now"
                 write_result "$action" "expired" \
                     "queued ${age} minutes ago and never run; too old to run now — queue it again from the dashboard" "$cid" 1
                 continue
-            fi
         fi
         # Claim: in flight first, then off the queue. A crash between the two leaves
         # it in both, and recovery sees it still queued. Either write failing stops
         # the drain before anything runs.
+        # It stays queued in both failure cases and runs at a later check-in, so the
+        # report is "deferred", never a terminal "failed" the later run contradicts.
         if ! _write_state "$INFLIGHT_FILE" "$(_inflight_rec "$cid" "$action" 1)"; then
             log "cannot record '${action}' as in flight (${INFLIGHT_FILE} not writable); leaving the queue as it is"
+            write_result "$action" "deferred" "not run yet: the box could not record it as in progress (state directory not writable); it tries again at the next check-in" "$cid" 1
             return 1
         fi
         if ! _queue_set "$Q_REST"; then
             _clear_state "$INFLIGHT_FILE" || true
             log "cannot remove '${action}' from ${REQUEST_FILE}; not running it (it would run again on every check-in)"
-            write_result "$action" "failed" "not run: the box could not remove it from its queue (state directory not writable)" "$cid" 1
+            write_result "$action" "deferred" "not run yet: the box could not remove it from its queue (state directory not writable); it tries again at the next check-in" "$cid" 1
             return 1
         fi
         log "draining host action id=${cid:-?} action=${action}"
@@ -544,6 +599,11 @@ main() {
     fi
 
     local mode="${1:-}"
+    # --- stamp only (netmon-checkin.sh, when it leaves the queue for later) --
+    if [ "$mode" = "--stamp" ]; then
+        _stamp_queue || true
+        return 0
+    fi
     # --- direct single-action invocation ------------------------------------
     if [ "$mode" != "--drain" ] && [ "$mode" != "--drain-leftover" ] && [ -n "$mode" ]; then
         recover_interrupted
@@ -556,7 +616,16 @@ main() {
     if [ ! -s "$REQUEST_FILE" ] && [ ! -s "$INFLIGHT_FILE" ]; then
         return 0
     fi
+    _stamp_queue || log "WARN: could not stamp ${REQUEST_FILE}; undated requests will expire"
     recover_interrupted
+    # An in-flight record still there means its retry is deferred (the record could
+    # not be rewritten). Hold the queue: the box runs requests strictly in order, and
+    # the dashboard relies on that — a newer command settling means every older one
+    # has finished here.
+    if [ -s "$INFLIGHT_FILE" ]; then
+        log "an interrupted action is still pending; leaving the queue for the next check-in"
+        return 0
+    fi
     drain_queue "$mode" || true
     return 0
 }
