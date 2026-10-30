@@ -448,7 +448,13 @@ _queue_head() {
 # box's stuck request stays old and expires) and the drain stamps again right after
 # (dating what this check-in appended). Entries for requests no longer queued or in
 # flight are dropped.
-_stamp_queue() {
+# <backlog>: when the pre-check-in stamp FAILED, netmon-checkin.sh passes how many
+# lines were queued before the check-in appended (NETMON_BACKLOG_LINES). Those
+# lines, if still undated, get stamp 0 — unknown age, so they expire — instead of
+# the fresh append's mtime, which would make a days-old reboot look new.
+_stamp_queue() {  # [backlog-lines]
+    local backlog="${1:-0}" i=0
+    [[ "$backlog" =~ ^[0-9]{1,9}$ ]] || backlog=999999
     local q line cid a seen keep="" m inflight_cid=""
     m="$(stat -c %Y "$REQUEST_FILE" 2>/dev/null)" || m=0
     q="$(_read_state "$REQUEST_FILE")"
@@ -460,9 +466,13 @@ _stamp_queue() {
     done <<< "$seen"
     while IFS= read -r line; do
         line="${line%$'\r'}"
+        [ -n "${line//[[:space:]]/}" ] || continue
+        i=$(( i + 1 ))
         IFS=$'\t' read -r cid a _ <<< "$line"
         [[ "${cid:-}" =~ ^[0-9]{1,18}$ ]] || continue
-        [ -n "${stamp[$cid]:-}" ] || stamp[$cid]="$m"
+        if [ -z "${stamp[$cid]:-}" ]; then
+            if (( i <= 10#$backlog )); then stamp[$cid]=0; else stamp[$cid]="$m"; fi
+        fi
         keep+="${cid}"$'\t'"${stamp[$cid]}"$'\n'
         unset 'stamp[$cid]'
     done <<< "$q"
@@ -646,7 +656,7 @@ main() {
     if [ "$mode" = "--stamp" ]; then
         # Failing to record leaves new requests undated, and undated ones EXPIRE
         # rather than run: safe, and loud in the journal.
-        _stamp_queue || { log "WARN: could not record request times in ${SEEN_FILE}; undated requests will expire"; return 1; }
+        _stamp_queue "${NETMON_BACKLOG_LINES:-0}" || { log "WARN: could not record request times in ${SEEN_FILE}; undated requests will expire"; return 1; }
         return 0
     fi
     # --- direct single-action invocation ------------------------------------
@@ -661,7 +671,7 @@ main() {
     if [ ! -s "$REQUEST_FILE" ] && [ ! -s "$INFLIGHT_FILE" ]; then
         return 0
     fi
-    _stamp_queue || log "WARN: could not record request times in ${SEEN_FILE}; undated requests will expire"
+    _stamp_queue "${NETMON_BACKLOG_LINES:-0}" || log "WARN: could not record request times in ${SEEN_FILE}; undated requests will expire"
     recover_interrupted
     # An in-flight record still there means its retry is deferred (the record could
     # not be rewritten). Hold the queue: requests run strictly in order, so a newer
@@ -671,7 +681,7 @@ main() {
         return 0
     fi
     drain_queue "$mode" || true
-    _stamp_queue || true   # drop the ages of what was just claimed
+    _stamp_queue 0 || true   # drop the ages of what was just claimed
     return 0
 }
 

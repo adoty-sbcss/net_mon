@@ -627,16 +627,14 @@ def test_checkin_stamps_before_the_checkin_and_serialises_itself() -> None:
     text = CHECKIN_SH.read_text(encoding="utf-8")
     assert 'CHECKIN_LOCK="${NETMON_LOCK_DIR:-/run/lock}/netmon-checkin.lock"' in text
     lock = text.index('exec 8<"$CHECKIN_LOCK"')
-    # Fails OPEN: a lock it cannot open must not stop the check-in.
-    branch = text[lock: text.index("export NETMON_CHECKIN_LOCKED=1")]
-    unopenable = branch[branch.index("else"):]
-    assert "exit" not in unopenable and "checking in without it" in unopenable
     assert text.index("export NETMON_CHECKIN_LOCKED=1") < text.index("exec -T collector python -m collector checkin")
-    stamp = text.index('host-action.sh" --stamp 8>&- >/dev/null 2>&1\n\nout=')
+    assert lock < text.index("exec -T collector python -m collector checkin")
+    stamp = text.index("if ! host_action --stamp")
     checkin = text.index("exec -T collector python -m collector checkin")
     assert lock < stamp < checkin
-    # every host-action call drops the check-in lock fd
-    for call in ("--drain 8>&-", "--drain-leftover 8>&-"):
+    # every host-action call goes through host_action, which drops the lock fd
+    assert '"$REPO_DIR/scripts/host-action.sh" "$@" 8>&-' in text
+    for call in ("host_action --drain ", "host_action --drain-leftover "):
         assert call in text
 
 
@@ -743,3 +741,58 @@ def test_the_lock_file_is_created_world_readable_and_reused(st: Path) -> None:
     assert len(inodes) == 2 and inodes[0] == inodes[1]     # never replaced
     if sys.platform != "win32":
         assert st_mod.S_IMODE(lock.stat().st_mode) == 0o666
+
+
+
+# --- review round 5 (Codex pass 5) ------------------------------------------------
+
+
+def _checkin_lock_block() -> str:
+    text = CHECKIN_SH.read_text(encoding="utf-8")
+    start = text.index("if command -v flock >/dev/null 2>&1; then\n    # Self-heal")
+    return text[start: text.index("\nfi\n", start) + 4]
+
+
+def test_an_unopenable_checkin_lock_checks_in_but_runs_no_host_action() -> None:
+    block = _checkin_lock_block()
+    assert 'sudo -n chmod 0666 "$CHECKIN_LOCK"' in block          # self-heal first
+    ok, bad = block.split("    else\n", 1)
+    assert "export NETMON_CHECKIN_LOCKED=1" in ok                 # only when actually held
+    assert "NETMON_CHECKIN_LOCKED" not in bad
+    assert 'HOST_ACTIONS_OK=""' in bad and "exit" not in bad      # heartbeat goes on
+
+
+def test_every_host_action_call_goes_through_the_gate() -> None:
+    text = CHECKIN_SH.read_text(encoding="utf-8")
+    calls = [ln for ln in text.splitlines() if '"$REPO_DIR/scripts/host-action.sh" ' in ln and "-x" not in ln]
+    assert calls == ['    "$REPO_DIR/scripts/host-action.sh" "$@" 8>&-']
+    gate = text[text.index("host_action() {"):]
+    gate = gate[: gate.index("\n}\n")]
+    assert '[ -n "$HOST_ACTIONS_OK" ] || return 3' in gate
+
+
+def test_checkin_marks_the_backlog_when_the_pre_stamp_fails() -> None:
+    text = CHECKIN_SH.read_text(encoding="utf-8")
+    pre = text[text.index("if ! host_action --stamp"):]
+    pre = pre[: pre.index("\nfi\n")]
+    assert 'export NETMON_BACKLOG_LINES="$backlog"' in pre
+    assert "backlog=999999" in pre                                # unreadable: all old
+    assert text.index("if ! host_action --stamp") < text.index("exec -T collector python -m collector checkin")
+
+
+def test_an_undated_backlog_expires_instead_of_taking_the_fresh_mtime(st: Path) -> None:
+    """The pre-check-in stamp failed; the check-in then appended. The old line must not
+    be dated by that append."""
+    _w(st / "host-action-request", "1\thost-reboot\n2\thost-apply-vlan\n")   # mtime: now
+    _run(st, "export NETMON_BACKLOG_LINES=1\nmain --drain\n")
+    assert _calls(st) == ["host-apply-vlan"]
+    assert [(h["commandId"], h["status"]) for h in _history(st)] == [(1, "expired"), (2, "ok")]
+
+
+def test_a_backlog_line_with_a_recorded_stamp_keeps_it(st: Path) -> None:
+    import time
+
+    _w(st / "host-action-request", "1\thost-reboot\n")
+    _w(st / "host-action-seen", f"1\t{int(time.time()) - 60}\n")
+    _run(st, "export NETMON_BACKLOG_LINES=1\nmain --drain\n")
+    assert _calls(st) == ["host-reboot"]

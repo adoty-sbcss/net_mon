@@ -67,21 +67,29 @@ ensure_env_readable
 # successful check-in, not only on the next exit 12 — which may never come.
 HOST_ACTION_REQUEST="/var/lib/netmon/host-action-request"
 HOST_ACTION_INFLIGHT="/var/lib/netmon/host-action-inflight"
+# Every host-action.sh call goes through here: none at all in a cycle that could not
+# take the lock (see below), and never with the lock's fd 8 (a long-lived child of
+# the drain must not hold the check-in lock after we exit).
+HOST_ACTIONS_OK=1
+host_action() {
+    [ -n "$HOST_ACTIONS_OK" ] || return 3
+    [ -x "$REPO_DIR/scripts/host-action.sh" ] || return 4
+    "$REPO_DIR/scripts/host-action.sh" "$@" 8>&-
+}
 drain_leftover_host_actions() {
     [ -s "$HOST_ACTION_REQUEST" ] || [ -s "$HOST_ACTION_INFLIGHT" ] || return 0
+    [ -n "$HOST_ACTIONS_OK" ] || return 0
     # An update (exit 11) may still be pulling / rebuilding / health-checking; a
     # reboot or rebuild queued alongside it waits for the next check-in.
     if systemctl is-active --quiet netmon-update.service 2>/dev/null; then
         log "leftover host action found; waiting — an update is in progress"
         # Date what was queued now, so its age is its own when it is finally drained.
-        [ -x "$REPO_DIR/scripts/host-action.sh" ] && "$REPO_DIR/scripts/host-action.sh" --stamp 8>&- >/dev/null 2>&1
+        host_action --stamp >/dev/null 2>&1
         return 0
     fi
-    if [ -x "$REPO_DIR/scripts/host-action.sh" ]; then
-        log "leftover host action found; draining"
-        "$REPO_DIR/scripts/host-action.sh" --drain-leftover 8>&- 2>&1 \
-            | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done || true
-    fi
+    log "leftover host action found; draining"
+    host_action --drain-leftover 2>&1 \
+        | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done || true
 }
 
 if ! "${DC[@]}" ps --status running 2>/dev/null | grep -q netmon-collector; then
@@ -99,23 +107,41 @@ fi
 # every check-in did before this lock existed. Children that could outlive us (the
 # host-action drain) get 8>&-.
 CHECKIN_LOCK="${NETMON_LOCK_DIR:-/run/lock}/netmon-checkin.lock"
-if command -v flock >/dev/null 2>&1; then
+open_checkin_lock() {
     [ -e "$CHECKIN_LOCK" ] || ( umask 000; : >> "$CHECKIN_LOCK" ) 2>/dev/null
-    if { exec 8<"$CHECKIN_LOCK"; } 2>/dev/null; then
+    { exec 8<"$CHECKIN_LOCK"; } 2>/dev/null
+}
+if command -v flock >/dev/null 2>&1; then
+    # Self-heal an unreadable lock (someone made it 0600 as root) the way
+    # ensure_env_readable heals the env file: the service user has NOPASSWD sudo.
+    if open_checkin_lock || { sudo -n chmod 0666 "$CHECKIN_LOCK" 2>/dev/null && open_checkin_lock; }; then
         if ! flock -w 600 8; then
             log "another check-in or host action is still running after 10 minutes; skipping"
             exit 0
         fi
+        # host-action.sh runs inside this lock: it must not try to take it again.
+        export NETMON_CHECKIN_LOCKED=1
     else
-        log "WARN: cannot open ${CHECKIN_LOCK}; checking in without it"
+        # Check in anyway (the heartbeat matters most) but run NO host action this
+        # cycle: unlocked, a drain could take a live action for an interrupted one.
+        # They stay queued for a cycle that gets the lock.
+        log "WARN: cannot open ${CHECKIN_LOCK}; checking in, but running no host actions this cycle"
+        HOST_ACTIONS_OK=""
     fi
 fi
-# host-action.sh runs inside this check-in's lock (or its absence): don't re-take it.
-export NETMON_CHECKIN_LOCKED=1
 
 # Date whatever is already queued BEFORE this check-in can append, so a request
-# left from an earlier cycle (or an old box's stuck one) keeps its own age.
-[ -x "$REPO_DIR/scripts/host-action.sh" ] && "$REPO_DIR/scripts/host-action.sh" --stamp 8>&- >/dev/null 2>&1
+# left from an earlier cycle (or an old box's stuck one) keeps its own age. If that
+# fails, tell the drain how many lines were already there: undated, they are
+# treated as old (they expire), never dated by this check-in's append.
+if [ -n "$HOST_ACTIONS_OK" ] && [ -s "$HOST_ACTION_REQUEST" ]; then
+    if ! host_action --stamp >/dev/null 2>&1; then
+        backlog="$(grep -c '[^[:space:]]' "$HOST_ACTION_REQUEST" 2>/dev/null)"
+        [[ "$backlog" =~ ^[0-9]+$ ]] || backlog=999999
+        export NETMON_BACKLOG_LINES="$backlog"
+        log "WARN: could not date the ${backlog} queued host action(s); they are treated as old and expire"
+    fi
+fi
 
 out="$("${DC[@]}" exec -T collector python -m collector checkin 2>&1)"
 rc=$?
@@ -181,8 +207,10 @@ elif [ "$rc" = "12" ]; then
         log "collector recreate FAILED"
         mark_config_pending || true
     fi
-    if [ -x "$REPO_DIR/scripts/host-action.sh" ]; then
-        "$REPO_DIR/scripts/host-action.sh" --drain 8>&- 2>&1 \
+    if [ -z "$HOST_ACTIONS_OK" ]; then
+        log "host action not run this cycle (no lock); it stays queued"
+    elif [ -x "$REPO_DIR/scripts/host-action.sh" ]; then
+        host_action --drain 2>&1 \
             | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done || true
     else
         log "scripts/host-action.sh missing; cannot run host action"
