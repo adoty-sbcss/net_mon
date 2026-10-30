@@ -61,6 +61,21 @@ else
 fi
 ensure_env_readable
 
+# Host actions left over from an earlier cycle: a request the box never drained
+# (it rebooted between the check-in that queued it and the drain), or an action a
+# reboot or kill cut short (host-action.sh's in-flight record). Picked up on any
+# successful check-in, not only on the next exit 12 — which may never come.
+HOST_ACTION_REQUEST="/var/lib/netmon/host-action-request"
+HOST_ACTION_INFLIGHT="/var/lib/netmon/host-action-inflight"
+drain_leftover_host_actions() {
+    [ -s "$HOST_ACTION_REQUEST" ] || [ -s "$HOST_ACTION_INFLIGHT" ] || return 0
+    if [ -x "$REPO_DIR/scripts/host-action.sh" ]; then
+        log "leftover host action found; draining"
+        "$REPO_DIR/scripts/host-action.sh" --drain-leftover 2>&1 \
+            | while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done || true
+    fi
+}
+
 if ! "${DC[@]}" ps --status running 2>/dev/null | grep -q netmon-collector; then
     log "collector not running; skipping check-in"
     exit 0
@@ -84,6 +99,7 @@ if [ "$rc" = "10" ]; then
         mark_config_pending || true
         exit 1
     fi
+    drain_leftover_host_actions
     exit 0
 elif [ "$rc" = "11" ]; then
     # Dashboard queued an "update". 11 implies the config-recreate of 10, so
@@ -138,6 +154,7 @@ elif [ "$rc" = "12" ]; then
     exit 0
 elif [ "$rc" = "0" ]; then
     log "check-in ok"
+    drain_leftover_host_actions
     exit 0
 else
     log "check-in failed (rc=$rc)"

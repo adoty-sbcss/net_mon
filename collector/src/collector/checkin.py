@@ -829,7 +829,9 @@ def _collect_logs(lines: int = 250) -> tuple[str, dict]:
     # auto-update.log is written by the host's scripts/auto-update.sh into the
     # /var/log/netmon bind mount, so include it here — it's the ONLY way to see
     # why a remote update failed without SSH (the rest goes to host syslog).
-    for fname in ("collector.log", "audit.log", "auto-update.log"):
+    # host-action.log is the same for host actions (scripts/host-action.sh): the
+    # output of a VLAN apply, Wi-Fi join, … that the dashboard can't otherwise see.
+    for fname in ("collector.log", "audit.log", "auto-update.log", "host-action.log"):
         p = LOG_DIR / fname
         try:
             tail = p.read_text(errors="replace").splitlines()[-lines:]
@@ -2556,7 +2558,13 @@ def _last_host_action() -> dict | None:
     try:
         raw = Path("/var/lib/netmon/host-action-result").read_text().strip()
         data = json.loads(raw) if raw else None
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return None
+        # The reason now carries the action's own output lines (why it failed);
+        # scrub it like every other log text that leaves the box.
+        if isinstance(data.get("reason"), str):
+            data["reason"] = _redact_secrets(data["reason"])[:1000]
+        return data
     except Exception:
         return None
 
