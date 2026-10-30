@@ -89,18 +89,29 @@ if ! "${DC[@]}" ps --status running 2>/dev/null | grep -q netmon-collector; then
     exit 0
 fi
 
-# One check-in at a time. The timer's oneshot already serialises itself, but a
-# manual run beside it would let two check-ins append host actions in interleaved
-# order while a drain rewrites the queue. /run/lock: world-writable, cleared at boot,
-# and the file is opened with >> so it is never replaced. Children of the long-lived
-# kind (the host-action drain) get 8>&- so they cannot hold it after we exit.
+# One check-in (or host action) at a time. The timer's oneshot already serialises
+# itself, but a manual check-in or host-action.sh run beside it would let the queue
+# be appended to while a drain rewrites it. The same lock host-action.sh takes
+# when an operator runs it (see its _take_lock: created 0666, opened read-only,
+# never replaced). FAILS OPEN: the check-in is the box's only line to the dashboard,
+# so a lock that cannot be opened must never stop it (a root-made lock the service
+# user can't open would otherwise silence the box for good) — it runs unlocked, as
+# every check-in did before this lock existed. Children that could outlive us (the
+# host-action drain) get 8>&-.
+CHECKIN_LOCK="${NETMON_LOCK_DIR:-/run/lock}/netmon-checkin.lock"
 if command -v flock >/dev/null 2>&1; then
-    if ! { exec 8>>"${NETMON_LOCK_DIR:-/run/lock}/netmon-checkin.lock"; } 2>/dev/null \
-        || ! flock -w 600 8; then
-        log "another check-in is running (or its lock is unavailable); skipping"
-        exit 0
+    [ -e "$CHECKIN_LOCK" ] || ( umask 000; : >> "$CHECKIN_LOCK" ) 2>/dev/null
+    if { exec 8<"$CHECKIN_LOCK"; } 2>/dev/null; then
+        if ! flock -w 600 8; then
+            log "another check-in or host action is still running after 10 minutes; skipping"
+            exit 0
+        fi
+    else
+        log "WARN: cannot open ${CHECKIN_LOCK}; checking in without it"
     fi
 fi
+# host-action.sh runs inside this check-in's lock (or its absence): don't re-take it.
+export NETMON_CHECKIN_LOCKED=1
 
 # Date whatever is already queued BEFORE this check-in can append, so a request
 # left from an earlier cycle (or an old box's stuck one) keeps its own age.

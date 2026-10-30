@@ -46,10 +46,13 @@ INFLIGHT_FILE="$STATE_DIR/host-action-inflight"
 # what an older host-action.sh (after a rollback) can read, and this file has no
 # writer but this script, under its lock.
 SEEN_FILE="$STATE_DIR/host-action-seen"
-# Outside the checkout on purpose: git pull REPLACES this script's file, so a lock
-# on the script's own inode would not exclude a run started after the pull. Opened
-# with >> (created if missing, never replaced): two starters must share one inode.
-LOCK_FILE="${NETMON_LOCK_DIR:-/run/lock}/netmon-host-action.lock"
+# ONE lock for the check-in and every host action: the check-in appends to the
+# queue and a drain rewrites it, so they must exclude each other, not just drains
+# each other. netmon-checkin.sh holds it for its whole run (check-in, then drain)
+# and says so with NETMON_CHECKIN_LOCKED=1; a host-action.sh run outside a check-in
+# (an operator's) takes it itself. Outside the checkout on purpose (git pull
+# REPLACES this script's file). See _take_lock for how it is opened.
+LOCK_FILE="${NETMON_LOCK_DIR:-/run/lock}/netmon-checkin.lock"
 LOG_TAG="netmon-host-action"
 # Runs per request: the first plus one automatic retry after an interruption.
 MAX_ATTEMPTS=2
@@ -609,13 +612,21 @@ drain_queue() {  # mode
     return 0
 }
 
-# One run at a time, so a drain never mistakes a live action (a manual run, say)
-# for an interrupted one. Fails closed: no lock, no run. Returns 2 when the lock
-# cannot be opened at all, 1 when another run holds it.
+# One run at a time, so a drain never mistakes a live action for an interrupted one
+# and never rewrites the queue while a check-in appends to it. Created once with
+# mode 0666 and opened READ-ONLY (flock works on any fd): an existing file is never
+# opened with O_CREAT, so it does not matter whether root or the service user made
+# it (a root-owned 0644 lock opened >> by the service user fails, and
+# fs.protected_regular refuses O_CREAT on another user's file in /run/lock), and it
+# is never replaced, so two starters always lock the same inode. A run outside a
+# check-in fails closed: returns 2 when the lock cannot be opened, 1 when a check-in
+# or another action still holds it after 10 minutes.
 _take_lock() {
+    [ "${NETMON_CHECKIN_LOCKED:-}" = 1 ] && return 0
     command -v flock >/dev/null 2>&1 || return 0
-    { exec 9>>"$LOCK_FILE"; } 2>/dev/null || return 2
-    flock -n 9 || return 1
+    [ -e "$LOCK_FILE" ] || ( umask 000; : >> "$LOCK_FILE" ) 2>/dev/null
+    { exec 9<"$LOCK_FILE"; } 2>/dev/null || return 2
+    flock -w 600 9 || return 1
 }
 
 main() {
@@ -625,7 +636,7 @@ main() {
         log "cannot open ${LOCK_FILE}; not running host actions (the queue stays for the next check-in)"
         return 1
     elif (( lk != 0 )); then
-        log "another host action is running; leaving the queue for the next check-in"
+        log "a check-in or another host action is still running; leaving the queue for the next check-in"
         return 0
     fi
 
@@ -633,7 +644,9 @@ main() {
     # --- stamp only (netmon-checkin.sh: before each check-in, and when it ---
     # leaves the queue for later) ------------------------------------------------
     if [ "$mode" = "--stamp" ]; then
-        _stamp_queue || true
+        # Failing to record leaves new requests undated, and undated ones EXPIRE
+        # rather than run: safe, and loud in the journal.
+        _stamp_queue || { log "WARN: could not record request times in ${SEEN_FILE}; undated requests will expire"; return 1; }
         return 0
     fi
     # --- direct single-action invocation ------------------------------------

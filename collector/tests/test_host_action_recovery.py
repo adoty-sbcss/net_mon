@@ -495,16 +495,19 @@ def test_leftover_age_limits_depend_on_the_action(st: Path, action: str, minutes
         assert (_result(st)["status"], _result(st)["commandId"]) == ("expired", 9)
 
 
-def test_the_run_lock_is_never_replaced_and_fails_closed() -> None:
-    """git pull replaces the script file, and an atomic rename would replace a lock
-    file too: either way two starters lock different inodes. Open with >> only."""
+def test_the_run_lock_is_shared_never_replaced_and_fails_closed() -> None:
+    """One lock with the check-in. Never replaced (git pull replaces the script; an
+    atomic rename would replace a lock file), opened read-only so neither a root-made
+    0644 file nor fs.protected_regular can lock the service user out."""
     text = HOST_ACTION.read_text(encoding="utf-8")
     take = text[text.index("_take_lock() {"):]
     take = take[: take.index("\n}\n")]
-    assert 'exec 9>>"$LOCK_FILE"' in take
+    assert 'exec 9<"$LOCK_FILE"' in take and "exec 9>" not in take
+    assert "umask 000" in take
+    assert '[ "${NETMON_CHECKIN_LOCKED:-}" = 1 ] && return 0' in take
     assert "BASH_SOURCE" not in take and "_write_state" not in take
     assert "return 2" in take                              # can't open: fail closed
-    assert 'LOCK_FILE="${NETMON_LOCK_DIR:-/run/lock}/netmon-host-action.lock"' in text
+    assert 'LOCK_FILE="${NETMON_LOCK_DIR:-/run/lock}/netmon-checkin.lock"' in text
 
 
 def test_an_unopenable_lock_runs_nothing(st: Path) -> None:
@@ -622,7 +625,13 @@ def test_a_retry_that_cannot_be_recorded_is_deferred_not_failed(st: Path) -> Non
 
 def test_checkin_stamps_before_the_checkin_and_serialises_itself() -> None:
     text = CHECKIN_SH.read_text(encoding="utf-8")
-    lock = text.index('exec 8>>"${NETMON_LOCK_DIR:-/run/lock}/netmon-checkin.lock"')
+    assert 'CHECKIN_LOCK="${NETMON_LOCK_DIR:-/run/lock}/netmon-checkin.lock"' in text
+    lock = text.index('exec 8<"$CHECKIN_LOCK"')
+    # Fails OPEN: a lock it cannot open must not stop the check-in.
+    branch = text[lock: text.index("export NETMON_CHECKIN_LOCKED=1")]
+    unopenable = branch[branch.index("else"):]
+    assert "exit" not in unopenable and "checking in without it" in unopenable
+    assert text.index("export NETMON_CHECKIN_LOCKED=1") < text.index("exec -T collector python -m collector checkin")
     stamp = text.index('host-action.sh" --stamp 8>&- >/dev/null 2>&1\n\nout=')
     checkin = text.index("exec -T collector python -m collector checkin")
     assert lock < stamp < checkin
@@ -696,6 +705,41 @@ def test_seen_keeps_the_in_flight_request(st: Path) -> None:
     _w(st / "host-action-request", "1\thost-restart\n2\thost-apply-vlan\n")
     (st / "die-host-restart").touch()
     _run(st, "main --drain\n")
+    _run(st, "main --stamp\n")                              # the pruning pass, after the kill
     seen = (st / "host-action-seen").read_text()
     assert seen.startswith("1\t") or "\n1\t" in seen       # in flight: kept
     assert "2\t" in seen                                      # still queued: kept
+
+
+
+# --- review round 4 (Codex pass 4): one lock --------------------------------------
+
+
+def test_inside_a_checkin_the_lock_is_not_taken_again(st: Path) -> None:
+    """netmon-checkin.sh holds it; re-taking it from the drain would deadlock."""
+    _w(st / "host-action-request", "1\thost-apply-vlan\n")
+    body = "flock() { echo FLOCK >> \"$ST/attempts\"; return 1; }\nexport NETMON_CHECKIN_LOCKED=1\nmain --drain\n"
+    _run(st, body)
+    assert _calls(st) == ["host-apply-vlan"]
+    assert not (st / "attempts").exists()
+
+
+def test_outside_a_checkin_a_held_lock_leaves_the_queue(st: Path) -> None:
+    _w(st / "host-action-request", "1\thost-reboot\n")
+    proc = _run(st, "flock() { return 1; }\nmain --drain\n")
+    assert _calls(st) == []
+    assert (st / "host-action-request").read_text() == "1\thost-reboot\n"
+    assert "still running" in proc.stdout
+
+
+def test_the_lock_file_is_created_world_readable_and_reused(st: Path) -> None:
+    import stat as st_mod
+
+    body = "flock() { return 0; }\nmain --stamp\nls -i \"$LOCK_FILE\"\nmain --stamp\nls -i \"$LOCK_FILE\"\n"
+    proc = _run(st, body)
+    lock = st / "netmon-checkin.lock"
+    assert lock.exists()
+    inodes = [ln.split()[0] for ln in proc.stdout.splitlines() if ln.strip().endswith("netmon-checkin.lock")]
+    assert len(inodes) == 2 and inodes[0] == inodes[1]     # never replaced
+    if sys.platform != "win32":
+        assert st_mod.S_IMODE(lock.stat().st_mode) == 0o666
