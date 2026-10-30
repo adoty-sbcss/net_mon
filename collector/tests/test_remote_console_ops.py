@@ -50,6 +50,16 @@ def _clean_inflight():
     """_ops_inflight is module state; never let one test leak into the next."""
     rc._ops_inflight.clear()
     yield
+    # Let this test's released workers finish BEFORE the next test starts: a worker
+    # still running its `finally` would otherwise discard the NEXT test's claim on
+    # the same cmd_id (the set is module state), letting a second op through — a
+    # flake that read as the in-flight guard failing.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with rc._ops_lock:
+            if not rc._ops_inflight:
+                break
+        time.sleep(0.01)
     rc._ops_inflight.clear()
 
 
