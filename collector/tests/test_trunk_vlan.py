@@ -158,7 +158,19 @@ nmcli() {
             # nmcli validates interface-name: > 15 bytes is refused.
             (( ${#ifn} <= 15 )) || return 2
             echo "$con $ifn $dev $vid $adr" >> "$ST/cons" ;;
+        "--wait "*" con up "*)
+            local c="$5" ifn par vid
+            echo "nmcli --wait $2 con up $c" >> "$ST/calls"
+            read -r _ ifn par vid _ < <(awk -v c="$c" '$1==c' "$ST/cons") || return 10
+            _add_vlan_link "$ifn" "$vid" "$par" || return 4 ;;
         "con up "*)
+            # Real nmcli: --wait is a GLOBAL option; after the connection name it is
+            # refused at once ("invalid extra argument") and nothing is activated.
+            # The old stub accepted it, which is how that bug passed every test.
+            if [[ " $* " == *" --wait "* ]]; then
+                echo "Error: invalid extra argument '--wait'." >&2
+                return 2
+            fi
             local c="$3" ifn par vid
             read -r _ ifn par vid _ < <(awk -v c="$c" '$1==c' "$ST/cons") || return 10
             _add_vlan_link "$ifn" "$vid" "$par" || return 4 ;;
@@ -695,3 +707,45 @@ def test_remove_without_nmcli_or_keyfiles_is_clean(tmp_path) -> None:
     out, st = _run(tmp_path, 'command() { [[ "$1" == "-v" && "$2" == "nmcli" ]] && return 1; builtin command "$@"; }; remove_vlan_interfaces_headless; echo "RC=$?"',
                    backend="networkd")
     assert "RC=0" in out, out
+
+
+
+# --- nmcli --wait must precede the subcommand (SBCUSD, 2026-10-30) ---------------
+
+
+def test_nmcli_activation_uses_the_global_wait_option() -> None:
+    """`nmcli con up X --wait 10` is refused at once by real nmcli; every apply then
+    reported every VLAN "not up" before NetworkManager had done anything."""
+    text = TRUNK.read_text(encoding="utf-8")
+    assert 'nmcli --wait 10 con up "$conname"' in text
+    assert 'con up "$conname" --wait' not in text
+
+
+def test_the_nmcli_stub_refuses_a_trailing_wait_like_real_nmcli(tmp_path) -> None:
+    out, state = _run(tmp_path, 'nmcli con up netmon-vlan10 --wait 10; echo "rc=$?"', backend="nm")
+    assert "rc=2" in out
+
+
+def test_an_nmcli_create_failure_is_quoted_not_hidden(tmp_path) -> None:
+    """nmcli's own error reaches the log as a warning (host-action.sh quotes those)."""
+    body = (
+        'nmcli() { case "$*" in "con add"*) echo "Error: boom" >&2; return 4;; *) return 10;; esac; }\n'
+        '_nmcli_remove_vlan_con() { return 0; }\n'
+        "_nmcli_add_vlan eth0 10"
+    )
+    out, _ = _run(tmp_path, body, backend="nm")
+    assert "could not create netmon-vlan10: Error: boom" in out
+    # the stub answers con up with 10 (no such connection): a refusal, quoted
+    assert "activation failed (nmcli exit 10)" in out
+
+
+@pytest.mark.parametrize(("rc", "warned"), [(3, False), (4, True)])
+def test_a_slow_dhcp_is_logged_but_a_refusal_is_warned(tmp_path, rc, warned) -> None:
+    body = (
+        f'nmcli() {{ case "$*" in "--wait "*) echo "Error: x" >&2; return {rc};; *) return 0;; esac; }}\n'
+        '_nmcli_remove_vlan_con() { return 0; }\n'
+        "_nmcli_add_vlan eth0 10"
+    )
+    out, _ = _run(tmp_path, body, backend="nm")
+    assert ("WARN nmcli VLAN 10: activation failed" in out) is warned
+    assert ("not active within 10 s" in out) is (not warned)

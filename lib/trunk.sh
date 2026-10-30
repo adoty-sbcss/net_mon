@@ -317,6 +317,11 @@ _nmcli_remove_vlan_con() {
     return 0
 }
 
+# nmcli output on one bounded line, for a log/warn message.
+_nmcli_oneline() {
+    printf '%s' "${1:-}" | tr '\n\t\r' '   ' | cut -c1-240
+}
+
 # (Re)create one NetMon VLAN connection `netmon-vlan<vid>` on <parent>.
 _nmcli_add_vlan() {
     local parent="$1" vid="$2" cidr="${3:-}"
@@ -325,22 +330,41 @@ _nmcli_add_vlan() {
     # Recreate idempotently: drop any same-name connection AND its old link (an
     # older name or another parent would otherwise hold this VLAN id), then add.
     _nmcli_remove_vlan_con "$conname" || return 1
+    # nmcli's own words are kept (not sent to /dev/null): they are the only record of
+    # WHY a VLAN did not come up, and host-action.sh quotes "!!" lines to the dashboard.
+    local out
     if [[ -n "$cidr" ]]; then
-        $SUDO nmcli con add type vlan con-name "$conname" ifname "$ifname" \
+        out="$($SUDO nmcli con add type vlan con-name "$conname" ifname "$ifname" \
             dev "$parent" id "$vid" ipv4.method manual ipv4.addresses "$cidr" \
             ipv4.never-default yes ipv4.ignore-auto-routes yes ipv6.method ignore \
-            connection.autoconnect yes >/dev/null 2>&1 || true
+            connection.autoconnect yes 2>&1)" \
+            || warn "nmcli VLAN ${vid}: could not create ${conname}: $(_nmcli_oneline "$out")"
     else
         # may-fail:yes so the sub-interface comes up immediately and DHCP runs in
         # the BACKGROUND — a VLAN with no DHCP server must not block the apply
         # (it just gets no lease, surfaced as "no data" on the dashboard).
-        $SUDO nmcli con add type vlan con-name "$conname" ifname "$ifname" \
+        out="$($SUDO nmcli con add type vlan con-name "$conname" ifname "$ifname" \
             dev "$parent" id "$vid" ipv4.method auto ipv4.may-fail yes \
             ipv4.never-default yes ipv4.ignore-auto-routes yes ipv6.method ignore \
-            connection.autoconnect yes >/dev/null 2>&1 || true
+            connection.autoconnect yes 2>&1)" \
+            || warn "nmcli VLAN ${vid}: could not create ${conname}: $(_nmcli_oneline "$out")"
     fi
-    # --wait caps activation so even a DHCP-less VLAN returns promptly.
-    $SUDO nmcli con up "$conname" --wait 10 >/dev/null 2>&1 || true
+    # --wait is a GLOBAL option and must PRECEDE the subcommand (as lib/wifi.sh
+    # learned). Written after the name — `nmcli con up X --wait 10`, as this was
+    # until 2026-10-30 — nmcli refuses it ("invalid extra argument") and returns at
+    # once, so the readiness check below ran before NetworkManager had brought
+    # anything up and every apply reported every VLAN "not up" (the activations
+    # still happened later, through autoconnect). It caps the wait per VLAN; a VLAN
+    # whose DHCP takes longer keeps activating in the background.
+    local rc=0
+    out="$($SUDO nmcli --wait 10 con up "$conname" 2>&1)" || rc=$?
+    if (( rc == 3 )); then
+        # nmcli's "Timeout expired": still activating (usually waiting on DHCP).
+        log "nmcli VLAN ${vid}: not active within 10 s (DHCP may still be running)"
+    elif (( rc != 0 )); then
+        # A refusal (4 = activation failed, 10 = no such connection, …): say why.
+        warn "nmcli VLAN ${vid}: activation failed (nmcli exit ${rc}): $(_nmcli_oneline "$out")"
+    fi
     log "nmcli VLAN ${vid} on ${parent} as ${ifname} (${cidr:-dhcp}, routes off)"
 }
 
