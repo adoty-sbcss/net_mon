@@ -710,7 +710,7 @@ def test_remove_without_nmcli_or_keyfiles_is_clean(tmp_path) -> None:
 
 
 
-# --- nmcli --wait must precede the subcommand (SBCUSD, 2026-10-30) ---------------
+# --- nmcli --wait must precede the subcommand (field box, 2026-10-30) ------------
 
 
 def test_nmcli_activation_uses_the_global_wait_option() -> None:
@@ -722,8 +722,19 @@ def test_nmcli_activation_uses_the_global_wait_option() -> None:
 
 
 def test_the_nmcli_stub_refuses_a_trailing_wait_like_real_nmcli(tmp_path) -> None:
-    out, state = _run(tmp_path, 'nmcli con up netmon-vlan10 --wait 10; echo "rc=$?"', backend="nm")
-    assert "rc=2" in out
+    """For an EXISTING profile (real nmcli looks the name up first: an unknown one is
+    exit 10), a trailing --wait is exit 2 and nothing activates; the global form
+    activates that same profile."""
+    body = (
+        'nmcli con up netmon-vlan10 --wait 10; echo "trailing=$?"\n'
+        'grep -q "^eth0.10 " "$ST/links" && echo "link-after-trailing"\n'
+        'nmcli --wait 10 con up netmon-vlan10; echo "global=$?"\n'
+    )
+    out, state = _run(tmp_path, body, backend="nm", cons="netmon-vlan10 eth0.10 eth0 10 -\n")
+    assert "trailing=2" in out
+    assert "link-after-trailing" not in out
+    assert "global=0" in out
+    assert "eth0.10 vlan 10 eth0" in state["links"]
 
 
 def test_an_nmcli_create_failure_is_quoted_not_hidden(tmp_path) -> None:
@@ -748,4 +759,5 @@ def test_a_slow_dhcp_is_logged_but_a_refusal_is_warned(tmp_path, rc, warned) -> 
     )
     out, _ = _run(tmp_path, body, backend="nm")
     assert ("WARN nmcli VLAN 10: activation failed" in out) is warned
-    assert ("not active within 10 s" in out) is (not warned)
+    assert ("not active within 10 s (no DHCP lease yet)" in out) is (not warned)
+    assert " active (" not in out                          # never reads as a success
