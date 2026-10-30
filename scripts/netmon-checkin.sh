@@ -147,6 +147,13 @@ out="$("${DC[@]}" exec -T collector python -m collector checkin 2>&1)"
 rc=$?
 while IFS= read -r ln; do [ -n "$ln" ] && log "  $ln"; done <<< "$out"
 
+# Record the times NOW, whatever the exit code: an update (11) or a failed check-in
+# leaves without a drain, and NETMON_BACKLOG_LINES (set above when the pre-check-in
+# stamp failed) dies with this run. Dates what this check-in appended and, with that
+# backlog count, marks the older undated lines as unknown age — durably, before the
+# next check-in can append again.
+[ -s "$HOST_ACTION_REQUEST" ] && host_action --stamp >/dev/null 2>&1
+
 if [ "$rc" = "10" ]; then
     # MUST recreate, not restart: the collector reads its config from the
     # process environment that compose injects from env_file at CREATE time.

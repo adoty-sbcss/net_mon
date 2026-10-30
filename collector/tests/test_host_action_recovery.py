@@ -796,3 +796,13 @@ def test_a_backlog_line_with_a_recorded_stamp_keeps_it(st: Path) -> None:
     _w(st / "host-action-seen", f"1\t{int(time.time()) - 60}\n")
     _run(st, "export NETMON_BACKLOG_LINES=1\nmain --drain\n")
     assert _calls(st) == ["host-reboot"]
+
+
+
+def test_checkin_stamps_right_after_the_checkin_on_every_exit_code() -> None:
+    """Exit 11 (update) and a failed check-in leave without a drain; the backlog
+    marker is only an environment variable, so the ages must be recorded here."""
+    text = CHECKIN_SH.read_text(encoding="utf-8")
+    after = text.index("rc=$?")
+    post = text.index('[ -s "$HOST_ACTION_REQUEST" ] && host_action --stamp', after)
+    assert post < text.index('if [ "$rc" = "10" ]')
