@@ -817,8 +817,18 @@ def test_a_parent_saved_by_name_keeps_the_nmcli_profile(tmp_path) -> None:
     ("load-to-netplan", "its parent still reads as '42b34496"),
 ])
 def test_a_keyfile_that_does_not_hold_is_warned(tmp_path, flag, said) -> None:
+    """Neither the keyfile nor a loaded profile is left behind, and the stale VLAN
+    (20, no longer wanted) is NOT removed: a failed replacement stops the
+    reconcile instead of half-applying."""
     out, st = _run(tmp_path, '_apply_vlan_nmcli eth0 "10"; echo "RC=$?"', backend="nm",
-                   flags=("netplan-parent-uuid", flag))
+                   flags=("netplan-parent-uuid", flag),
+                   cons="netmon-vlan20 eth0.20 eth0 20 -\n", links="eth0.20 vlan 20 eth0\n")
     assert "RC=1" in out
     assert "WARN nmcli VLAN 10: " in out and said in out
+    assert "would not keep their parent eth0 by name (see above): 10" in out
     assert ("eth0.10", "10", "eth0") not in _vlan_links(st)
+    assert not list((tmp_path / "st" / "nmconn").iterdir())
+    assert "netmon-vlan10" not in st["cons"]
+    assert "netmon-vlan20 eth0.20 eth0 20" in st["cons"]
+    assert "nmcli con delete netmon-vlan20" not in st["calls"]
+    assert "nmcli --wait 10 con up netmon-vlan10" not in st["calls"]
