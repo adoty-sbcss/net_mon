@@ -157,7 +157,25 @@ nmcli() {
             echo "nmcli con add $con $ifn $dev $vid $adr" >> "$ST/calls"
             # nmcli validates interface-name: > 15 bytes is refused.
             (( ${#ifn} <= 15 )) || return 2
+            # Netplan-integrated NM with a match:-defined parent saves the parent as a
+            # fresh netplan UUID that names no loaded profile (activation then fails).
+            [[ -e "$ST/netplan-parent-uuid" ]] && dev="10d44f21-cc3e-48f8-b877-9ed36a5d6e98"
             echo "$con $ifn $dev $vid $adr" >> "$ST/cons" ;;
+        "-g vlan.parent con show "*)
+            local c="${*: -1}" par
+            read -r _ _ par _ < <(awk -v c="$c" '$1==c' "$ST/cons") || return 10
+            [[ "$par" == "-" ]] || echo "$par" ;;
+        "con load "*)
+            local f="${*: -1}" con ifn par vid adr
+            echo "nmcli con load ${f##*/}" >> "$ST/calls"
+            [[ -e "$ST/load-fails" ]] && { echo "Error: failed to load connection: bad keyfile" >&2; return 1; }
+            con="$(sed -n 's/^id=//p' "$f" | head -1)"
+            ifn="$(sed -n 's/^interface-name=//p' "$f")"
+            par="$(sed -n 's/^parent=//p' "$f")"
+            vid="$(sed -n '/^\[vlan\]/,/^\[/s/^id=//p' "$f")"
+            adr="$(sed -n 's/^address1=//p' "$f")"
+            [[ -e "$ST/load-to-netplan" ]] && par="42b34496-cee5-4a03-b288-0c901a7c1c5a"
+            echo "$con $ifn $par $vid ${adr:--}" >> "$ST/cons" ;;
         "--wait "*" con up "*)
             local c="$5" ifn par vid
             echo "nmcli --wait $2 con up $c" >> "$ST/calls"
@@ -761,3 +779,56 @@ def test_a_slow_dhcp_is_logged_but_a_refusal_is_warned(tmp_path, rc, warned) -> 
     assert ("WARN nmcli VLAN 10: activation failed" in out) is warned
     assert ("not active within 10 s (no DHCP lease yet)" in out) is (not warned)
     assert " active (" not in out                          # never reads as a success
+
+
+# --- netplan saves a match:-defined parent as a UUID (field box, 2026-10-30) -----
+
+
+def test_a_netplan_uuid_parent_is_resaved_as_a_keyfile_by_name(tmp_path) -> None:
+    """Netplan-integrated NM saved each VLAN's parent as a UUID naming no loaded
+    profile, so every activation failed. The profile is replaced by a keyfile with
+    parent=<name>, and the VLANs (DHCP and static) come up."""
+    body = '_apply_vlan_nmcli eth0 "10 20" "20:10.9.20.5/24"; echo "RC=$?"'
+    out, st = _run(tmp_path, body, backend="nm", flags=("netplan-parent-uuid",))
+    assert "RC=0" in out
+    assert {("eth0.10", "10", "eth0"), ("eth0.20", "20", "eth0")} <= _vlan_links(st)
+    assert "saved its parent as 10d44f21" in out
+    assert "nmcli con load netmon-vlan10.nmconnection" in st["calls"]
+    assert "netmon-vlan20 eth0.20 eth0 20 10.9.20.5/24" in st["cons"]
+    kf = (tmp_path / "st" / "nmconn" / "netmon-vlan20.nmconnection").read_text(encoding="utf-8")
+    assert "parent=eth0\n" in kf and "address1=10.9.20.5/24\n" in kf
+    assert "never-default=true\n" in kf and "ignore-auto-routes=true\n" in kf
+    assert "uuid=" not in kf
+    kf10 = (tmp_path / "st" / "nmconn" / "netmon-vlan10.nmconnection").read_text(encoding="utf-8")
+    assert "method=auto\nmay-fail=true\n" in kf10
+    assert "WARN" not in out
+
+
+def test_a_parent_saved_by_name_keeps_the_nmcli_profile(tmp_path) -> None:
+    """Every box where nmcli already keeps the parent by name is unchanged."""
+    out, st = _run(tmp_path, '_apply_vlan_nmcli eth0 "10"; echo "RC=$?"', backend="nm")
+    assert "RC=0" in out
+    assert "con load" not in st["calls"]
+    assert not list((tmp_path / "st" / "nmconn").iterdir())
+
+
+@pytest.mark.parametrize(("flag", "said"), [
+    ("load-fails", "did not load"),
+    ("load-to-netplan", "its parent still reads as '42b34496"),
+])
+def test_a_keyfile_that_does_not_hold_is_warned(tmp_path, flag, said) -> None:
+    """Neither the keyfile nor a loaded profile is left behind, and the stale VLAN
+    (20, no longer wanted) is NOT removed: a failed replacement stops the
+    reconcile instead of half-applying."""
+    out, st = _run(tmp_path, '_apply_vlan_nmcli eth0 "10"; echo "RC=$?"', backend="nm",
+                   flags=("netplan-parent-uuid", flag),
+                   cons="netmon-vlan20 eth0.20 eth0 20 -\n", links="eth0.20 vlan 20 eth0\n")
+    assert "RC=1" in out
+    assert "WARN nmcli VLAN 10: " in out and said in out
+    assert "would not keep their parent eth0 by name (see above): 10" in out
+    assert ("eth0.10", "10", "eth0") not in _vlan_links(st)
+    assert not list((tmp_path / "st" / "nmconn").iterdir())
+    assert "netmon-vlan10" not in st["cons"]
+    assert "netmon-vlan20 eth0.20 eth0 20" in st["cons"]
+    assert "nmcli con delete netmon-vlan20" not in st["calls"]
+    assert "nmcli --wait 10 con up netmon-vlan10" not in st["calls"]

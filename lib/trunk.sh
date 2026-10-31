@@ -326,7 +326,57 @@ _nmcli_oneline() {
     printf '%s' "${v:0:240}"
 }
 
-# (Re)create one NetMon VLAN connection `netmon-vlan<vid>` on <parent>.
+# Save NetMon VLAN connection `netmon-vlan<vid>` as a keyfile in NetworkManager's
+# own directory (what nmcli itself writes on a box without netplan) and load it —
+# the same settings _nmcli_add_vlan asks nmcli for, with the parent BY NAME. No
+# uuid line, ON PURPOSE: NetworkManager derives a stable one from the file path,
+# and Ubuntu's network-manager postinst, which on EVERY package upgrade moves each
+# keyfile here into netplan (bringing the UUID parent back), skips a file with no
+# "uuid=" in it (read on the field box). Args: parent vid ifname [cidr]. Returns 1,
+# with NetworkManager's words, after trying to remove the file and profile, if it
+# is not loaded or does not keep the parent by name.
+_nmcli_vlan_keyfile() {
+    local parent="$1" vid="$2" ifname="$3" cidr="${4:-}"
+    local conname="netmon-vlan${vid}" f tmp ipv4 out got
+    f="${NETMON_NM_CONN_DIR}/${conname}.nmconnection"
+    if [[ -n "$cidr" ]]; then
+        ipv4="method=manual"$'\n'"address1=${cidr}"
+    else
+        ipv4="method=auto"$'\n'"may-fail=true"
+    fi
+    if ! tmp="$(mktemp)"; then
+        warn "nmcli VLAN ${vid}: could not create a temporary file for its keyfile."
+        return 1
+    fi
+    printf '[connection]\nid=%s\ntype=vlan\ninterface-name=%s\nautoconnect=true\n\n[vlan]\nid=%s\nparent=%s\nflags=1\n\n[ipv4]\n%s\nnever-default=true\nignore-auto-routes=true\n\n[ipv6]\nmethod=ignore\n' \
+        "$conname" "$ifname" "$vid" "$parent" "$ipv4" > "$tmp"
+    if ! $SUDO install -m 600 -o root -g root "$tmp" "$f"; then
+        rm -f "$tmp"
+        warn "nmcli VLAN ${vid}: could not write ${f}."
+        return 1
+    fi
+    rm -f "$tmp"
+    if ! out="$($SUDO nmcli con load "$f" 2>&1)"; then
+        # Not loaded, so nothing NetMon lists could ever remove it: it would come
+        # back as a VLAN at NetworkManager's next start.
+        $SUDO rm -f "$f"
+        warn "nmcli VLAN ${vid}: NetworkManager did not load ${f}: $(_nmcli_oneline "$out")"
+        return 1
+    fi
+    got="$($SUDO nmcli -g vlan.parent con show "$conname" 2>/dev/null)"
+    if [[ "$got" != "$parent" ]]; then
+        _nmcli_remove_vlan_con "$conname" || true
+        $SUDO rm -f "$f"
+        warn "nmcli VLAN ${vid}: its parent still reads as '$(_nmcli_oneline "${got:0:40}")', not ${parent}, after loading ${f}."
+        return 1
+    fi
+    log "nmcli VLAN ${vid}: saved as ${f} (parent ${parent})"
+}
+
+# (Re)create one NetMon VLAN connection `netmon-vlan<vid>` on <parent>. Returns 1
+# if a non-NetMon profile holds the name, 2 if the profile could not be kept with
+# its parent by name (see below); an activation that fails still returns 0 (the
+# caller's missing-link check reports it).
 _nmcli_add_vlan() {
     local parent="$1" vid="$2" cidr="${3:-}"
     local conname="netmon-vlan${vid}" ifname
@@ -336,12 +386,12 @@ _nmcli_add_vlan() {
     _nmcli_remove_vlan_con "$conname" || return 1
     # nmcli's own words are kept (not sent to /dev/null): they are the only record of
     # WHY a VLAN did not come up, and host-action.sh quotes "!!" lines to the dashboard.
-    local out
+    local out added=0
     if [[ -n "$cidr" ]]; then
         out="$($SUDO nmcli con add type vlan con-name "$conname" ifname "$ifname" \
             dev "$parent" id "$vid" ipv4.method manual ipv4.addresses "$cidr" \
             ipv4.never-default yes ipv4.ignore-auto-routes yes ipv6.method ignore \
-            connection.autoconnect yes 2>&1)" \
+            connection.autoconnect yes 2>&1)" && added=1 \
             || warn "nmcli VLAN ${vid}: could not create ${conname}: $(_nmcli_oneline "$out")"
     else
         # NOTE what this profile does on NetworkManager (checked in NM 1.54 source,
@@ -354,8 +404,31 @@ _nmcli_add_vlan() {
         out="$($SUDO nmcli con add type vlan con-name "$conname" ifname "$ifname" \
             dev "$parent" id "$vid" ipv4.method auto ipv4.may-fail yes \
             ipv4.never-default yes ipv4.ignore-auto-routes yes ipv6.method ignore \
-            connection.autoconnect yes 2>&1)" \
+            connection.autoconnect yes 2>&1)" && added=1 \
             || warn "nmcli VLAN ${vid}: could not create ${conname}: $(_nmcli_oneline "$out")"
+    fi
+    # Ubuntu's netplan-integrated NetworkManager (23.10+) saves every nmcli profile
+    # as netplan YAML. When the parent ethernet is defined with `match:` (Ubuntu's
+    # installer writes macaddress + set-name), netplan writes the VLAN's parent as
+    # the parent's netplan UUID and draws a NEW one on every `netplan generate` —
+    # which every nmcli add/delete runs — while NetworkManager keeps the uplink
+    # profile it loaded at boot (which had no uuid yet: NM derived one from its
+    # path). So the parent names no loaded profile until the next reboot, and
+    # activation fails with "Failed to find a compatible device for this
+    # connection" (field box, 2026-10-30: netplan 1.2, NM 1.54). Nothing given to
+    # nmcli changes what netplan writes, and a networkmanager uuid in the uplink's
+    # YAML is not what it uses. A keyfile in NetworkManager's own directory keeps
+    # parent=<name>; a UUID parent that would resolve works by name just the same.
+    if (( added )); then
+        local got
+        got="$($SUDO nmcli -g vlan.parent con show "$conname" 2>/dev/null)"
+        if [[ -n "$got" && "$got" != "$parent" ]]; then
+            log "nmcli VLAN ${vid}: NetworkManager saved its parent as $(_nmcli_oneline "${got:0:40}"), not ${parent} (netplan) — saving it as a keyfile instead"
+            if ! _nmcli_remove_vlan_con "$conname" \
+                || ! _nmcli_vlan_keyfile "$parent" "$vid" "$ifname" "$cidr"; then
+                return 2
+            fi
+        fi
     fi
     # --wait is a GLOBAL option and must PRECEDE the subcommand (as lib/wifi.sh
     # learned). Written after the name — `nmcli con up X --wait 10`, as this was
@@ -396,21 +469,28 @@ _apply_vlan_nmcli() {
     local before_default
     before_default="$(ip route show default 2>/dev/null | head -1)"
 
-    local vid cidr pair wanted="" refused=""
+    local vid cidr pair wanted="" refused="" unkept="" arc
     for vid in $vids; do
         cidr=""
         for pair in ${statics//,/ }; do
             [[ "$pair" == "${vid}:"* ]] && cidr="${pair#"${vid}":}"
         done
-        _nmcli_add_vlan "$parent" "$vid" "$cidr" || refused+="${vid} "
+        arc=0
+        _nmcli_add_vlan "$parent" "$vid" "$cidr" || arc=$?
+        if (( arc == 2 )); then
+            unkept+="${vid} "
+        elif (( arc != 0 )); then
+            refused+="${vid} "
+        fi
         wanted+="$(vlan_child_name "$parent" "$vid") ${vid} ${parent}"$'\n'
     done
 
     # Remove netmon-vlan<digits> connections we own that are no longer wanted —
-    # unless an add was refused: a foreign profile holds one of our names, so
-    # stop reconciling and report it rather than half-apply.
+    # unless an add was refused (a foreign profile holds one of our names) or a
+    # wanted VLAN could not be kept: stop reconciling and report it rather than
+    # half-apply.
     local existing evid listing stale_left=""
-    if [[ -z "$refused" ]]; then
+    if [[ -z "$refused" && -z "$unkept" ]]; then
         if listing="$($SUDO nmcli -g NAME con show 2>/dev/null)"; then
             while IFS= read -r existing; do
                 [[ "$existing" =~ ^netmon-vlan[0-9]+$ ]] || continue
@@ -442,6 +522,10 @@ _apply_vlan_nmcli() {
 
     if [[ -n "$refused" ]]; then
         warn "VLAN(s) not configured — a non-NetMon NM profile holds the name: ${refused% }"
+        return 1
+    fi
+    if [[ -n "$unkept" ]]; then
+        warn "VLAN(s) not configured — NetworkManager would not keep their parent ${parent} by name (see above): ${unkept% }"
         return 1
     fi
     if [[ -n "$stale_left" ]]; then
