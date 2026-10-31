@@ -333,7 +333,7 @@ _nmcli_oneline() {
 # and Ubuntu's network-manager postinst, which on EVERY package upgrade moves each
 # keyfile here into netplan (bringing the UUID parent back), skips a file with no
 # "uuid=" in it (read on the field box). Args: parent vid ifname [cidr]. Returns 1,
-# with NetworkManager's words, leaving neither the file nor a profile behind, if it
+# with NetworkManager's words, after trying to remove the file and profile, if it
 # is not loaded or does not keep the parent by name.
 _nmcli_vlan_keyfile() {
     local parent="$1" vid="$2" ifname="$3" cidr="${4:-}"
