@@ -158,6 +158,15 @@ _UA_BROWSER='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gec
 CAPTIVE_ACCEPT_POLL_SEC="$(current_value NETMON_WIFI_CAPTIVE_POLL_SEC 2>/dev/null || echo 45)"
 [[ "$CAPTIVE_ACCEPT_POLL_SEC" =~ ^[0-9]+$ ]] || CAPTIVE_ACCEPT_POLL_SEC=45
 
+# A portal redirect is taken verbatim from its Location header, and Aruba Central puts the
+# AP group name there unencoded ("vcname=Some Group"). curl refuses a URL containing a
+# space (exit 3, malformed URL), so the Aruba accept died on its very first fetch, every
+# run. Encode spaces and drop control bytes before a portal URL reaches curl.
+_url_escape() {
+    local s="${1// /%20}"
+    printf '%s' "$s" | tr -d '\000-\037\177'
+}
+
 # Classify the portal vendor from the redirect host, then (if inconclusive) the page body.
 # Echoes: aruba_central | aruba | cisco_wlc | cisco_ise | meraki | generic
 _captive_vendor() {
@@ -168,6 +177,7 @@ _captive_vendor() {
         *network-auth.com*) echo "meraki"; return;;
     esac
     [[ -z "$redir" ]] && { echo "generic"; return; }
+    redir="$(_url_escape "$redir")"
     page="$($SUDO curl -s -m 8 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" "$redir" 2>/dev/null || true)"
     case "$page" in
         *portal_login_page_config*|*cloudguest*) echo "aruba_central";;
@@ -188,16 +198,16 @@ _captive_vendor() {
 _accept_aruba_central() {
     local srcip="$1" cap_url="$2" cj bounce login host page csrf capture code waited
     cj="$(mktemp 2>/dev/null || echo /tmp/nm-cj.$$)"
-    bounce="$($SUDO curl -s -m 12 -L --interface "$srcip" -A "$_UA_BROWSER" -c "$cj" -b "$cj" "$cap_url" 2>/dev/null || true)"
+    bounce="$($SUDO curl -s -m 12 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" -c "$cj" -b "$cj" "$cap_url" 2>/dev/null || true)"
     login="$(printf '%s' "$bounce" | grep -oiE 'window\.top\.location\.href *= *"[^"]+"' | head -1 | sed -E 's/.*href *= *"([^"]+)".*/\1/')"
     login="${login//&amp;/&}"; login="${login// /%20}"
     [[ -z "$login" ]] && { rm -f "$cj"; return 1; }
     host="$(printf '%s' "$login" | sed -E 's#^(https?://[^/]+).*#\1#')"
-    page="$($SUDO curl -s -m 12 -L --interface "$srcip" -A "$_UA_BROWSER" -c "$cj" -b "$cj" "$login" 2>/dev/null || true)"
+    page="$($SUDO curl -s -m 12 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" -c "$cj" -b "$cj" "$login" 2>/dev/null || true)"
     csrf="$(printf '%s' "$page" | grep -oE '"csrf_token":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/')"
     capture="$(printf '%s' "$page" | grep -oE '"capture":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/')"
     [[ -z "$capture" ]] && capture="$(printf '%s' "$login" | sed -E 's/.*[?&]capture=([^&]*).*/\1/')"
-    $SUDO curl -s -m 15 -L --interface "$srcip" -A "$_UA_BROWSER" -c "$cj" -b "$cj" \
+    $SUDO curl -s -m 15 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" -c "$cj" -b "$cj" \
         -H "Referer: $login" -H "Origin: $host" \
         --data-urlencode "csrf_token=$csrf" --data-urlencode "capture=$capture" --data 'cmd=authenticate' \
         -o /dev/null "$login" 2>/dev/null || true
@@ -269,6 +279,7 @@ _accept_generic() {
 _captive_try_accept() {
     local srcip="$1" url="$2" vendor="${3:-generic}"
     [[ -z "$url" ]] && url="http://connectivitycheck.gstatic.com/generate_204"
+    url="$(_url_escape "$url")"
     case "$vendor" in
         aruba_central) _accept_aruba_central "$srcip" "$url" ;;
         cisco_wlc)     _accept_cisco_wlc "$srcip" "$url" ;;

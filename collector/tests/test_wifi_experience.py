@@ -23,6 +23,12 @@ from __future__ import annotations
 
 import base64
 import json
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
 
 from collector.discovery import wifi_experience
 
@@ -191,3 +197,33 @@ def test_a_result_without_a_captive_portal_block_is_left_alone(monkeypatch, tmp_
     out = wifi_experience.load()
     assert out["available"] is True
     assert len(out["results"]) == 2
+
+
+# --- portal URLs handed to curl (host script) -------------------------------------
+
+def _run_url_escape(url: str) -> str:
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("needs bash")
+    script = Path(__file__).resolve().parents[2] / "scripts" / "netmon-wifi-experience.sh"
+    m = re.search(r"^_url_escape\(\) \{\n.*?^\}\n", script.read_text(encoding="utf-8"), re.S | re.M)
+    assert m, "_url_escape not found in the battery script"
+    out = subprocess.run([bash, "-c", m.group(0) + '_url_escape "$1"', "_", url],
+                         capture_output=True, check=True)
+    return out.stdout.decode()
+
+
+def test_portal_url_with_spaces_becomes_one_curl_accepts() -> None:
+    # Aruba Central's redirect carries the AP group name unencoded. curl rejects a URL
+    # with a space outright (exit 3), which is why the Aruba accept never once worked.
+    url = ("https://portal.example/capture?cmd=login&vcname=Tech Services Test Group"
+           "&url=http%3A%2F%2Fconnectivitycheck.gstatic.com%2Fgenerate_204")
+    got = _run_url_escape(url)
+    assert " " not in got
+    assert "vcname=Tech%20Services%20Test%20Group&url=http%3A%2F%2F" in got
+
+
+def test_portal_url_escape_drops_control_bytes_and_keeps_clean_urls() -> None:
+    assert _run_url_escape("http://a.example/x\ty\r") == "http://a.example/xy"
+    clean = "https://a.example/p?a=1&b=%20"
+    assert _run_url_escape(clean) == clean
