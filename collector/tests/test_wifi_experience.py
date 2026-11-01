@@ -238,6 +238,9 @@ def test_every_portal_url_is_escaped_and_passed_as_url() -> None:
     assert body and 'url="$(_url_escape "$url")"' in body.group(0)
     assert vendor and 'redir="$(_url_escape "$redir")"' in vendor.group(0)
     section = script[script.index("_captive_vendor() {"):script.index("_webperf_one() {")]
-    for ln in section.splitlines():
-        if "curl " in ln and "generate_204" not in ln and ln.rstrip().endswith(("|| true)\"", "&& return 0", "|| true")):
-            assert '--url "' in ln, ln
+    lines = section.replace("\\\n", " ").splitlines()
+    commands = [c for c in lines if "curl " in c and not c.lstrip().startswith("#")]
+    portal = [c for c in commands if "-w '%{http_code}'" not in c]  # the generate_204 poll is fixed
+    assert len(portal) == 10, portal
+    for cmd in portal:
+        assert '--url "' in cmd, cmd
