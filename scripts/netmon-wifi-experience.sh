@@ -201,7 +201,8 @@ _accept_aruba_central() {
     cj="$(mktemp 2>/dev/null || echo /tmp/nm-cj.$$)"
     bounce="$($SUDO curl -s -m 12 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" -c "$cj" -b "$cj" --url "$cap_url" 2>/dev/null || true)"
     login="$(printf '%s' "$bounce" | grep -oiE 'window\.top\.location\.href *= *"[^"]+"' | head -1 | sed -E 's/.*href *= *"([^"]+)".*/\1/')"
-    login="${login//&amp;/&}"; login="${login// /%20}"
+    # sed, not ${login//&amp;/&}: under bash 5.2's patsub_replacement that "&" is the match.
+    login="$(printf '%s' "$login" | sed 's/&amp;/\&/g')"; login="${login// /%20}"
     [[ -z "$login" ]] && { rm -f "$cj"; return 1; }
     host="$(printf '%s' "$login" | sed -E 's#^(https?://[^/]+).*#\1#')"
     page="$($SUDO curl -s -m 12 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" -c "$cj" -b "$cj" --url "$login" 2>/dev/null || true)"
