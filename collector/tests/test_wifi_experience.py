@@ -23,6 +23,12 @@ from __future__ import annotations
 
 import base64
 import json
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
 
 from collector.discovery import wifi_experience
 
@@ -191,3 +197,50 @@ def test_a_result_without_a_captive_portal_block_is_left_alone(monkeypatch, tmp_
     out = wifi_experience.load()
     assert out["available"] is True
     assert len(out["results"]) == 2
+
+
+# --- portal URLs handed to curl (host script) -------------------------------------
+
+def _run_url_escape(url: str) -> str:
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("needs bash")
+    script = Path(__file__).resolve().parents[2] / "scripts" / "netmon-wifi-experience.sh"
+    m = re.search(r"^_url_escape\(\) \{\n.*?^\}\n", script.read_text(encoding="utf-8"), re.S | re.M)
+    assert m, "_url_escape not found in the battery script"
+    out = subprocess.run([bash, "-c", m.group(0) + '_url_escape "$1"', "_", url],
+                         capture_output=True, check=True)
+    return out.stdout.decode()
+
+
+def test_portal_url_with_spaces_becomes_one_curl_accepts() -> None:
+    # Aruba Central's redirect carries the AP group name unencoded. curl rejects a URL
+    # with a space outright (exit 3), which is why the Aruba accept never once worked.
+    url = ("https://portal.example/capture?cmd=login&vcname=Tech Services Test Group"
+           "&url=http%3A%2F%2Fconnectivitycheck.gstatic.com%2Fgenerate_204")
+    got = _run_url_escape(url)
+    assert " " not in got
+    assert "vcname=Tech%20Services%20Test%20Group&url=http%3A%2F%2F" in got
+
+
+def test_portal_url_escape_drops_control_bytes_and_keeps_clean_urls() -> None:
+    assert _run_url_escape("http://a.example/x\ty\r") == "http://a.example/xy"
+    clean = "https://a.example/p?a=1&b=%20"
+    assert _run_url_escape(clean) == clean
+
+
+def test_every_portal_url_is_escaped_and_passed_as_url() -> None:
+    # The helper alone is not the fix: the dispatcher and the vendor probe must call it,
+    # and no portal fetch may hand curl a bare positional URL an AP could start with "-".
+    script = (Path(__file__).resolve().parents[2] / "scripts" / "netmon-wifi-experience.sh").read_text(encoding="utf-8")
+    body = re.search(r"^_captive_try_accept\(\) \{\n.*?^\}\n", script, re.S | re.M)
+    vendor = re.search(r"^_captive_vendor\(\) \{\n.*?^\}\n", script, re.S | re.M)
+    assert body and 'url="$(_url_escape "$url")"' in body.group(0)
+    assert vendor and 'redir="$(_url_escape "$redir")"' in vendor.group(0)
+    section = script[script.index("_captive_vendor() {"):script.index("_webperf_one() {")]
+    lines = section.replace("\\\n", " ").splitlines()
+    commands = [c for c in lines if "curl " in c and not c.lstrip().startswith("#")]
+    portal = [c for c in commands if "-w '%{http_code}'" not in c]  # the generate_204 poll is fixed
+    assert len(portal) == 10, portal
+    for cmd in portal:
+        assert '--url "' in cmd, cmd
