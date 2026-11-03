@@ -203,7 +203,7 @@ _accept_aruba_central() {
     login="$(printf '%s' "$bounce" | grep -oiE 'window\.top\.location\.href *= *"[^"]+"' | head -1 | sed -E 's/.*href *= *"([^"]+)".*/\1/')"
     # sed, not ${login//&amp;/&}: under bash 5.2's patsub_replacement that "&" is the match.
     login="$(printf '%s' "$login" | sed 's/&amp;/\&/g')"; login="${login// /%20}"
-    [[ -z "$login" ]] && { rm -f "$cj"; return 1; }
+    [[ -z "$login" ]] && { rm -f "$cj"; return 2; }   # 2 = no accept was sent
     host="$(printf '%s' "$login" | sed -E 's#^(https?://[^/]+).*#\1#')"
     page="$($SUDO curl -s -m 12 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" -c "$cj" -b "$cj" --url "$login" 2>/dev/null || true)"
     csrf="$(printf '%s' "$page" | grep -oE '"csrf_token":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/')"
@@ -288,6 +288,60 @@ _captive_try_accept() {
         meraki)        _accept_meraki "$srcip" "$url" ;;
         *)             _accept_generic "$srcip" "$url" ;;   # aruba on-prem, cisco_ise, generic
     esac
+}
+
+# Re-associate the joined profile and wait for its lease again. After an Aruba Central
+# accept the sensor cannot finish the AP-side hop itself: the AP answers its login host
+# (securelogin.*) only through DNS on the joined network, and curl resolves through the
+# wired resolver. The accept does register the MAC with Central, though, and the NEXT
+# association passes the AP's MAC-caching check. On the verification sensor the run that
+# accepted stayed walled for its whole poll, and the following run's fresh join came up
+# open (204, 63-95 Mbps). So rejoin rather than wait for the next scheduled run.
+# Echoes "ip4<TAB>gw"; returns 1 if the rejoin got no lease. Probe routing is torn
+# down first and is the caller's to redo.
+_captive_reassociate() {
+    local iface="$1" ssid="$2" conname ip4="" gw="" tries=0
+    conname="$(_wifi_conname "$ssid")"
+    _routing_teardown "$iface"
+    $SUDO nmcli con down "$conname" >/dev/null 2>&1 || true
+    $SUDO nmcli --wait 25 con up "$conname" >/dev/null 2>&1 || return 1
+    while (( tries < 30 )); do
+        ip4="$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4; exit}')"
+        [[ -n "$ip4" ]] && break
+        sleep 0.5; tries=$((tries+1))
+    done
+    [[ -z "$ip4" ]] && return 1
+    gw="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null | tr ',' '\n' | grep -E '(^|[[:space:]])routers = ' | sed -n 's/.*routers = \([0-9.]*\).*/\1/p' | head -1)"
+    [[ -z "$gw" ]] && gw="$($SUDO nmcli -g IP4.GATEWAY dev show "$iface" 2>/dev/null | head -1)"
+    [[ -z "$gw" ]] && return 1
+    printf '%s\t%s' "$ip4" "$gw"
+}
+
+# Signal, BSSID, band and link rate of the in-use AP, as "rssi<TAB>bssid<TAB>band<TAB>
+# rate". nmcli SIGNAL is 0-100 link quality, NOT dBm (the same unit the WIFI-2 survey
+# reports). Both values come from the in-use (*) row; iw is not installed on every box.
+# RATE is the AP's advertised link rate, not the negotiated PHY rate.
+_link_info() {
+    local iface="$1" rssi="" bssid="" band="" rx_rate="" apline freq
+    rssi="$($SUDO nmcli -t -f IN-USE,SIGNAL,SSID dev wifi list ifname "$iface" 2>/dev/null \
+            | awk -F: '/^\*/{print $2; exit}')"
+    apline="$($SUDO nmcli -t -f IN-USE,BSSID,FREQ,RATE dev wifi list ifname "$iface" 2>/dev/null \
+              | awk '/^\*/{print; exit}')"
+    if [[ -n "$apline" ]]; then
+        # terse mode escapes value-internal colons as '\:'; unescape, then pattern-pull
+        # each piece (MAC / "NNNN MHz" / "NNN Mbit/s") rather than split on ':'. sed, not
+        # ${apline//\\:/:}: that expansion left the "\:" in place on a bash 5.3 build.
+        apline="$(printf '%s' "$apline" | sed 's/[\\]:/:/g')"
+        bssid="$(printf '%s' "$apline" | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)"
+        freq="$(printf '%s' "$apline" | grep -oE '[0-9]{3,5} MHz' | grep -oE '^[0-9]+' | head -1)"
+        rx_rate="$(printf '%s' "$apline" | grep -oE '[0-9]+ Mbit/s' | grep -oE '^[0-9]+' | head -1)"
+        if [[ "$freq" =~ ^[0-9]+$ ]]; then
+            if (( freq < 2500 )); then band="2.4GHz"
+            elif (( freq < 5900 )); then band="5GHz"
+            else band="6GHz"; fi
+        fi
+    fi
+    printf '%s\t%s\t%s\t%s' "$rssi" "$bssid" "$band" "$rx_rate"
 }
 
 # Probe ONE URL's load waterfall source-bound over the Wi-Fi (curl --interface), and
@@ -407,40 +461,21 @@ _run_profile() {
         [[ -z "$gw" ]] && gw="$($SUDO nmcli -g IP4.GATEWAY dev show "$iface" 2>/dev/null | head -1)"
     fi
 
-    # 3. Signal quality (nmcli SIGNAL is 0-100 link quality, NOT dBm — same unit the
-    #    WIFI-2 survey reports; tagged signal_unit="quality" in the artifact).
-    local rssi=""
-    rssi="$($SUDO nmcli -t -f IN-USE,SIGNAL,SSID dev wifi list ifname "$iface" 2>/dev/null \
-            | awk -F: '/^\*/{print $2; exit}')"
-
-    # 3b. Which AP (BSSID), band, and link rate the client got — e.g. "shoved onto
-    #     2.4GHz at a low rate" is a real finding, and the BSSID ties the experience to
-    #     a specific AP. Read from the SAME in-use (*) nmcli row the signal came from
-    #     (iw is not installed on every box; nmcli is a hard dependency we already use).
-    #     RATE here is the AP's advertised link rate, not the negotiated PHY rate.
-    local bssid="" band="" rx_rate="" apline freq
-    apline="$($SUDO nmcli -t -f IN-USE,BSSID,FREQ,RATE dev wifi list ifname "$iface" 2>/dev/null \
-              | awk '/^\*/{print; exit}')"
-    if [[ -n "$apline" ]]; then
-        # terse mode escapes value-internal colons as '\:'; unescape, then pattern-pull
-        # each piece (MAC / "NNNN MHz" / "NNN Mbit/s") rather than split on ':'.
-        apline="${apline//\\:/:}"
-        bssid="$(printf '%s' "$apline" | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)"
-        freq="$(printf '%s' "$apline" | grep -oE '[0-9]{3,5} MHz' | grep -oE '^[0-9]+' | head -1)"
-        rx_rate="$(printf '%s' "$apline" | grep -oE '[0-9]+ Mbit/s' | grep -oE '^[0-9]+' | head -1)"
-        if [[ "$freq" =~ ^[0-9]+$ ]]; then
-            if (( freq < 2500 )); then band="2.4GHz"
-            elif (( freq < 5900 )); then band="5GHz"
-            else band="6GHz"; fi
-        fi
-    fi
+    # 3. Signal quality, and which AP (BSSID), band and link rate the client got: "shoved
+    #    onto 2.4GHz at a low rate" is a real finding, and the BSSID ties the experience
+    #    to a specific AP. Signal is tagged signal_unit="quality" in the artifact.
+    # cut, not `IFS=$'\t' read`: tab is IFS-whitespace, so read collapses an empty field.
+    local link rssi bssid band rx_rate
+    link="$(_link_info "$iface")"
+    rssi="$(printf '%s' "$link" | cut -f1)"; bssid="$(printf '%s' "$link" | cut -f2)"
+    band="$(printf '%s' "$link" | cut -f3)"; rx_rate="$(printf '%s' "$link" | cut -f4)"
 
     # 4. Battery (only if we got an IP). Probes traverse the joined net via the
     #    dedicated route table.
-    local cap_state="n/a" cap_code="" cap_redir="" cap_redir_b64="" cap_accepted="null" cap_vendor=""
+    local cap_state="n/a" cap_code="" cap_redir="" cap_redir_b64="" cap_accepted="null" cap_vendor="" cap_rejoined=false
     local ping_ok=false http_ok=false rtt="" loss="" dns_ok=false iso_tested="" iso_reachable=""
     local dl_mbps="" tgt_json="" wp_json="" st_json=""
-    local routing_ok=false dns_srv="" dns_via=""
+    local routing_ok=false dns_srv="" dns_via="" measure=true
     if [[ -n "$ip4" && -n "$gw" ]]; then
         local srcip="${ip4%/*}"
         _routing_setup "$iface" "$srcip" "$gw" && routing_ok=true
@@ -455,103 +490,139 @@ _run_profile() {
         [[ "$cap_state" == "portal" ]] && cap_vendor="$(_captive_vendor "$srcip" "$cap_redir")"
         # optional best-effort click-through accept (vendor-tailored), then re-probe.
         if [[ "$cap_accept" == "1" && "$cap_state" == "portal" ]]; then
-            if _captive_try_accept "$srcip" "$cap_redir" "$cap_vendor"; then cap_accepted=true; else cap_accepted=false; fi
+            local accept_rc=0
+            _captive_try_accept "$srcip" "$cap_redir" "$cap_vendor" || accept_rc=$?
+            if (( accept_rc == 0 )); then cap_accepted=true; else cap_accepted=false; fi
             cap="$(_captive_probe "$srcip")"
             cap_state="$(printf '%s' "$cap" | cut -f1)"
             cap_code="$(printf '%s' "$cap" | cut -f2)"
             cap_redir="$(printf '%s' "$cap" | cut -f3)"
+            # Aruba Central opens on the next association (see _captive_reassociate):
+            # rejoin once instead of leaving the grant for the next scheduled run. Not
+            # when no accept was sent (rc 2): there is nothing for a rejoin to pick up.
+            if [[ "$cap_vendor" == "aruba_central" && "$cap_state" == "portal" ]] && (( accept_rc != 2 )); then
+                local rejoin
+                cap_rejoined=true
+                if rejoin="$(_captive_reassociate "$iface" "$ssid")"; then
+                    ip4="$(printf '%s' "$rejoin" | cut -f1)"; gw="$(printf '%s' "$rejoin" | cut -f2)"
+                    srcip="${ip4%/*}"
+                    link="$(_link_info "$iface")"   # the rejoin may have landed on another AP
+                    rssi="$(printf '%s' "$link" | cut -f1)"; bssid="$(printf '%s' "$link" | cut -f2)"
+                    band="$(printf '%s' "$link" | cut -f3)"; rx_rate="$(printf '%s' "$link" | cut -f4)"
+                fi
+                # Probe routing was torn down for the rejoin. Put it back (the new lease,
+                # or the old one if the rejoin failed). If it cannot be verified, measure
+                # nothing more: a source-bound probe with no policy route would quietly
+                # measure the wired uplink. Dropping the connection is cleanup only.
+                routing_ok=false
+                _routing_setup "$iface" "$srcip" "$gw" && routing_ok=true
+                if $routing_ok; then
+                    cap="$(_captive_probe "$srcip")"
+                    cap_state="$(printf '%s' "$cap" | cut -f1)"
+                    cap_code="$(printf '%s' "$cap" | cut -f2)"
+                    cap_redir="$(printf '%s' "$cap" | cut -f3)"
+                    [[ "$cap_state" == "open" ]] && cap_accepted=true
+                else
+                    measure=false
+                    _routing_teardown "$iface"
+                    $SUDO nmcli con down "$(_wifi_conname "$ssid")" >/dev/null 2>&1 || true
+                fi
+            fi
         fi
         cap_redir_b64="$(printf '%s' "$cap_redir" | b64)"
-        # internet reachability via the Wi-Fi. TWO signals: ICMP (ping_ok) AND HTTP
-        # (http_ok). Guest networks commonly BLOCK ICMP but pass HTTP/DNS, so ping alone
-        # gives a false "unreachable" — http_ok (a 204 from the connectivity endpoint, the
-        # same one the captive probe used) is the reliable "internet actually works" signal.
-        local png; png="$($SUDO ping -I "$srcip" -c 3 -W 2 1.1.1.1 2>/dev/null || true)"
-        printf '%s' "$png" | grep -q ' 0% packet loss' && ping_ok=true
-        rtt="$(printf '%s' "$png" | awk -F'/' '/rtt|round-trip/{print $5; exit}')"
-        loss="$(printf '%s' "$png" | grep -oE '[0-9]+% packet loss' | grep -oE '[0-9]+' | head -1)"
-        [[ "$cap_state" == "open" ]] && http_ok=true
-        # DNS through the JOINED network's own resolver. `curl --interface` binds the
-        # socket AFTER getaddrinfo, so the previous probe resolved via the box's WIRED
-        # resolv.conf and happily reported dns_ok=true on a guest VLAN whose DNS was
-        # filtered or dead — precisely the "Wi-Fi is broken in Room 12" case this
-        # battery exists to catch. Ask the DHCP-supplied resolver directly, bound to
-        # the Wi-Fi source IP. `dns_via` records which method actually answered, so a
-        # fallback can never be mistaken for a real test of the joined resolver.
-        # `nmcli -g` joins MULTIPLE values with " | " on one line, so a lease handing
-        # out two resolvers yields "10.0.0.1 | 10.0.0.2" — passing that whole string as
-        # dig's @server silently fails and reads as "this network's DNS is broken".
-        # Caught on the verification sensor: the guest SSID has two resolvers and reported a false
-        # dns_ok=false. Take the FIRST server only.
-        dns_srv="$($SUDO nmcli -g IP4.DNS dev show "$iface" 2>/dev/null \
-            | head -1 | tr '|' '\n' | head -1 | tr -d '[:space:]')"
-        [[ -z "$dns_srv" ]] && dns_srv="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null \
-            | tr ',' '\n' | grep -E '(^|[[:space:]])domain_name_servers = ' \
-            | sed -n 's/.*domain_name_servers = \([0-9. ]*\).*/\1/p' | head -1 | awk '{print $1}')"
-        if [[ -n "$dns_srv" ]] && command -v dig >/dev/null 2>&1; then
-            dns_via="dig"
-            [[ -n "$($SUDO dig +short +time=3 +tries=1 -b "$srcip" @"$dns_srv" example.com A 2>/dev/null)" ]] && dns_ok=true
-        elif command -v resolvectl >/dev/null 2>&1; then
-            dns_via="resolvectl"
-            $SUDO resolvectl query -i "$iface" example.com >/dev/null 2>&1 && dns_ok=true
-        else
-            # Last resort. Reachability of a DoH endpoint over the Wi-Fi — it does NOT
-            # exercise the joined resolver; labelled so nobody reads it as if it did.
-            dns_via="doh-reachability"
-            $SUDO curl -s -m 6 --interface "$srcip" -o /dev/null https://dns.google/resolve?name=example.com 2>/dev/null && dns_ok=true
-        fi
-        # throughput: a short source-bound download over the Wi-Fi (Cloudflare speed
-        # endpoint, capped at 12s); the analysis radio only, never the uplink.
-        local dl
-        dl="$($SUDO curl -s -m 12 --proto '=https' --interface "$srcip" -o /dev/null -w '%{speed_download}' 'https://speed.cloudflare.com/__down?bytes=25000000' 2>/dev/null || true)"
-        [[ "$dl" =~ ^[0-9.]+$ ]] && dl_mbps="$(awk "BEGIN{printf \"%.2f\", ($dl*8)/1000000}")"
-        # instructional-target latency over the Wi-Fi ("internet's fine but Google /
-        # M365 is slow" is a distinct, real signal). RTT is source-routed over the radio.
-        local _t _tp _trtt
-        for _t in www.google.com www.office.com; do
-            _tp="$($SUDO ping -I "$srcip" -c 2 -W 2 "$_t" 2>/dev/null || true)"
-            _trtt="$(printf '%s' "$_tp" | awk -F'/' '/rtt|round-trip/{print $5; exit}')"
-            [[ -n "$tgt_json" ]] && tgt_json="${tgt_json},"
-            tgt_json="${tgt_json}{\"host\":\"${_t}\",\"rtt_ms\":${_trtt:-null}}"
-        done
-        # webperf: run the district URL waterfall source-bound over the Wi-Fi, so each
-        # site's DNS/TCP/TLS/TTFB/total is comparable to the WIRED run (same probe, both
-        # paths). Only when the district enabled web monitoring + pushed a URL list.
-        local webperf_on="0" _wpurl
-        case "$(current_value NETMON_WEBPERF_ENABLED 2>/dev/null | tr '[:upper:]' '[:lower:]')" in
-            true|1|yes) webperf_on=1 ;;
-        esac
-        if [[ "$webperf_on" == "1" && -s "$WEBPERF_URLS_FILE" ]]; then
-            while IFS= read -r _wpurl; do
-                [[ -z "$_wpurl" ]] && continue
-                [[ -n "$wp_json" ]] && wp_json="${wp_json},"
-                wp_json="${wp_json}$(_webperf_one "$srcip" "$_wpurl")"
-            done < <($SUDO grep -oE 'https?://[^"]+' "$WEBPERF_URLS_FILE" 2>/dev/null)
-        fi
-        # Internet SPEED TEST — only for the PRIMARY network (saturating up/down is
-        # airtime-expensive on a live AP, so we designate ONE SSID per school for it).
-        # Download reuses the throughput pull above; add a source-bound upload + a longer
-        # ping burst for latency/jitter(mdev)/loss. Teams/Zoom/online-testing pain is
-        # upload- and jitter-bound, so a download-only number would hide the real problem.
-        if [[ "$speedtest" == "1" ]]; then
-            local up ul_mbps="" zf stp st_lat="" st_jit="" st_loss=""
-            zf="$(mktemp 2>/dev/null || echo /tmp/netmon-ul.$$)"
-            head -c 10000000 /dev/zero > "$zf" 2>/dev/null
-            up="$($SUDO curl -s -m 15 --proto '=https' --interface "$srcip" -o /dev/null \
-                  -w '%{speed_upload}' --data-binary "@$zf" 'https://speed.cloudflare.com/__up' 2>/dev/null || true)"
-            rm -f "$zf"
-            [[ "$up" =~ ^[0-9.]+$ ]] && ul_mbps="$(awk "BEGIN{printf \"%.2f\", ($up*8)/1000000}")"
-            stp="$($SUDO ping -I "$srcip" -c 10 -W 2 1.1.1.1 2>/dev/null || true)"
-            st_lat="$(printf '%s' "$stp" | awk -F'/' '/rtt|round-trip/{print $5; exit}')"
-            st_jit="$(printf '%s' "$stp" | awk -F'/' '/rtt|round-trip/{split($7,a," "); print a[1]; exit}')"
-            st_loss="$(printf '%s' "$stp" | grep -oE '[0-9]+% packet loss' | grep -oE '[0-9]+' | head -1)"
-            st_json="{\"download_mbps\":${dl_mbps:-null},\"upload_mbps\":${ul_mbps:-null},\"latency_ms\":${st_lat:-null},\"jitter_ms\":${st_jit:-null},\"loss_pct\":${st_loss:-null}}"
-        fi
-        # ISOLATION: from the guest/Wi-Fi, can we reach an INTERNAL host (the wired
-        # uplink's gateway)? A properly isolated guest network should NOT.
-        iso_tested="$(ip -4 route show default 2>/dev/null | awk '/default/{print $3; exit}')"
-        if [[ -n "$iso_tested" ]]; then
-            if $SUDO ping -I "$srcip" -c 1 -W 2 "$iso_tested" >/dev/null 2>&1; then iso_reachable=true; else iso_reachable=false; fi
+        # The battery below runs only on verified probe routing (see the rejoin above).
+        if $measure; then
+            # internet reachability via the Wi-Fi. TWO signals: ICMP (ping_ok) AND HTTP
+            # (http_ok). Guest networks commonly BLOCK ICMP but pass HTTP/DNS, so ping alone
+            # gives a false "unreachable" — http_ok (a 204 from the connectivity endpoint, the
+            # same one the captive probe used) is the reliable "internet actually works" signal.
+            local png; png="$($SUDO ping -I "$srcip" -c 3 -W 2 1.1.1.1 2>/dev/null || true)"
+            printf '%s' "$png" | grep -q ' 0% packet loss' && ping_ok=true
+            rtt="$(printf '%s' "$png" | awk -F'/' '/rtt|round-trip/{print $5; exit}')"
+            loss="$(printf '%s' "$png" | grep -oE '[0-9]+% packet loss' | grep -oE '[0-9]+' | head -1)"
+            [[ "$cap_state" == "open" ]] && http_ok=true
+            # DNS through the JOINED network's own resolver. `curl --interface` binds the
+            # socket AFTER getaddrinfo, so the previous probe resolved via the box's WIRED
+            # resolv.conf and happily reported dns_ok=true on a guest VLAN whose DNS was
+            # filtered or dead — precisely the "Wi-Fi is broken in Room 12" case this
+            # battery exists to catch. Ask the DHCP-supplied resolver directly, bound to
+            # the Wi-Fi source IP. `dns_via` records which method actually answered, so a
+            # fallback can never be mistaken for a real test of the joined resolver.
+            # `nmcli -g` joins MULTIPLE values with " | " on one line, so a lease handing
+            # out two resolvers yields "10.0.0.1 | 10.0.0.2" — passing that whole string as
+            # dig's @server silently fails and reads as "this network's DNS is broken".
+            # Caught on the verification sensor: the guest SSID has two resolvers and reported a false
+            # dns_ok=false. Take the FIRST server only.
+            dns_srv="$($SUDO nmcli -g IP4.DNS dev show "$iface" 2>/dev/null \
+                | head -1 | tr '|' '\n' | head -1 | tr -d '[:space:]')"
+            [[ -z "$dns_srv" ]] && dns_srv="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null \
+                | tr ',' '\n' | grep -E '(^|[[:space:]])domain_name_servers = ' \
+                | sed -n 's/.*domain_name_servers = \([0-9. ]*\).*/\1/p' | head -1 | awk '{print $1}')"
+            if [[ -n "$dns_srv" ]] && command -v dig >/dev/null 2>&1; then
+                dns_via="dig"
+                [[ -n "$($SUDO dig +short +time=3 +tries=1 -b "$srcip" @"$dns_srv" example.com A 2>/dev/null)" ]] && dns_ok=true
+            elif command -v resolvectl >/dev/null 2>&1; then
+                dns_via="resolvectl"
+                $SUDO resolvectl query -i "$iface" example.com >/dev/null 2>&1 && dns_ok=true
+            else
+                # Last resort. Reachability of a DoH endpoint over the Wi-Fi — it does NOT
+                # exercise the joined resolver; labelled so nobody reads it as if it did.
+                dns_via="doh-reachability"
+                $SUDO curl -s -m 6 --interface "$srcip" -o /dev/null https://dns.google/resolve?name=example.com 2>/dev/null && dns_ok=true
+            fi
+            # throughput: a short source-bound download over the Wi-Fi (Cloudflare speed
+            # endpoint, capped at 12s); the analysis radio only, never the uplink.
+            local dl
+            dl="$($SUDO curl -s -m 12 --proto '=https' --interface "$srcip" -o /dev/null -w '%{speed_download}' 'https://speed.cloudflare.com/__down?bytes=25000000' 2>/dev/null || true)"
+            [[ "$dl" =~ ^[0-9.]+$ ]] && dl_mbps="$(awk "BEGIN{printf \"%.2f\", ($dl*8)/1000000}")"
+            # instructional-target latency over the Wi-Fi ("internet's fine but Google /
+            # M365 is slow" is a distinct, real signal). RTT is source-routed over the radio.
+            local _t _tp _trtt
+            for _t in www.google.com www.office.com; do
+                _tp="$($SUDO ping -I "$srcip" -c 2 -W 2 "$_t" 2>/dev/null || true)"
+                _trtt="$(printf '%s' "$_tp" | awk -F'/' '/rtt|round-trip/{print $5; exit}')"
+                [[ -n "$tgt_json" ]] && tgt_json="${tgt_json},"
+                tgt_json="${tgt_json}{\"host\":\"${_t}\",\"rtt_ms\":${_trtt:-null}}"
+            done
+            # webperf: run the district URL waterfall source-bound over the Wi-Fi, so each
+            # site's DNS/TCP/TLS/TTFB/total is comparable to the WIRED run (same probe, both
+            # paths). Only when the district enabled web monitoring + pushed a URL list.
+            local webperf_on="0" _wpurl
+            case "$(current_value NETMON_WEBPERF_ENABLED 2>/dev/null | tr '[:upper:]' '[:lower:]')" in
+                true|1|yes) webperf_on=1 ;;
+            esac
+            if [[ "$webperf_on" == "1" && -s "$WEBPERF_URLS_FILE" ]]; then
+                while IFS= read -r _wpurl; do
+                    [[ -z "$_wpurl" ]] && continue
+                    [[ -n "$wp_json" ]] && wp_json="${wp_json},"
+                    wp_json="${wp_json}$(_webperf_one "$srcip" "$_wpurl")"
+                done < <($SUDO grep -oE 'https?://[^"]+' "$WEBPERF_URLS_FILE" 2>/dev/null)
+            fi
+            # Internet SPEED TEST — only for the PRIMARY network (saturating up/down is
+            # airtime-expensive on a live AP, so we designate ONE SSID per school for it).
+            # Download reuses the throughput pull above; add a source-bound upload + a longer
+            # ping burst for latency/jitter(mdev)/loss. Teams/Zoom/online-testing pain is
+            # upload- and jitter-bound, so a download-only number would hide the real problem.
+            if [[ "$speedtest" == "1" ]]; then
+                local up ul_mbps="" zf stp st_lat="" st_jit="" st_loss=""
+                zf="$(mktemp 2>/dev/null || echo /tmp/netmon-ul.$$)"
+                head -c 10000000 /dev/zero > "$zf" 2>/dev/null
+                up="$($SUDO curl -s -m 15 --proto '=https' --interface "$srcip" -o /dev/null \
+                      -w '%{speed_upload}' --data-binary "@$zf" 'https://speed.cloudflare.com/__up' 2>/dev/null || true)"
+                rm -f "$zf"
+                [[ "$up" =~ ^[0-9.]+$ ]] && ul_mbps="$(awk "BEGIN{printf \"%.2f\", ($up*8)/1000000}")"
+                stp="$($SUDO ping -I "$srcip" -c 10 -W 2 1.1.1.1 2>/dev/null || true)"
+                st_lat="$(printf '%s' "$stp" | awk -F'/' '/rtt|round-trip/{print $5; exit}')"
+                st_jit="$(printf '%s' "$stp" | awk -F'/' '/rtt|round-trip/{split($7,a," "); print a[1]; exit}')"
+                st_loss="$(printf '%s' "$stp" | grep -oE '[0-9]+% packet loss' | grep -oE '[0-9]+' | head -1)"
+                st_json="{\"download_mbps\":${dl_mbps:-null},\"upload_mbps\":${ul_mbps:-null},\"latency_ms\":${st_lat:-null},\"jitter_ms\":${st_jit:-null},\"loss_pct\":${st_loss:-null}}"
+            fi
+            # ISOLATION: from the guest/Wi-Fi, can we reach an INTERNAL host (the wired
+            # uplink's gateway)? A properly isolated guest network should NOT.
+            iso_tested="$(ip -4 route show default 2>/dev/null | awk '/default/{print $3; exit}')"
+            if [[ -n "$iso_tested" ]]; then
+                if $SUDO ping -I "$srcip" -c 1 -W 2 "$iso_tested" >/dev/null 2>&1; then iso_reachable=true; else iso_reachable=false; fi
+            fi
         fi
         _routing_teardown "$iface"
     fi
@@ -563,8 +634,8 @@ _run_profile() {
     printf '{"ssid":"%s","auth":"%s","associated":%s,"assoc_ms":%s,"dhcp_ms":%s,' \
         "$(printf '%s' "$ssid" | tr -d '\000-\037\042\134')" "${auth:-open}" "$associated" "$assoc_ms" "$dhcp_ms"
     printf '"ip":"%s","gateway":"%s","signal":%s,"signal_unit":"quality",' "${ip4:-}" "${gw:-}" "${rssi:-null}"
-    printf '"captive_portal":{"state":"%s","http_code":"%s","redirect_b64":"%s","auto_accepted":%s,"vendor":"%s"},' \
-        "$cap_state" "${cap_code:-}" "$cap_redir_b64" "$cap_accepted" "${cap_vendor:-}"
+    printf '"captive_portal":{"state":"%s","http_code":"%s","redirect_b64":"%s","auto_accepted":%s,"vendor":"%s","rejoined":%s},' \
+        "$cap_state" "${cap_code:-}" "$cap_redir_b64" "$cap_accepted" "${cap_vendor:-}" "$cap_rejoined"
     printf '"internet":{"ping_ok":%s,"http_ok":%s,"rtt_ms":"%s","loss_pct":"%s"},' "$ping_ok" "$http_ok" "${rtt:-}" "${loss:-}"
     printf '"link":{"bssid":"%s","band":"%s","rx_rate_mbps":%s},' "${bssid:-}" "${band:-}" "${rx_rate:-null}"
     printf '"throughput":{"download_mbps":%s},' "${dl_mbps:-null}"
