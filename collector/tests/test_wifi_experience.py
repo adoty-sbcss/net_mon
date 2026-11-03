@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -244,3 +246,54 @@ def test_every_portal_url_is_escaped_and_passed_as_url() -> None:
     assert len(portal) == 10, portal
     for cmd in portal:
         assert '--url "' in cmd, cmd
+
+
+def _run_reassociate(lease: str, routers: str, up_ok: bool = True) -> tuple[str, list[str]]:
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("needs bash")
+    script = (Path(__file__).resolve().parents[2] / "scripts" / "netmon-wifi-experience.sh").read_text(encoding="utf-8")
+    m = re.search(r"^_captive_reassociate\(\) \{\n.*?^\}\n", script, re.S | re.M)
+    assert m, "_captive_reassociate not found in the battery script"
+    # nmcli/ip are stubbed; the calls they receive are logged so the order can be checked.
+    stubs = (
+        'SUDO=""; log() { printf "%s\\n" "$*" >> "$LOG"; }\n'
+        '_wifi_conname() { printf "netmon-wifi-%s" "$1"; }\n'
+        '_routing_teardown() { log teardown; }\n'
+        'sleep() { :; }\n'
+        'nmcli() { log nmcli "$@"; if [[ "$*" == *"con up"* ]]; then [[ "$UP_OK" == 1 ]]; return; fi;'
+        ' if [[ "$*" == *DHCP4.OPTION* ]]; then printf "%s" "$ROUTERS"; fi; }\n'
+        'ip() { [[ -n "$LEASE" ]] && printf "3: wlan0 inet %s brd x scope global\\n" "$LEASE"; }\n'
+    )
+    code = stubs + m.group(0) + '_captive_reassociate wlan0 Guest; echo "rc=$?"'
+    with tempfile.TemporaryDirectory() as d:
+        log = Path(d) / "log"
+        env = dict(os.environ, LOG=str(log), LEASE=lease, ROUTERS=routers, UP_OK="1" if up_ok else "0")
+        out = subprocess.run([bash, "-c", code], capture_output=True, env=env, check=True)
+        calls = log.read_text().splitlines() if log.exists() else []
+        return out.stdout.decode(), calls
+
+
+def test_reassociate_rejoins_the_same_profile_and_reports_the_new_lease() -> None:
+    out, calls = _run_reassociate("10.6.0.89/22", "requested_routers = 1, routers = 10.6.3.254")
+    assert out == "10.6.0.89/22\t10.6.3.254rc=0\n"
+    assert calls[0] == "teardown"  # routing comes down before the link drops
+    assert calls[1] == "nmcli con down netmon-wifi-Guest"
+    assert calls[2] == "nmcli --wait 25 con up netmon-wifi-Guest"
+
+
+def test_reassociate_fails_cleanly_without_a_lease_or_gateway() -> None:
+    assert _run_reassociate("", "routers = 10.6.3.254")[0] == "rc=1\n"
+    assert _run_reassociate("10.6.0.89/22", "")[0] == "rc=1\n"
+    assert _run_reassociate("10.6.0.89/22", "routers = 10.6.3.254", up_ok=False)[0] == "rc=1\n"
+
+
+def test_aruba_rejoin_is_wired_in_and_restores_routing_on_failure() -> None:
+    script = (Path(__file__).resolve().parents[2] / "scripts" / "netmon-wifi-experience.sh").read_text(encoding="utf-8")
+    run = re.search(r"^_run_profile\(\) \{\n.*?^\}\n", script, re.S | re.M)
+    assert run
+    body = run.group(0)
+    branch = body[body.index('if rejoin="$(_captive_reassociate "$iface" "$ssid")"; then'):]
+    ok, _, failed = branch.partition("                else\n")
+    assert '_routing_setup "$iface" "$srcip" "$gw" && routing_ok=true' in ok
+    assert '_routing_setup "$iface" "$srcip" "$gw" && routing_ok=true' in failed.split("                fi")[0]

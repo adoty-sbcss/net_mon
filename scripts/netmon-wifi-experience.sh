@@ -290,6 +290,29 @@ _captive_try_accept() {
     esac
 }
 
+# Re-associate the joined profile and wait for its lease again. Aruba Central applies the
+# guest grant on the client's NEXT association, not mid-session: on the verification
+# sensor the run that accepted stayed walled for the whole poll, and the following run,
+# a fresh join, came up open (204, ~95 Mbps). Echoes "ip4<TAB>gw"; returns 1 if the
+# rejoin got no lease. Probe routing is torn down first and is the caller's to redo.
+_captive_reassociate() {
+    local iface="$1" ssid="$2" conname ip4="" gw="" tries=0
+    conname="$(_wifi_conname "$ssid")"
+    _routing_teardown "$iface"
+    $SUDO nmcli con down "$conname" >/dev/null 2>&1 || true
+    $SUDO nmcli --wait 25 con up "$conname" >/dev/null 2>&1 || return 1
+    while (( tries < 30 )); do
+        ip4="$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4; exit}')"
+        [[ -n "$ip4" ]] && break
+        sleep 0.5; tries=$((tries+1))
+    done
+    [[ -z "$ip4" ]] && return 1
+    gw="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null | tr ',' '\n' | grep -E '(^|[[:space:]])routers = ' | sed -n 's/.*routers = \([0-9.]*\).*/\1/p' | head -1)"
+    [[ -z "$gw" ]] && gw="$($SUDO nmcli -g IP4.GATEWAY dev show "$iface" 2>/dev/null | head -1)"
+    [[ -z "$gw" ]] && return 1
+    printf '%s\t%s' "$ip4" "$gw"
+}
+
 # Probe ONE URL's load waterfall source-bound over the Wi-Fi (curl --interface), and
 # emit a single JSON object matching collector/webperf.py's shape so the wired (live
 # POST) and Wi-Fi (bundle) runs are the SAME measurement. Cumulative curl seconds -> ms.
@@ -460,6 +483,27 @@ _run_profile() {
             cap_state="$(printf '%s' "$cap" | cut -f1)"
             cap_code="$(printf '%s' "$cap" | cut -f2)"
             cap_redir="$(printf '%s' "$cap" | cut -f3)"
+            # Aruba Central opens on the next association (see _captive_reassociate):
+            # rejoin once instead of leaving the grant for the next scheduled run.
+            if [[ "$cap_vendor" == "aruba_central" && "$cap_state" == "portal" ]]; then
+                local rejoin
+                if rejoin="$(_captive_reassociate "$iface" "$ssid")"; then
+                    ip4="$(printf '%s' "$rejoin" | cut -f1)"; gw="$(printf '%s' "$rejoin" | cut -f2)"
+                    srcip="${ip4%/*}"
+                    routing_ok=false
+                    _routing_setup "$iface" "$srcip" "$gw" && routing_ok=true
+                    cap="$(_captive_probe "$srcip")"
+                    cap_state="$(printf '%s' "$cap" | cut -f1)"
+                    cap_code="$(printf '%s' "$cap" | cut -f2)"
+                    cap_redir="$(printf '%s' "$cap" | cut -f3)"
+                    [[ "$cap_state" == "open" ]] && cap_accepted=true
+                else
+                    # Rejoin got no usable lease. Put the probe routing back for the
+                    # old address so nothing below can leave through the wired uplink.
+                    routing_ok=false
+                    _routing_setup "$iface" "$srcip" "$gw" && routing_ok=true
+                fi
+            fi
         fi
         cap_redir_b64="$(printf '%s' "$cap_redir" | b64)"
         # internet reachability via the Wi-Fi. TWO signals: ICMP (ping_ok) AND HTTP
