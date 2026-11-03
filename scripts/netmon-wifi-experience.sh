@@ -203,7 +203,7 @@ _accept_aruba_central() {
     login="$(printf '%s' "$bounce" | grep -oiE 'window\.top\.location\.href *= *"[^"]+"' | head -1 | sed -E 's/.*href *= *"([^"]+)".*/\1/')"
     # sed, not ${login//&amp;/&}: under bash 5.2's patsub_replacement that "&" is the match.
     login="$(printf '%s' "$login" | sed 's/&amp;/\&/g')"; login="${login// /%20}"
-    [[ -z "$login" ]] && { rm -f "$cj"; return 1; }
+    [[ -z "$login" ]] && { rm -f "$cj"; return 2; }   # 2 = no accept was sent
     host="$(printf '%s' "$login" | sed -E 's#^(https?://[^/]+).*#\1#')"
     page="$($SUDO curl -s -m 12 -L --proto '=http,https' --proto-redir '=http,https' --interface "$srcip" -A "$_UA_BROWSER" -c "$cj" -b "$cj" --url "$login" 2>/dev/null || true)"
     csrf="$(printf '%s' "$page" | grep -oE '"csrf_token":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/')"
@@ -290,11 +290,15 @@ _captive_try_accept() {
     esac
 }
 
-# Re-associate the joined profile and wait for its lease again. Aruba Central applies the
-# guest grant on the client's NEXT association, not mid-session: on the verification
-# sensor the run that accepted stayed walled for the whole poll, and the following run,
-# a fresh join, came up open (204, ~95 Mbps). Echoes "ip4<TAB>gw"; returns 1 if the
-# rejoin got no lease. Probe routing is torn down first and is the caller's to redo.
+# Re-associate the joined profile and wait for its lease again. After an Aruba Central
+# accept the sensor cannot finish the AP-side hop itself: the AP answers its login host
+# (securelogin.*) only through DNS on the joined network, and curl resolves through the
+# wired resolver. The accept does register the MAC with Central, though, and the NEXT
+# association passes the AP's MAC-caching check. On the verification sensor the run that
+# accepted stayed walled for its whole poll, and the following run's fresh join came up
+# open (204, 63-95 Mbps). So rejoin rather than wait for the next scheduled run.
+# Echoes "ip4<TAB>gw"; returns 1 if the rejoin got no lease. Probe routing is torn
+# down first and is the caller's to redo.
 _captive_reassociate() {
     local iface="$1" ssid="$2" conname ip4="" gw="" tries=0
     conname="$(_wifi_conname "$ssid")"
@@ -311,6 +315,33 @@ _captive_reassociate() {
     [[ -z "$gw" ]] && gw="$($SUDO nmcli -g IP4.GATEWAY dev show "$iface" 2>/dev/null | head -1)"
     [[ -z "$gw" ]] && return 1
     printf '%s\t%s' "$ip4" "$gw"
+}
+
+# Signal, BSSID, band and link rate of the in-use AP, as "rssi<TAB>bssid<TAB>band<TAB>
+# rate". nmcli SIGNAL is 0-100 link quality, NOT dBm (the same unit the WIFI-2 survey
+# reports). Both values come from the in-use (*) row; iw is not installed on every box.
+# RATE is the AP's advertised link rate, not the negotiated PHY rate.
+_link_info() {
+    local iface="$1" rssi="" bssid="" band="" rx_rate="" apline freq
+    rssi="$($SUDO nmcli -t -f IN-USE,SIGNAL,SSID dev wifi list ifname "$iface" 2>/dev/null \
+            | awk -F: '/^\*/{print $2; exit}')"
+    apline="$($SUDO nmcli -t -f IN-USE,BSSID,FREQ,RATE dev wifi list ifname "$iface" 2>/dev/null \
+              | awk '/^\*/{print; exit}')"
+    if [[ -n "$apline" ]]; then
+        # terse mode escapes value-internal colons as '\:'; unescape, then pattern-pull
+        # each piece (MAC / "NNNN MHz" / "NNN Mbit/s") rather than split on ':'. sed, not
+        # ${apline//\\:/:}: bash 5.2+ quotes that pattern differently and it stops matching.
+        apline="$(printf '%s' "$apline" | sed 's/[\\]:/:/g')"
+        bssid="$(printf '%s' "$apline" | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)"
+        freq="$(printf '%s' "$apline" | grep -oE '[0-9]{3,5} MHz' | grep -oE '^[0-9]+' | head -1)"
+        rx_rate="$(printf '%s' "$apline" | grep -oE '[0-9]+ Mbit/s' | grep -oE '^[0-9]+' | head -1)"
+        if [[ "$freq" =~ ^[0-9]+$ ]]; then
+            if (( freq < 2500 )); then band="2.4GHz"
+            elif (( freq < 5900 )); then band="5GHz"
+            else band="6GHz"; fi
+        fi
+    fi
+    printf '%s\t%s\t%s\t%s' "$rssi" "$bssid" "$band" "$rx_rate"
 }
 
 # Probe ONE URL's load waterfall source-bound over the Wi-Fi (curl --interface), and
@@ -430,37 +461,18 @@ _run_profile() {
         [[ -z "$gw" ]] && gw="$($SUDO nmcli -g IP4.GATEWAY dev show "$iface" 2>/dev/null | head -1)"
     fi
 
-    # 3. Signal quality (nmcli SIGNAL is 0-100 link quality, NOT dBm — same unit the
-    #    WIFI-2 survey reports; tagged signal_unit="quality" in the artifact).
-    local rssi=""
-    rssi="$($SUDO nmcli -t -f IN-USE,SIGNAL,SSID dev wifi list ifname "$iface" 2>/dev/null \
-            | awk -F: '/^\*/{print $2; exit}')"
-
-    # 3b. Which AP (BSSID), band, and link rate the client got — e.g. "shoved onto
-    #     2.4GHz at a low rate" is a real finding, and the BSSID ties the experience to
-    #     a specific AP. Read from the SAME in-use (*) nmcli row the signal came from
-    #     (iw is not installed on every box; nmcli is a hard dependency we already use).
-    #     RATE here is the AP's advertised link rate, not the negotiated PHY rate.
-    local bssid="" band="" rx_rate="" apline freq
-    apline="$($SUDO nmcli -t -f IN-USE,BSSID,FREQ,RATE dev wifi list ifname "$iface" 2>/dev/null \
-              | awk '/^\*/{print; exit}')"
-    if [[ -n "$apline" ]]; then
-        # terse mode escapes value-internal colons as '\:'; unescape, then pattern-pull
-        # each piece (MAC / "NNNN MHz" / "NNN Mbit/s") rather than split on ':'.
-        apline="${apline//\\:/:}"
-        bssid="$(printf '%s' "$apline" | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)"
-        freq="$(printf '%s' "$apline" | grep -oE '[0-9]{3,5} MHz' | grep -oE '^[0-9]+' | head -1)"
-        rx_rate="$(printf '%s' "$apline" | grep -oE '[0-9]+ Mbit/s' | grep -oE '^[0-9]+' | head -1)"
-        if [[ "$freq" =~ ^[0-9]+$ ]]; then
-            if (( freq < 2500 )); then band="2.4GHz"
-            elif (( freq < 5900 )); then band="5GHz"
-            else band="6GHz"; fi
-        fi
-    fi
+    # 3. Signal quality, and which AP (BSSID), band and link rate the client got: "shoved
+    #    onto 2.4GHz at a low rate" is a real finding, and the BSSID ties the experience
+    #    to a specific AP. Signal is tagged signal_unit="quality" in the artifact.
+    # cut, not `IFS=$'\t' read`: tab is IFS-whitespace, so read collapses an empty field.
+    local link rssi bssid band rx_rate
+    link="$(_link_info "$iface")"
+    rssi="$(printf '%s' "$link" | cut -f1)"; bssid="$(printf '%s' "$link" | cut -f2)"
+    band="$(printf '%s' "$link" | cut -f3)"; rx_rate="$(printf '%s' "$link" | cut -f4)"
 
     # 4. Battery (only if we got an IP). Probes traverse the joined net via the
     #    dedicated route table.
-    local cap_state="n/a" cap_code="" cap_redir="" cap_redir_b64="" cap_accepted="null" cap_vendor=""
+    local cap_state="n/a" cap_code="" cap_redir="" cap_redir_b64="" cap_accepted="null" cap_vendor="" cap_rejoined=false
     local ping_ok=false http_ok=false rtt="" loss="" dns_ok=false iso_tested="" iso_reachable=""
     local dl_mbps="" tgt_json="" wp_json="" st_json=""
     local routing_ok=false dns_srv="" dns_via=""
@@ -478,31 +490,41 @@ _run_profile() {
         [[ "$cap_state" == "portal" ]] && cap_vendor="$(_captive_vendor "$srcip" "$cap_redir")"
         # optional best-effort click-through accept (vendor-tailored), then re-probe.
         if [[ "$cap_accept" == "1" && "$cap_state" == "portal" ]]; then
-            if _captive_try_accept "$srcip" "$cap_redir" "$cap_vendor"; then cap_accepted=true; else cap_accepted=false; fi
+            local accept_rc=0
+            _captive_try_accept "$srcip" "$cap_redir" "$cap_vendor" || accept_rc=$?
+            if (( accept_rc == 0 )); then cap_accepted=true; else cap_accepted=false; fi
             cap="$(_captive_probe "$srcip")"
             cap_state="$(printf '%s' "$cap" | cut -f1)"
             cap_code="$(printf '%s' "$cap" | cut -f2)"
             cap_redir="$(printf '%s' "$cap" | cut -f3)"
             # Aruba Central opens on the next association (see _captive_reassociate):
-            # rejoin once instead of leaving the grant for the next scheduled run.
-            if [[ "$cap_vendor" == "aruba_central" && "$cap_state" == "portal" ]]; then
+            # rejoin once instead of leaving the grant for the next scheduled run. Not
+            # when no accept was sent (rc 2): there is nothing for a rejoin to pick up.
+            if [[ "$cap_vendor" == "aruba_central" && "$cap_state" == "portal" ]] && (( accept_rc != 2 )); then
                 local rejoin
+                cap_rejoined=true
                 if rejoin="$(_captive_reassociate "$iface" "$ssid")"; then
                     ip4="$(printf '%s' "$rejoin" | cut -f1)"; gw="$(printf '%s' "$rejoin" | cut -f2)"
                     srcip="${ip4%/*}"
-                    routing_ok=false
-                    _routing_setup "$iface" "$srcip" "$gw" && routing_ok=true
-                    cap="$(_captive_probe "$srcip")"
-                    cap_state="$(printf '%s' "$cap" | cut -f1)"
-                    cap_code="$(printf '%s' "$cap" | cut -f2)"
-                    cap_redir="$(printf '%s' "$cap" | cut -f3)"
-                    [[ "$cap_state" == "open" ]] && cap_accepted=true
-                else
-                    # Rejoin got no usable lease. Put the probe routing back for the
-                    # old address so nothing below can leave through the wired uplink.
-                    routing_ok=false
-                    _routing_setup "$iface" "$srcip" "$gw" && routing_ok=true
+                    link="$(_link_info "$iface")"   # the rejoin may have landed on another AP
+                    rssi="$(printf '%s' "$link" | cut -f1)"; bssid="$(printf '%s' "$link" | cut -f2)"
+                    band="$(printf '%s' "$link" | cut -f3)"; rx_rate="$(printf '%s' "$link" | cut -f4)"
                 fi
+                # Probe routing was torn down for the rejoin. Put it back (the new lease,
+                # or the old one if the rejoin failed), and if it cannot be verified, drop
+                # the connection: with no Wi-Fi address every source-bound probe below
+                # fails to bind instead of quietly measuring the wired uplink.
+                routing_ok=false
+                _routing_setup "$iface" "$srcip" "$gw" && routing_ok=true
+                if ! $routing_ok; then
+                    _routing_teardown "$iface"
+                    $SUDO nmcli con down "$(_wifi_conname "$ssid")" >/dev/null 2>&1 || true
+                fi
+                cap="$(_captive_probe "$srcip")"
+                cap_state="$(printf '%s' "$cap" | cut -f1)"
+                cap_code="$(printf '%s' "$cap" | cut -f2)"
+                cap_redir="$(printf '%s' "$cap" | cut -f3)"
+                [[ "$cap_state" == "open" ]] && cap_accepted=true
             fi
         fi
         cap_redir_b64="$(printf '%s' "$cap_redir" | b64)"
@@ -607,8 +629,8 @@ _run_profile() {
     printf '{"ssid":"%s","auth":"%s","associated":%s,"assoc_ms":%s,"dhcp_ms":%s,' \
         "$(printf '%s' "$ssid" | tr -d '\000-\037\042\134')" "${auth:-open}" "$associated" "$assoc_ms" "$dhcp_ms"
     printf '"ip":"%s","gateway":"%s","signal":%s,"signal_unit":"quality",' "${ip4:-}" "${gw:-}" "${rssi:-null}"
-    printf '"captive_portal":{"state":"%s","http_code":"%s","redirect_b64":"%s","auto_accepted":%s,"vendor":"%s"},' \
-        "$cap_state" "${cap_code:-}" "$cap_redir_b64" "$cap_accepted" "${cap_vendor:-}"
+    printf '"captive_portal":{"state":"%s","http_code":"%s","redirect_b64":"%s","auto_accepted":%s,"vendor":"%s","rejoined":%s},' \
+        "$cap_state" "${cap_code:-}" "$cap_redir_b64" "$cap_accepted" "${cap_vendor:-}" "$cap_rejoined"
     printf '"internet":{"ping_ok":%s,"http_ok":%s,"rtt_ms":"%s","loss_pct":"%s"},' "$ping_ok" "$http_ok" "${rtt:-}" "${loss:-}"
     printf '"link":{"bssid":"%s","band":"%s","rx_rate_mbps":%s},' "${bssid:-}" "${band:-}" "${rx_rate:-null}"
     printf '"throughput":{"download_mbps":%s},' "${dl_mbps:-null}"

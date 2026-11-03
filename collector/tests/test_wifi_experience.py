@@ -248,16 +248,31 @@ def test_every_portal_url_is_escaped_and_passed_as_url() -> None:
         assert '--url "' in cmd, cmd
 
 
-def _run_reassociate(lease: str, routers: str, up_ok: bool = True) -> tuple[str, list[str]]:
+_BATTERY = Path(__file__).resolve().parents[2] / "scripts" / "netmon-wifi-experience.sh"
+
+
+def _shipped_fn(name: str) -> str:
+    m = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", _BATTERY.read_text(encoding="utf-8"), re.S | re.M)
+    assert m, f"{name} not found in the battery script"
+    return m.group(0)
+
+
+def _run_fn(name: str, stubs: str, call: str, **env: str) -> tuple[str, list[str]]:
+    """Run one shipped function under the script's own shell options with stubbed tools.
+    Stubs log what they were called with, so the order of side effects can be checked."""
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("needs bash")
-    script = (Path(__file__).resolve().parents[2] / "scripts" / "netmon-wifi-experience.sh").read_text(encoding="utf-8")
-    m = re.search(r"^_captive_reassociate\(\) \{\n.*?^\}\n", script, re.S | re.M)
-    assert m, "_captive_reassociate not found in the battery script"
-    # nmcli/ip are stubbed; the calls they receive are logged so the order can be checked.
+    code = ('set -uo pipefail\nSUDO=""; log() { printf "%s\\n" "$*" >> "$LOG"; }\n'
+            + stubs + _shipped_fn(name) + call)
+    with tempfile.TemporaryDirectory() as d:
+        log = Path(d) / "log"
+        out = subprocess.run([bash, "-c", code], capture_output=True, env=dict(os.environ, LOG=str(log), **env), check=True)
+        return out.stdout.decode(), (log.read_text().splitlines() if log.exists() else [])
+
+
+def _run_reassociate(lease: str, routers: str, up_ok: bool = True) -> tuple[str, list[str]]:
     stubs = (
-        'SUDO=""; log() { printf "%s\\n" "$*" >> "$LOG"; }\n'
         '_wifi_conname() { printf "netmon-wifi-%s" "$1"; }\n'
         '_routing_teardown() { log teardown; }\n'
         'sleep() { :; }\n'
@@ -265,13 +280,8 @@ def _run_reassociate(lease: str, routers: str, up_ok: bool = True) -> tuple[str,
         ' if [[ "$*" == *DHCP4.OPTION* ]]; then printf "%s" "$ROUTERS"; fi; }\n'
         'ip() { [[ -n "$LEASE" ]] && printf "3: wlan0 inet %s brd x scope global\\n" "$LEASE"; }\n'
     )
-    code = stubs + m.group(0) + '_captive_reassociate wlan0 Guest; echo "rc=$?"'
-    with tempfile.TemporaryDirectory() as d:
-        log = Path(d) / "log"
-        env = dict(os.environ, LOG=str(log), LEASE=lease, ROUTERS=routers, UP_OK="1" if up_ok else "0")
-        out = subprocess.run([bash, "-c", code], capture_output=True, env=env, check=True)
-        calls = log.read_text().splitlines() if log.exists() else []
-        return out.stdout.decode(), calls
+    return _run_fn("_captive_reassociate", stubs, '_captive_reassociate wlan0 Guest; echo "rc=$?"',
+                   LEASE=lease, ROUTERS=routers, UP_OK="1" if up_ok else "0")
 
 
 def test_reassociate_rejoins_the_same_profile_and_reports_the_new_lease() -> None:
@@ -288,12 +298,32 @@ def test_reassociate_fails_cleanly_without_a_lease_or_gateway() -> None:
     assert _run_reassociate("10.6.0.89/22", "routers = 10.6.3.254", up_ok=False)[0] == "rc=1\n"
 
 
-def test_aruba_rejoin_is_wired_in_and_restores_routing_on_failure() -> None:
-    script = (Path(__file__).resolve().parents[2] / "scripts" / "netmon-wifi-experience.sh").read_text(encoding="utf-8")
-    run = re.search(r"^_run_profile\(\) \{\n.*?^\}\n", script, re.S | re.M)
-    assert run
-    body = run.group(0)
-    branch = body[body.index('if rejoin="$(_captive_reassociate "$iface" "$ssid")"; then'):]
-    ok, _, failed = branch.partition("                else\n")
-    assert '_routing_setup "$iface" "$srcip" "$gw" && routing_ok=true' in ok
-    assert '_routing_setup "$iface" "$srcip" "$gw" && routing_ok=true' in failed.split("                fi")[0]
+def test_link_info_keeps_fields_in_place_when_signal_is_blank() -> None:
+    # An empty first field must not shift BSSID into the signal slot (the IFS-tab trap).
+    stubs = (
+        'nmcli() { if [[ "$*" == *SIGNAL* ]]; then printf "*::Guest\\n"; '
+        'else printf "*:74\\\\:9E\\\\:75\\\\:CB\\\\:50\\\\:66:5180 MHz:540 Mbit/s\\n"; fi; }\n'
+    )
+    out, _ = _run_fn("_link_info", stubs, '_link_info wlan0')
+    assert out.split("\t") == ["", "74:9E:75:CB:50:66", "5GHz", "540"]
+
+
+def test_aruba_rejoin_is_gated_refreshes_the_link_and_fails_closed() -> None:
+    body = _shipped_fn("_run_profile")
+    start = body.index('if rejoin="$(_captive_reassociate "$iface" "$ssid")"; then')
+    gate = body[body.rindex("\n", 0, body.rindex("if [[", 0, start)):start]
+    after = body[start:body.index('[[ "$cap_state" == "open" ]] && cap_accepted=true', start)]
+    # no rejoin when no accept POST was sent
+    assert "accept_rc != 2" in gate and 'cap_vendor" == "aruba_central"' in gate
+    assert "cap_rejoined=true" in gate
+    assert 'link="$(_link_info "$iface")"' in after
+    # routing is re-verified after the rejoin, and an unverified route drops the link
+    setup = after.index('_routing_setup "$iface" "$srcip" "$gw" && routing_ok=true')
+    guard = after.index("if ! $routing_ok; then", setup)
+    assert 'nmcli con down "$(_wifi_conname "$ssid")"' in after[guard:]
+    assert after.index("_captive_probe", guard) > after.index("nmcli con down", guard)
+    assert '"rejoined":%s' in _BATTERY.read_text(encoding="utf-8")
+
+
+def test_aruba_accept_without_a_login_page_says_no_accept_was_sent() -> None:
+    assert "return 2; }   # 2 = no accept was sent" in _shipped_fn("_accept_aruba_central")
