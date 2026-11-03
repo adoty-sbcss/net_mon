@@ -266,8 +266,10 @@ def _run_fn(name: str, stubs: str, call: str, **env: str) -> tuple[str, list[str
     code = ('set -uo pipefail\nSUDO=""; log() { printf "%s\\n" "$*" >> "$LOG"; }\n'
             + stubs + _shipped_fn(name) + call)
     with tempfile.TemporaryDirectory() as d:
-        log = Path(d) / "log"
-        out = subprocess.run([bash, "-c", code], capture_output=True, env=dict(os.environ, LOG=str(log), **env), check=True)
+        # a file, not `bash -c`: a whole function can exceed the Windows command-line limit
+        log, script = Path(d) / "log", Path(d) / "run.sh"
+        script.write_text(code, encoding="utf-8", newline="\n")
+        out = subprocess.run([bash, script.as_posix()], capture_output=True, env=dict(os.environ, LOG=str(log), **env), check=True)
         return out.stdout.decode(), (log.read_text().splitlines() if log.exists() else [])
 
 
@@ -308,21 +310,61 @@ def test_link_info_keeps_fields_in_place_when_signal_is_blank() -> None:
     assert out.split("\t") == ["", "74:9E:75:CB:50:66", "5GHz", "540"]
 
 
-def test_aruba_rejoin_is_gated_refreshes_the_link_and_fails_closed() -> None:
-    body = _shipped_fn("_run_profile")
-    start = body.index('if rejoin="$(_captive_reassociate "$iface" "$ssid")"; then')
-    gate = body[body.rindex("\n", 0, body.rindex("if [[", 0, start)):start]
-    after = body[start:body.index('[[ "$cap_state" == "open" ]] && cap_accepted=true', start)]
-    # no rejoin when no accept POST was sent
-    assert "accept_rc != 2" in gate and 'cap_vendor" == "aruba_central"' in gate
-    assert "cap_rejoined=true" in gate
-    assert 'link="$(_link_info "$iface")"' in after
-    # routing is re-verified after the rejoin, and an unverified route drops the link
-    setup = after.index('_routing_setup "$iface" "$srcip" "$gw" && routing_ok=true')
-    guard = after.index("if ! $routing_ok; then", setup)
-    assert 'nmcli con down "$(_wifi_conname "$ssid")"' in after[guard:]
-    assert after.index("_captive_probe", guard) > after.index("nmcli con down", guard)
-    assert '"rejoined":%s' in _BATTERY.read_text(encoding="utf-8")
+# _run_profile with every helper and network tool stubbed. A portal is always up until the
+# rejoin; _routing_setup succeeds for the first SETUP_OK calls only; probe tools log
+# "PROBE ..." so a probe that ran without verified routing is visible.
+_PROFILE_STUBS = (
+    '_now_ms() { echo 0; }\nsleep() { :; }\nwifi_join() { return 0; }\nwifi_leave() { log leave; }\n'
+    'current_value() { :; }\nb64() { cat; }\nWEBPERF_URLS_FILE=/nonexistent\n'
+    'ip() { case "$*" in *"addr show"*) printf "3: wlan0 inet 10.6.0.89/22 brd x scope global\\n";;'
+    ' *"route show default"*) printf "default via 10.8.3.254 dev eth0\\n";; esac; }\n'
+    'nmcli() { log "nmcli $*"; if [[ "$*" == *DHCP4.OPTION* ]]; then printf "routers = 10.6.3.254"; fi; return 0; }\n'
+    '_link_info() { if [[ -f "$OPEN" ]]; then printf "%s" "$LINK2"; else printf "%s" "$LINK"; fi; }\n'
+    'SETUPS=0; _routing_setup() { SETUPS=$((SETUPS+1)); log "routing_setup $3"; (( SETUPS <= SETUP_OK )); }\n'
+    '_routing_teardown() { log teardown; }\n'
+    '_captive_probe() { log probe; if [[ -f "$OPEN" ]]; then printf "open\\t204\\t"; else printf "portal\\t302\\thttps://cg.example/x"; fi; }\n'
+    '_captive_vendor() { printf aruba_central; }\n'
+    '_captive_try_accept() { log accept; return "$ACCEPT_RC"; }\n'
+    '_captive_reassociate() { log rejoin; [[ "$REJOIN_OPENS" == 1 ]] && : > "$OPEN"; printf "10.6.0.90/22\\t10.6.3.254"; }\n'
+    '_wifi_conname() { printf "netmon-wifi-%s" "$1"; }\n'
+    'ping() { log "PROBE ping $*"; }\ncurl() { log "PROBE curl $*"; }\ndig() { log "PROBE dig $*"; }\n'
+    'resolvectl() { log "PROBE resolvectl $*"; }\n_webperf_one() { log "PROBE webperf"; }\n'
+)
+
+
+def _run_profile(setup_ok: int, accept_rc: int = 1, rejoin_opens: bool = True) -> tuple[dict, list[str]]:
+    with tempfile.TemporaryDirectory() as d:
+        out, calls = _run_fn("_run_profile", _PROFILE_STUBS, "_run_profile wlan0 Guest open '' '' 1 0",
+                             SETUP_OK=str(setup_ok), ACCEPT_RC=str(accept_rc), OPEN=str(Path(d) / "open"),
+                             REJOIN_OPENS="1" if rejoin_opens else "0", LINK="61\taa:bb:cc:00:11:22\t\t", LINK2="58\taa:bb:cc:00:11:99\t\t")
+    return json.loads(out), calls
+
+
+def test_aruba_rejoin_opens_the_portal_and_measures_on_the_new_lease() -> None:
+    res, calls = _run_profile(setup_ok=9)
+    assert calls.index("accept") < calls.index("rejoin") < calls.index("routing_setup 10.6.3.254", calls.index("rejoin"))
+    cp = res["captive_portal"]
+    assert cp["state"] == "open" and cp["auto_accepted"] is True and cp["rejoined"] is True
+    assert res["ip"] == "10.6.0.90/22" and res["routing_ok"] is True
+    assert res["link"]["bssid"] == "aa:bb:cc:00:11:99" and res["link"]["band"] == ""  # the post-rejoin AP
+    assert any(c.startswith("PROBE ") for c in calls)
+
+
+def test_unverified_routing_after_the_rejoin_measures_nothing() -> None:
+    # Even if the disconnect does nothing (the nmcli stub always "succeeds" without
+    # removing anything), no probe may run once routing could not be re-verified.
+    res, calls = _run_profile(setup_ok=1)
+    after = calls[calls.index("rejoin"):]
+    assert not [c for c in after if c.startswith("PROBE ") or c == "probe"], after
+    assert "nmcli con down netmon-wifi-Guest" in after
+    assert res["routing_ok"] is False and res["captive_portal"]["rejoined"] is True
+    assert res["internet"]["ping_ok"] is False and res["throughput"]["download_mbps"] is None
+
+
+def test_no_rejoin_when_no_accept_was_sent() -> None:
+    res, calls = _run_profile(setup_ok=9, accept_rc=2)
+    assert "rejoin" not in calls
+    assert res["captive_portal"]["rejoined"] is False and res["captive_portal"]["auto_accepted"] is False
 
 
 def test_aruba_accept_without_a_login_page_says_no_accept_was_sent() -> None:
