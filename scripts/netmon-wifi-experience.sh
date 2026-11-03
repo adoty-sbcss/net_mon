@@ -648,6 +648,23 @@ _run_profile() {
         "${iso_tested:-}" "${iso_reachable:-null}"
 }
 
+# Take the one-battery lock on fd 9, non-blocking. 0 = held, 1 = another battery holds
+# it, 2 = the lock file could not be opened. The lock is opened READ-ONLY: flock(2)
+# needs no write access, and the scheduled run (root) creates it 0644, so the "Test
+# now" host action (the check-in user) could not open it for writing. flock then
+# failed on a closed fd and every Test now was reported "already running" and skipped.
+# A missing lock is created through $SUDO: the state dir may be root-owned, and a box
+# set to Test-now-only never has a root run to create it.
+_take_battery_lock() {
+    local lock="$1"
+    [[ -e "$lock" ]] || $SUDO install -m 0644 /dev/null "$lock" 2>/dev/null
+    # The braces keep 2>/dev/null to the open itself: on a bare `exec` it would also
+    # silence the rest of the script's stderr.
+    { exec 9<"$lock"; } 2>/dev/null || return 2
+    flock -n 9 || return 1
+    return 0
+}
+
 # ---- main ----------------------------------------------------------------
 
 main() {
@@ -660,11 +677,11 @@ main() {
     # probes then egress the WIRED uplink while still being recorded as Wi-Fi results.
     # Non-blocking — a second caller exits rather than queueing behind a long battery.
     if command -v flock >/dev/null 2>&1; then
-        exec 9>"${NETMON_STATE_DIR:-/var/lib/netmon}/.wifi-experience.lock" 2>/dev/null || true
-        if ! flock -n 9; then
-            echo "another Wi-Fi battery is already running — skipping"
-            exit 0
-        fi
+        _take_battery_lock "${NETMON_STATE_DIR:-/var/lib/netmon}/.wifi-experience.lock"
+        case $? in
+            1) echo "another Wi-Fi battery is already running — skipping"; exit 0 ;;
+            2) echo "cannot open the Wi-Fi battery lock — not running"; exit 1 ;;   # a fault, not "nothing to do"
+        esac
     fi
 
     local enabled

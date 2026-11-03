@@ -376,3 +376,61 @@ def test_no_rejoin_when_no_accept_was_sent() -> None:
 
 def test_aruba_accept_without_a_login_page_says_no_accept_was_sent() -> None:
     assert "return 2; }   # 2 = no accept was sent" in _shipped_fn("_accept_aruba_central")
+
+
+# --- the one-battery lock ----------------------------------------------------------
+
+def _lock(path: Path, hold: bool = False) -> str:
+    """Take the shipped lock on `path`. hold=True takes it first on a separate open of
+    the same file (flock(2) treats separate opens independently, even in one process).
+    $SUDO is a stub that logs and runs its command, so privileged creation is visible."""
+    if shutil.which("flock") is None:
+        pytest.skip("needs flock (util-linux)")
+    holder = 'exec 8>"$L"; flock 8\n' if hold else ""
+    call = holder + '_take_battery_lock "$L"; echo "rc=$?"; echo "stderr-ok" >&2'
+    bash = shutil.which("bash")
+    assert bash
+    sudo = 'fakesudo() { echo "SUDO $*"; "$@"; }; SUDO=fakesudo\n'
+    code = "set -uo pipefail\n" + sudo + _shipped_fn("_take_battery_lock") + call
+    out = subprocess.run([bash, "-c", code], capture_output=True, env=dict(os.environ, L=str(path)), check=True)
+    return out.stdout.decode() + out.stderr.decode()
+
+
+def test_battery_lock_opens_a_read_only_lock_left_by_root(tmp_path) -> None:
+    # The scheduled run (root) leaves the lock 0644; the Test now host action runs as the
+    # check-in user and must still be able to take it.
+    if shutil.which("flock") is None:
+        pytest.skip("needs flock (util-linux)")
+    if getattr(os, "geteuid", lambda: 0)() == 0:
+        pytest.skip("root can write any file; the bug only shows for a non-root caller")
+    lock = tmp_path / ".wifi-experience.lock"
+    lock.write_text("")
+    lock.chmod(0o444)
+    out = _lock(lock)
+    assert "rc=0" in out and "stderr-ok" in out
+
+
+def test_battery_lock_reports_a_held_lock_as_busy(tmp_path) -> None:
+    assert "rc=1" in _lock(tmp_path / ".wifi-experience.lock", hold=True)
+
+
+def test_battery_lock_creates_a_missing_lock_through_sudo(tmp_path) -> None:
+    # The state dir may be root-owned, and a Test-now-only box has no root run to
+    # create the lock, so the check-in user must create it with privilege.
+    lock = tmp_path / ".wifi-experience.lock"
+    out = _lock(lock)
+    assert f"SUDO install -m 0644 /dev/null {lock}" in out and "rc=0" in out
+    assert lock.exists() and (lock.stat().st_mode & 0o777) == 0o644
+    assert "SUDO" not in _lock(lock)  # an existing lock needs no privilege
+
+
+def test_battery_lock_reports_an_unopenable_lock_honestly(tmp_path) -> None:
+    out = _lock(tmp_path / "missing-dir" / ".wifi-experience.lock")
+    assert "rc=2" in out and "stderr-ok" in out
+
+
+def test_main_distinguishes_busy_from_unopenable() -> None:
+    main = _shipped_fn("main")
+    assert '_take_battery_lock "${NETMON_STATE_DIR:-/var/lib/netmon}/.wifi-experience.lock"' in main
+    assert "exec 9>" not in main  # the lock is opened only by the helper
+    assert 'not running"; exit 1 ;;' in main  # an unopenable lock is a fault, not "ok"
