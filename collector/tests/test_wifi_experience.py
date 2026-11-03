@@ -315,7 +315,8 @@ def test_link_info_keeps_fields_in_place_when_signal_is_blank() -> None:
 # "PROBE ..." so a probe that ran without verified routing is visible.
 _PROFILE_STUBS = (
     '_now_ms() { echo 0; }\nsleep() { :; }\nwifi_join() { return 0; }\nwifi_leave() { log leave; }\n'
-    'current_value() { :; }\nb64() { cat; }\nWEBPERF_URLS_FILE=/nonexistent\n'
+    'current_value() { if [[ "$1" == NETMON_WEBPERF_ENABLED ]]; then printf "%s" "$WEBPERF"; fi; }\n'
+    'b64() { cat; }\nWEBPERF_URLS_FILE="$WPFILE"\n'
     'ip() { case "$*" in *"addr show"*) printf "3: wlan0 inet 10.6.0.89/22 brd x scope global\\n";;'
     ' *"route show default"*) printf "default via 10.8.3.254 dev eth0\\n";; esac; }\n'
     'nmcli() { log "nmcli $*"; if [[ "$*" == *DHCP4.OPTION* ]]; then printf "routers = 10.6.3.254"; fi; return 0; }\n'
@@ -333,15 +334,21 @@ _PROFILE_STUBS = (
 
 
 def _run_profile(setup_ok: int, accept_rc: int = 1, rejoin_opens: bool = True) -> tuple[dict, list[str]]:
+    # Speed test and webperf are on, so every optional probe block is exercised.
     with tempfile.TemporaryDirectory() as d:
-        out, calls = _run_fn("_run_profile", _PROFILE_STUBS, "_run_profile wlan0 Guest open '' '' 1 0",
+        wp = Path(d) / "webperf-urls.json"
+        wp.write_text('["https://site.example/"]', encoding="utf-8")
+        out, calls = _run_fn("_run_profile", _PROFILE_STUBS, "_run_profile wlan0 Guest open '' '' 1 1",
                              SETUP_OK=str(setup_ok), ACCEPT_RC=str(accept_rc), OPEN=str(Path(d) / "open"),
-                             REJOIN_OPENS="1" if rejoin_opens else "0", LINK="61\taa:bb:cc:00:11:22\t\t", LINK2="58\taa:bb:cc:00:11:99\t\t")
+                             REJOIN_OPENS="1" if rejoin_opens else "0", WEBPERF="true", WPFILE=wp.as_posix(),
+                             LINK="61\taa:bb:cc:00:11:22\t\t", LINK2="58\taa:bb:cc:00:11:99\t\t")
     return json.loads(out), calls
 
 
 def test_aruba_rejoin_opens_the_portal_and_measures_on_the_new_lease() -> None:
     res, calls = _run_profile(setup_ok=9)
+    # positive control: with routing verified, the optional blocks do run
+    assert "PROBE webperf" in calls and any("speed.cloudflare.com/__up" in c for c in calls)
     assert calls.index("accept") < calls.index("rejoin") < calls.index("routing_setup 10.6.3.254", calls.index("rejoin"))
     cp = res["captive_portal"]
     assert cp["state"] == "open" and cp["auto_accepted"] is True and cp["rejoined"] is True
