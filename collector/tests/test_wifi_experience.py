@@ -376,3 +376,47 @@ def test_no_rejoin_when_no_accept_was_sent() -> None:
 
 def test_aruba_accept_without_a_login_page_says_no_accept_was_sent() -> None:
     assert "return 2; }   # 2 = no accept was sent" in _shipped_fn("_accept_aruba_central")
+
+
+# --- the one-battery lock ----------------------------------------------------------
+
+def _lock(path: Path, hold: bool = False) -> str:
+    """Take the shipped lock on `path`; with hold=True another process holds it first."""
+    if shutil.which("flock") is None:
+        pytest.skip("needs flock (util-linux)")
+    holder = '(exec 8>"$L"; flock 8; sleep 5) & sleep 0.5\n' if hold else ""
+    call = holder + '_take_battery_lock "$L"; echo "rc=$?"; echo "stderr-ok" >&2'
+    bash = shutil.which("bash")
+    assert bash
+    code = "set -uo pipefail\n" + _shipped_fn("_take_battery_lock") + call
+    out = subprocess.run([bash, "-c", code], capture_output=True, env=dict(os.environ, L=str(path)), check=True)
+    return out.stdout.decode() + out.stderr.decode()
+
+
+def test_battery_lock_opens_a_read_only_lock_left_by_root(tmp_path) -> None:
+    # The scheduled run (root) leaves the lock 0644; the Test now host action runs as the
+    # check-in user and must still be able to take it.
+    if shutil.which("flock") is None:
+        pytest.skip("needs flock (util-linux)")
+    if getattr(os, "geteuid", lambda: 0)() == 0:
+        pytest.skip("root can write any file; the bug only shows for a non-root caller")
+    lock = tmp_path / ".wifi-experience.lock"
+    lock.write_text("")
+    lock.chmod(0o444)
+    out = _lock(lock)
+    assert "rc=0" in out and "stderr-ok" in out
+
+
+def test_battery_lock_reports_a_held_lock_as_busy(tmp_path) -> None:
+    assert "rc=1" in _lock(tmp_path / ".wifi-experience.lock", hold=True)
+
+
+def test_battery_lock_reports_an_unopenable_lock_honestly(tmp_path) -> None:
+    out = _lock(tmp_path / "missing-dir" / ".wifi-experience.lock")
+    assert "rc=2" in out and "stderr-ok" in out
+
+
+def test_main_distinguishes_busy_from_unopenable() -> None:
+    main = _shipped_fn("main")
+    assert '_take_battery_lock "${NETMON_STATE_DIR:-/var/lib/netmon}/.wifi-experience.lock"' in main
+    assert "exec 9>" not in main  # the lock is opened only by the helper
