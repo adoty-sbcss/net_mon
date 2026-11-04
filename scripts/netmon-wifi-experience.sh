@@ -785,6 +785,10 @@ main() {
     trap '_cleanup 143' TERM
     trap '_cleanup 130' INT
     trap '_cleanup 129' HUP
+    # Whatever a run killed past its trap (SIGKILL) left in RT_TABLE goes before the
+    # first join: a stale default via the radio there makes the networkd join refuse
+    # the radio as an uplink. The lock above means no other battery owns it.
+    _routing_teardown "$iface"
 
     # Run each profile serialized (one radio = one association at a time), appending a
     # result object. Empty results[] if there are no profiles / none associated.

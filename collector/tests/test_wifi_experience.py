@@ -464,6 +464,11 @@ def test_main_distinguishes_busy_from_unopenable() -> None:
     assert 'not running"; exit 1 ;;' in main  # an unopenable lock is a fault, not "ok"
 
 
+def test_main_clears_leftover_policy_routing_before_the_first_join() -> None:
+    main = _shipped_fn("main")
+    assert main.index("_take_battery_lock") < main.index('_routing_teardown "$iface"') < main.index("_run_profile")
+
+
 # --- the joined subnet stays out of the main table -----------------------------------
 
 @pytest.mark.parametrize("cidr,net", [("10.6.0.89/22", "10.6.0.0/22"), ("192.168.71.57/24", "192.168.71.0/24"),

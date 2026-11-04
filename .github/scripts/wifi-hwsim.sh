@@ -225,6 +225,12 @@ watch_wired() {
         sleep 0.3
     done
 }
+# What a battery SIGKILLed mid-profile leaves behind: its default via the radio in
+# table 51 and its source rule. The networkd join refuses a radio that carries a default
+# route in any table, so the battery must clear this before its first join (the three
+# networks below must still associate).
+ip route add default dev "$STA" table 51
+ip rule add from 192.0.2.9 table 51 prio 5100
 watch_wired > "$STATE/wired-watch.log" &
 WATCH_PID=$!
 NETMON_STATE_DIR="$STATE" timeout 900 bash "$REPO_DIR/scripts/netmon-wifi-experience.sh" 2> "$STATE/battery.err" \
