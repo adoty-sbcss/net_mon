@@ -282,7 +282,8 @@ def _run_reassociate(lease: str, routers: str, up_ok: bool = True) -> tuple[str,
         ' if [[ "$*" == *DHCP4.OPTION* ]]; then printf "%s" "$ROUTERS"; fi; }\n'
         'ip() { [[ -n "$LEASE" ]] && printf "3: wlan0 inet %s brd x scope global\\n" "$LEASE"; }\n'
     )
-    return _run_fn("_captive_reassociate", stubs, '_captive_reassociate wlan0 Guest; echo "rc=$?"',
+    return _run_fn("_captive_reassociate", stubs + _shipped_fn("_lease_gateway"),
+                   '_captive_reassociate wlan0 Guest; echo "rc=$?"',
                    LEASE=lease, ROUTERS=routers, UP_OK="1" if up_ok else "0")
 
 
@@ -307,7 +308,31 @@ def test_link_info_keeps_fields_in_place_when_signal_is_blank() -> None:
         'else printf "*:74\\\\:9E\\\\:75\\\\:CB\\\\:50\\\\:66:5180 MHz:540 Mbit/s\\n"; fi; }\n'
     )
     out, _ = _run_fn("_link_info", stubs, '_link_info wlan0')
-    assert out.split("\t") == ["", "74:9E:75:CB:50:66", "5GHz", "540"]
+    assert out.split("\t") == ["", "74:9E:75:CB:50:66", "5GHz", "540", "quality"]
+
+
+def test_link_info_on_networkd_reads_the_supplicant_in_dbm() -> None:
+    stubs = (
+        '_wifi_backend() { printf networkd; }\n'
+        'wifi_networkd_link() { printf -- "-58\\taa:bb:cc:00:11:22\\t2437\\t72"; }\n'
+    )
+    out, _ = _run_fn("_link_info", stubs, '_link_info wlan0')
+    assert out.split("\t") == ["-58", "aa:bb:cc:00:11:22", "2.4GHz", "72", "dbm"]
+
+
+def test_networkd_reassociate_and_lease_values_come_from_the_supplicant_and_lease() -> None:
+    stubs = (
+        '_wifi_backend() { printf networkd; }\n_wifi_conname() { printf "netmon-wifi-%s" "$1"; }\n'
+        '_routing_teardown() { log teardown; }\nsleep() { :; }\n'
+        'wifi_networkd_reassociate() { log "reassociate $1"; }\n'
+        'wifi_networkd_lease() { log "lease $2"; printf 10.9.0.1; }\n'
+        'nmcli() { log "nmcli $*"; }\n'
+        'ip() { printf "3: wlo1 inet 10.9.0.50/24 brd x scope global\\n"; }\n'
+    )
+    out, calls = _run_fn("_captive_reassociate", stubs + _shipped_fn("_lease_gateway"),
+                         '_captive_reassociate wlo1 Guest')
+    assert out == "10.9.0.50/24\t10.9.0.1"
+    assert calls == ["teardown", "reassociate wlo1", "lease ROUTER"]  # no nmcli on networkd
 
 
 # _run_profile with every helper and network tool stubbed. A portal is always up until the
@@ -328,6 +353,7 @@ _PROFILE_STUBS = (
     '_captive_try_accept() { log accept; return "$ACCEPT_RC"; }\n'
     '_captive_reassociate() { log rejoin; [[ "$REJOIN_OPENS" == 1 ]] && : > "$OPEN"; printf "10.6.0.90/22\\t10.6.3.254"; }\n'
     '_wifi_conname() { printf "netmon-wifi-%s" "$1"; }\n'
+    '_lease_gateway() { printf 10.6.3.254; }\n_lease_dns() { printf 10.6.3.1; }\n'
     'ping() { log "PROBE ping $*"; }\ncurl() { log "PROBE curl $*"; }\ndig() { log "PROBE dig $*"; }\n'
     'resolvectl() { log "PROBE resolvectl $*"; }\n_webperf_one() { log "PROBE webperf"; }\n'
 )
@@ -363,7 +389,8 @@ def test_unverified_routing_after_the_rejoin_measures_nothing() -> None:
     res, calls = _run_profile(setup_ok=1)
     after = calls[calls.index("rejoin"):]
     assert not [c for c in after if c.startswith("PROBE ") or c == "probe"], after
-    assert "nmcli con down netmon-wifi-Guest" in after
+    # dropped right there (wifi_leave), and again by the normal end-of-profile leave
+    assert after.count("leave") == 2
     assert res["routing_ok"] is False and res["captive_portal"]["rejoined"] is True
     assert res["internet"]["ping_ok"] is False and res["throughput"]["download_mbps"] is None
 
