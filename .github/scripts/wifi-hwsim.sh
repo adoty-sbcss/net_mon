@@ -72,6 +72,8 @@ uplink_state() {
 }
 UPLINK_BEFORE="$(uplink_state)"
 echo "uplink: $UPLINK"; echo "$UPLINK_BEFORE"
+# Otherwise two identical error markers would compare equal and observe nothing.
+[[ "$UPLINK_BEFORE" == *RESOLVECTL-ERROR* ]] && { echo "cannot read the uplink's resolvers"; exit 2; }
 uplink_untouched() {
     local now
     now="$(uplink_state)"
@@ -108,12 +110,25 @@ check "lease back after reassociate" bash -c "ip -4 -o addr show dev $STA | grep
 wifi_leave "NetmonTest Open" || true
 check "leave cleans up everything" nothing_left
 
+check "join open again" wifi_join "$STA" "NetmonTest Open" open
+rm -f /run/netmon-wifi/netmon-wifi-*.pid
+wifi_leave "NetmonTest Open" || true
+check "leave without a pidfile still stops the supplicant" nothing_left
+
 check "wrong PSK does not associate" bash -c "! (for l in common.sh paths.sh envfile.sh wifi.sh; do . '$REPO_DIR/lib/'\$l; done; wifi_join '$STA' 'NetmonTest \"PSK\"' psk '' 'wrong passphrase')"
 check "a failed join leaves nothing behind" nothing_left
 check "unusable passphrase refused before touching the radio" bash -c "! (for l in common.sh paths.sh envfile.sh wifi.sh; do . '$REPO_DIR/lib/'\$l; done; wifi_join '$STA' 'NetmonTest \"PSK\"' psk '' \$'two\\nlines!!')"
 LIBS="for l in common.sh paths.sh envfile.sh wifi.sh; do . '$REPO_DIR/lib/'\$l; done"
 check "the uplink, named explicitly, is refused" bash -c "! ($LIBS; wifi_join '$UPLINK' 'NetmonTest Open' open)"
 check "a non-radio is refused" bash -c "! ($LIBS; wifi_join lo 'NetmonTest Open' open)"
+# The uplink guard on a RADIO (the two above stop at the radio check): give the station
+# a default route in a side table, then as one nexthop of a multipath default.
+ip route add default dev "$STA" table 77
+check "a radio carrying a default route (side table) is refused" bash -c "! ($LIBS; wifi_join '$STA' 'NetmonTest Open' open)"
+ip route del default dev "$STA" table 77
+ip route add default table 78 nexthop dev "$UPLINK" nexthop dev "$STA"
+check "a radio in a multipath default is refused" bash -c "! ($LIBS; wifi_join '$STA' 'NetmonTest Open' open)"
+ip route del default table 78
 check "nothing written for a refused interface" bash -c "! compgen -G '/run/systemd/network/05-netmon-wifi-*' >/dev/null"
 check "uplink untouched after failures" uplink_untouched
 

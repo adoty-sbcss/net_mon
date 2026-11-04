@@ -192,10 +192,13 @@ _wifi_leave_nm() {
 # A netdev name we are willing to put in a file name and a [Match] line.
 _wifi_iface_ok() { [[ "${1:-}" =~ ^[A-Za-z0-9_.-]{1,15}$ ]]; }
 
-# Does this interface carry a default route, IPv4 or IPv6, in any table? (Never
-# reconfigure the uplink, even when it was named explicitly.)
+# Does this interface carry a default route, IPv4 or IPv6, in any table, including as
+# one nexthop of a multipath default? (Never reconfigure the uplink, even when it was
+# named explicitly.) Not `ip route show default dev X`: before iproute2 6.10 that
+# filter ignores multipath nexthops.
 _wifi_is_uplink() {
-    [[ -n "$(ip -4 route show default dev "$1" table all 2>/dev/null)$(ip -6 route show default dev "$1" table all 2>/dev/null)" ]]
+    { ip -4 route show default table all; ip -6 route show default table all; } 2>/dev/null \
+        | grep -qE "[[:space:]]dev ${1//./\\.}([[:space:]]|$)"
 }
 
 _wifi_is_radio() { [[ -e "/sys/class/net/${1}/phy80211" ]]; }
@@ -343,32 +346,52 @@ _wifi_wpa_wait_completed() {
 _wifi_pid_is_ours() {
     local pid="$1" conf="$2"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    tr '\0' '\n' < "/proc/${pid}/cmdline" 2>/dev/null | grep -qxF -- "$conf"
+    # $SUDO cat: /proc may be mounted hidepid, hiding root's processes from a sudoer.
+    $SUDO cat "/proc/${pid}/cmdline" 2>/dev/null | tr '\0' '\n' | grep -qxF -- "$conf"
+}
+
+# Every live supplicant started with this config: the pidfile's pid AND any process
+# whose command line names the config, so a missing or stale pidfile hides none.
+_wifi_our_pids() {
+    local conf="$1" p
+    { $SUDO cat "${conf%.conf}.pid" 2>/dev/null; echo; pgrep -f -- "$conf" 2>/dev/null; } \
+        | sort -u | while read -r p; do
+            _wifi_pid_is_ours "$p" "$conf" && printf '%s\n' "$p"
+        done
 }
 
 # Stop one connection's supplicant and remove its files. First through our own control
-# socket (only our instance listens there, and it needs no pidfile), then by signal to
-# the recorded pid if that is still ours.
+# socket (only our instance listens there), then by signal to whatever is still ours.
+# A terminate reply comes before the process is gone, so wait for the process itself.
 #   args: base (run-dir path without extension) [iface, if the .iface record is missing]
 _wifi_networkd_stop() {
-    local base="$1" iface pid i
+    local base="$1" iface pid i left
     iface="$($SUDO cat "${base}.iface" 2>/dev/null || true)"
     [[ -z "$iface" ]] && iface="${2:-}"
-    pid="$($SUDO cat "${base}.pid" 2>/dev/null || true)"
     if _wifi_iface_ok "$iface"; then
         _wifi_wpa_cli -i "$iface" terminate >/dev/null || true
-        for (( i = 0; i < 10; i++ )); do
-            _wifi_pid_is_ours "$pid" "${base}.conf" || break
-            sleep 0.3
-        done
     fi
-    if _wifi_pid_is_ours "$pid" "${base}.conf"; then
+    for (( i = 0; i < 10; i++ )); do
+        [[ -z "$(_wifi_our_pids "${base}.conf")" ]] && break
+        sleep 0.3
+    done
+    for pid in $(_wifi_our_pids "${base}.conf"); do
         $SUDO kill "$pid" 2>/dev/null || true
-        for (( i = 0; i < 10; i++ )); do
-            _wifi_pid_is_ours "$pid" "${base}.conf" || break
-            sleep 0.3
-        done
-        _wifi_pid_is_ours "$pid" "${base}.conf" && $SUDO kill -9 "$pid" 2>/dev/null
+    done
+    for (( i = 0; i < 10; i++ )); do
+        [[ -z "$(_wifi_our_pids "${base}.conf")" ]] && break
+        sleep 0.3
+    done
+    for pid in $(_wifi_our_pids "${base}.conf"); do
+        $SUDO kill -9 "$pid" 2>/dev/null || true
+    done
+    sleep 0.2
+    left="$(_wifi_our_pids "${base}.conf")"
+    if [[ -n "$left" ]]; then
+        # Keep the records so the next leave/leave_all tries again; the routes-off
+        # .network file stays on the link while the supplicant does.
+        warn "wpa_supplicant for ${base##*/} would not stop (pid ${left//$'\n'/ }) — keeping its records."
+        return 1
     fi
     $SUDO rm -f "${base}.conf" "${base}.pid" "${base}.iface" 2>/dev/null || true
     if _wifi_iface_ok "$iface"; then
