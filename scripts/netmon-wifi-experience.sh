@@ -23,7 +23,10 @@
 # test. For the duration of each profile's battery we install a dedicated policy-
 # routing table (from the Wi-Fi source IP -> default via the Wi-Fi gateway) so the
 # probes actually traverse the joined network, then remove it. The box's real
-# uplink / default route is never touched.
+# uplink / default route is never touched. The joined address's own connected route
+# lives in that table too, never in main (wifi_join's route table): in main it would
+# pull any destination inside the joined subnet that the box reaches over the wired
+# uplink onto the Wi-Fi for as long as the battery runs.
 #
 # Validated live on the verification sensor 2026-06-30 (a PSK SSID): join, DHCP, gateway (from
 # the DHCP `routers` option), source-routed probes, and clean teardown all confirmed.
@@ -96,15 +99,55 @@ _routing_teardown() {
     $SUDO ip route flush table "$RT_TABLE" 2>/dev/null || true
 }
 
+# An address with its prefix length as its network: 10.6.0.89/22 -> 10.6.0.0/22.
+_ip4_net() {
+    local len="${1#*/}" n m
+    [[ "${1:-}" == */* && "$len" =~ ^[0-9]{1,2}$ ]] && (( len >= 1 && len <= 32 )) || return 1
+    [[ "${1%/*}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    for n in "${BASH_REMATCH[@]:1}"; do (( 10#$n <= 255 )) || return 1; done
+    n=$(( (10#${BASH_REMATCH[1]} << 24) | (10#${BASH_REMATCH[2]} << 16) | (10#${BASH_REMATCH[3]} << 8) | 10#${BASH_REMATCH[4]} ))
+    m=$(( (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+    n=$(( n & m ))
+    printf '%d.%d.%d.%d/%d' $(( n >> 24 & 255 )) $(( n >> 16 & 255 )) $(( n >> 8 & 255 )) $(( n & 255 )) "$len"
+}
+
+# Nothing in the main table via the analysis radio. The join already puts its connected
+# route in RT_TABLE; this catches a backend that left it in main anyway (systemd 249
+# falls back to a kernel prefix route when the kernel refuses one in another table).
+# Connected (scope link) routes only — never a default — and never on an uplink.
+_main_table_clear() {
+    local iface="$1" dst i
+    _wifi_is_uplink "$iface" && return 1
+    for (( i = 0; i < 8; i++ )); do
+        dst="$(ip -4 route show table main dev "$iface" scope link 2>/dev/null | awk '$1 != "default" {print $1; exit}')"
+        [[ -z "$dst" ]] && break
+        $SUDO ip -4 route del "$dst" dev "$iface" scope link table main 2>/dev/null || break
+    done
+    [[ -z "$(ip -4 route show table main dev "$iface" 2>/dev/null)" ]]
+}
+
 # Route probe traffic out via the Wi-Fi gateway (so it traverses the joined network,
 # not the wired uplink). Two rules: `from <wifi-ip>` (matches probes bound by source
 # IP) AND `oif <iface>` (matches anything egress-bound to the radio) — belt-and-
-# suspenders since SO_BINDTODEVICE sets the oif but NOT the source IP. Reversible;
-# the box's real default route is untouched.
+# suspenders since SO_BINDTODEVICE sets the oif but NOT the source IP. The joined
+# subnet and the default via its gateway go in RT_TABLE only (onlink: the gateway is
+# on the radio's link whether or not any table holds its subnet). Reversible; the
+# box's real default route is untouched.
+#   args: iface wifi-ip gateway [wifi-ip/prefixlen]
 _routing_setup() {
-    local iface="$1" ip="$2" gw="$3"
+    local iface="$1" ip="$2" gw="$3" net=""
     [[ -z "$ip" || -z "$gw" ]] && return 1
-    $SUDO ip route replace default via "$gw" dev "$iface" table "$RT_TABLE" 2>/dev/null || return 1
+    # First, while a default route via the radio can only mean it is an uplink.
+    if _main_table_clear "$iface"; then
+        printf 'routing: main table has no route via %s\n' "$iface" >&2
+    else
+        printf 'routing: main table still routes via %s: %s\n' "$iface" \
+            "$(ip -4 route show table main dev "$iface" 2>/dev/null | tr '\n' ';')" >&2
+    fi
+    if net="$(_ip4_net "${4:-}")"; then
+        $SUDO ip route replace "$net" dev "$iface" src "$ip" scope link table "$RT_TABLE" 2>/dev/null || return 1
+    fi
+    $SUDO ip route replace default via "$gw" dev "$iface" onlink table "$RT_TABLE" 2>/dev/null || return 1
     $SUDO ip rule add from "$ip" table "$RT_TABLE" prio "$RT_RULE_PRIO" 2>/dev/null || true
     $SUDO ip rule add oif "$iface" table "$RT_TABLE" prio "$((RT_RULE_PRIO + 1))" 2>/dev/null || true
     # The `from <ip>` rule is the one EVERY source-bound probe depends on. If it did
@@ -483,7 +526,7 @@ _run_profile() {
     # 1. Associate (timed).
     local t0 assoc_ms associated=false
     t0="$(_now_ms)"
-    if wifi_join "$iface" "$ssid" "${auth:-open}" "$identity" "$secret" >/dev/null 2>&1; then
+    if wifi_join "$iface" "$ssid" "${auth:-open}" "$identity" "$secret" "$RT_TABLE" >/dev/null 2>&1; then
         associated=true
     fi
     assoc_ms=$(( $(_now_ms) - t0 ))
@@ -519,7 +562,7 @@ _run_profile() {
     local routing_ok=false dns_srv="" dns_via="" measure=true
     if [[ -n "$ip4" && -n "$gw" ]]; then
         local srcip="${ip4%/*}"
-        _routing_setup "$iface" "$srcip" "$gw" && routing_ok=true
+        _routing_setup "$iface" "$srcip" "$gw" "$ip4" && routing_ok=true
         # captive portal (probes bind by SOURCE IP so the `from <ip>` rule routes them
         # via the Wi-Fi gateway; SO_BINDTODEVICE would set oif but not the source IP).
         local cap; cap="$(_captive_probe "$srcip")"
@@ -556,7 +599,7 @@ _run_profile() {
                 # nothing more: a source-bound probe with no policy route would quietly
                 # measure the wired uplink. Dropping the connection is cleanup only.
                 routing_ok=false
-                _routing_setup "$iface" "$srcip" "$gw" && routing_ok=true
+                _routing_setup "$iface" "$srcip" "$gw" "$ip4" && routing_ok=true
                 if $routing_ok; then
                     cap="$(_captive_probe "$srcip")"
                     cap_state="$(printf '%s' "$cap" | cut -f1)"

@@ -100,3 +100,49 @@ def test_network_unit_takes_an_address_and_nothing_else() -> None:
     for line in ("UseGateway=no", "UseRoutes=no", "UseDNS=no", "UseDomains=no", "UseMTU=no", "SendHostname=no",
                  "RequiredForOnline=no", "DNSDefaultRoute=no", "IPv6AcceptRA=no"):
         assert f"{line}\n" in unit, line
+
+
+def test_network_unit_puts_the_connected_route_in_the_given_table() -> None:
+    rc, unit = _call("wifi_networkd_unit_content", "wlo1", "51")
+    assert rc == 0
+    dhcp = unit[unit.index("[DHCPv4]\n"):]
+    assert "RouteTable=51\n" in dhcp and "UseRoutes=no\n" in dhcp
+    assert "RouteTable" not in _call("wifi_networkd_unit_content", "wlo1")[1]
+
+
+def test_nm_keyfile_puts_the_connected_route_in_the_given_table() -> None:
+    rc, kf = _call("wifi_keyfile_content", "wlan0", "Guest", "open", "", "", "51")
+    assert rc == 0
+    ipv4 = kf[kf.index("[ipv4]\n"):kf.index("[ipv6]\n")]
+    assert "route-table=51\n" in ipv4 and "never-default=true\n" in ipv4
+    assert "route-table" not in _call("wifi_keyfile_content", "wlan0", "Guest", "open")[1]
+
+
+@pytest.mark.parametrize("table,ok", [("51", True), ("1", True), ("1000", True), ("253", False), ("254", False),
+                                      ("255", False), ("0", False), ("051", False), ("main", False), ("", False),
+                                      ("51 ", False)])
+def test_route_table_must_be_a_plain_non_reserved_number(table: str, ok: bool) -> None:
+    assert (_call("_wifi_table_ok", table)[0] == 0) is ok
+
+
+def _join_with_table(table: str) -> tuple[int, str]:
+    # Both backends stubbed: only what wifi_join hands them is observed.
+    code = (f'warn() {{ echo "WARN $*"; }}; ok() {{ :; }}; . "{_LIB.as_posix()}"; '
+            '_wifi_backend() { echo "$BACKEND"; }; '
+            '_wifi_join_nm() { echo "NM $*"; }; _wifi_join_networkd() { echo "ND $*"; }; '
+            'wifi_join wlan0 Guest open "" "" "$T"')
+    out_nm = subprocess.run([_bash(), "-c", code], capture_output=True, env=dict(os.environ, T=table, BACKEND="nm"))
+    out_nd = subprocess.run([_bash(), "-c", code], capture_output=True,
+                            env=dict(os.environ, T=table, BACKEND="networkd"))
+    assert out_nm.returncode == out_nd.returncode
+    return out_nm.returncode, out_nm.stdout.decode() + out_nd.stdout.decode()
+
+
+def test_join_passes_the_route_table_to_either_backend() -> None:
+    rc, out = _join_with_table("51")
+    assert rc == 0 and "NM wlan0 Guest open   51\n" in out and "ND wlan0 Guest open   51\n" in out
+
+
+def test_join_refuses_a_reserved_table_before_touching_the_radio() -> None:
+    rc, out = _join_with_table("254")
+    assert rc == 1 and "NM " not in out and "ND " not in out and "WARN" in out

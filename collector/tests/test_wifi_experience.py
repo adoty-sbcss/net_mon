@@ -339,7 +339,7 @@ def test_networkd_reassociate_and_lease_values_come_from_the_supplicant_and_leas
 # rejoin; _routing_setup succeeds for the first SETUP_OK calls only; probe tools log
 # "PROBE ..." so a probe that ran without verified routing is visible.
 _PROFILE_STUBS = (
-    '_now_ms() { echo 0; }\nsleep() { :; }\nwifi_join() { return 0; }\nwifi_leave() { log leave; }\n'
+    'RT_TABLE=51\n_now_ms() { echo 0; }\nsleep() { :; }\nwifi_join() { log "join table=$6"; }\nwifi_leave() { log leave; }\n'
     'current_value() { if [[ "$1" == NETMON_WEBPERF_ENABLED ]]; then printf "%s" "$WEBPERF"; fi; }\n'
     'b64() { cat; }\nWEBPERF_URLS_FILE="$WPFILE"\n'
     'ip() { case "$*" in *"addr show"*) printf "3: wlan0 inet 10.6.0.89/22 brd x scope global\\n";;'
@@ -373,6 +373,7 @@ def _run_profile(setup_ok: int, accept_rc: int = 1, rejoin_opens: bool = True) -
 
 def test_aruba_rejoin_opens_the_portal_and_measures_on_the_new_lease() -> None:
     res, calls = _run_profile(setup_ok=9)
+    assert calls[0] == "join table=51"  # the joined subnet's route goes to the policy table
     # positive control: with routing verified, the optional blocks do run
     assert "PROBE webperf" in calls and any("speed.cloudflare.com/__up" in c for c in calls)
     assert calls.index("accept") < calls.index("rejoin") < calls.index("routing_setup 10.6.3.254", calls.index("rejoin"))
@@ -461,3 +462,90 @@ def test_main_distinguishes_busy_from_unopenable() -> None:
     assert '_take_battery_lock "${NETMON_STATE_DIR:-/var/lib/netmon}/.wifi-experience.lock"' in main
     assert "exec 9>" not in main  # the lock is opened only by the helper
     assert 'not running"; exit 1 ;;' in main  # an unopenable lock is a fault, not "ok"
+
+
+# --- the joined subnet stays out of the main table -----------------------------------
+
+@pytest.mark.parametrize("cidr,net", [("10.6.0.89/22", "10.6.0.0/22"), ("192.168.71.57/24", "192.168.71.0/24"),
+                                      ("10.0.0.5/32", "10.0.0.5/32"), ("010.1.1.1/8", "10.0.0.0/8"),
+                                      ("172.16.5.4/12", "172.16.0.0/12")])
+def test_ip4_net_masks_the_host_bits(cidr: str, net: str) -> None:
+    out, _ = _run_fn("_ip4_net", "", f'_ip4_net "{cidr}"')
+    assert out == net
+
+
+@pytest.mark.parametrize("bad", ["10.6.0.89", "10.6.0.89/33", "10.6.0.89/0", "300.1.1.1/8", "a.b.c.d/8", "", "/24"])
+def test_ip4_net_refuses_what_is_not_an_address_with_a_prefix(bad: str) -> None:
+    out, _ = _run_fn("_ip4_net", "", f'_ip4_net "{bad}" || echo refused')
+    assert out == "refused\n"
+
+
+# `ip` against a main table that holds MAIN_ROUTE (one line per file line) until a
+# delete removes it; DEL_OK=0 makes deletes fail. Every call is logged.
+_ROUTE_STUBS = (
+    'RT_TABLE=51; RT_RULE_PRIO=5100\n'
+    '_wifi_is_uplink() { [[ "$UPLINK" == 1 ]]; }\n'
+    'ip() { log "ip $*"; case "$*" in'
+    ' "-4 route show table main dev wlan0"*) [[ -f "$MAIN" ]] && cat "$MAIN";;'
+    ' "-4 route del "*) [[ "$DEL_OK" == 1 ]] && rm -f "$MAIN"; return;;'
+    ' "rule show") printf "5100:\tfrom 10.6.0.89 lookup 51\n";;'
+    ' esac; return 0; }\n'
+)
+
+
+def _route_fn(name: str, call: str, main_route: str, uplink: bool = False,
+              del_ok: bool = True) -> tuple[str, list[str]]:
+    with tempfile.TemporaryDirectory() as d:
+        main = Path(d) / "main"
+        if main_route:
+            main.write_text(main_route + "\n", encoding="utf-8", newline="\n")
+        stubs = _ROUTE_STUBS + _shipped_fn("_ip4_net") + _shipped_fn("_main_table_clear")
+        return _run_fn(name, stubs, call, MAIN=main.as_posix(), UPLINK="1" if uplink else "0",
+                       DEL_OK="1" if del_ok else "0")
+
+
+_KERNEL_ROUTE = "10.6.0.0/22 proto kernel scope link src 10.6.0.89 metric 600"
+
+
+def test_routing_setup_moves_the_joined_subnet_out_of_main() -> None:
+    out, calls = _route_fn("_routing_setup", '_routing_setup wlan0 10.6.0.89 10.6.3.254 10.6.0.89/22 2>&1; echo "rc=$?"',
+                           _KERNEL_ROUTE)
+    assert out.endswith("rc=0\n") and "routing: main table has no route via wlan0\n" in out
+    deleted = calls.index("ip -4 route del 10.6.0.0/22 dev wlan0 scope link table main")
+    prefix = calls.index("ip route replace 10.6.0.0/22 dev wlan0 src 10.6.0.89 scope link table 51")
+    default = calls.index("ip route replace default via 10.6.3.254 dev wlan0 onlink table 51")
+    assert deleted < prefix < default  # the main table is cleared before anything is installed
+    # nothing is ever added to the main table
+    assert not [c for c in calls if ("replace" in c or " add " in c) and "table 51" not in c and "rule" not in c]
+
+
+def test_routing_setup_with_a_clean_main_table_deletes_nothing() -> None:
+    out, calls = _route_fn("_routing_setup", '_routing_setup wlan0 10.6.0.89 10.6.3.254 10.6.0.89/22 2>&1; echo "rc=$?"',
+                           "")
+    assert out.endswith("rc=0\n") and not [c for c in calls if " del " in c]
+    assert "ip route replace 10.6.0.0/22 dev wlan0 src 10.6.0.89 scope link table 51" in calls
+
+
+def test_main_table_clear_never_touches_an_uplink() -> None:
+    out, calls = _route_fn("_main_table_clear", '_main_table_clear wlan0; echo "rc=$?"', _KERNEL_ROUTE, uplink=True)
+    assert out == "rc=1\n" and not [c for c in calls if c.startswith("ip ")]
+
+
+def test_main_table_clear_leaves_a_default_alone_and_says_so() -> None:
+    out, calls = _route_fn("_main_table_clear", '_main_table_clear wlan0; echo "rc=$?"', "default scope link")
+    assert out == "rc=1\n" and not [c for c in calls if " del " in c]
+
+
+def test_a_route_that_will_not_go_is_reported_and_probing_still_proceeds() -> None:
+    # The leftover is the pre-fix behaviour, not a reason to measure nothing: warn, go on.
+    out, calls = _route_fn("_routing_setup", '_routing_setup wlan0 10.6.0.89 10.6.3.254 10.6.0.89/22 2>&1; echo "rc=$?"',
+                           _KERNEL_ROUTE, del_ok=False)
+    assert out.endswith("rc=0\n") and f"routing: main table still routes via wlan0: {_KERNEL_ROUTE};" in out
+    assert len([c for c in calls if " del " in c]) == 1  # one attempt, no spinning
+
+
+def test_every_battery_join_and_routing_setup_uses_the_policy_table() -> None:
+    prof = _shipped_fn("_run_profile")
+    assert 'wifi_join "$iface" "$ssid" "${auth:-open}" "$identity" "$secret" "$RT_TABLE"' in prof
+    setups = re.findall(r"_routing_setup [^\n]*", prof)
+    assert len(setups) == 2 and all(s.startswith('_routing_setup "$iface" "$srcip" "$gw" "$ip4"') for s in setups)
