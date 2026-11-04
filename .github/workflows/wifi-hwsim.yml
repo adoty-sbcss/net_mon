@@ -1,0 +1,29 @@
+# WIFI-1: join simulated Wi-Fi networks on a systemd-networkd runner (no fleet box is
+# a networkd box we may freely associate). Runs when the join or battery code changes.
+name: Wi-Fi join (simulated radios)
+
+on:
+  pull_request:
+    paths:
+      - lib/wifi.sh
+      - scripts/netmon-wifi-experience.sh
+      - .github/scripts/wifi-hwsim.sh
+      - .github/workflows/wifi-hwsim.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hwsim:
+    name: networkd join + battery (mac80211_hwsim)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install radio simulator + AP tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" hostapd dnsmasq-base wpasupplicant iw
+      - name: Join open / PSK / PEAP and run the battery
+        run: sudo bash .github/scripts/wifi-hwsim.sh

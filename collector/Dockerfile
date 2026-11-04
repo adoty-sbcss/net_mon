@@ -15,7 +15,9 @@ ENV PYTHONUNBUFFERED=1 \
 # - tshark: control-plane capture
 # - iproute2: ip / ss
 # - iputils-ping, traceroute, dnsutils: reachability probes + ad-hoc checks
+# - iw: read-only Wi-Fi radio capabilities at check-in (discovery/wifi_caps.py)
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        iw \
         lldpd \
         arp-scan \
         nmap \

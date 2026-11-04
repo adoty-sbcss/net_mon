@@ -303,45 +303,91 @@ _captive_reassociate() {
     local iface="$1" ssid="$2" conname ip4="" gw="" tries=0
     conname="$(_wifi_conname "$ssid")"
     _routing_teardown "$iface"
-    $SUDO nmcli con down "$conname" >/dev/null 2>&1 || true
-    $SUDO nmcli --wait 25 con up "$conname" >/dev/null 2>&1 || return 1
+    if [[ "$(_wifi_backend 2>/dev/null)" == "networkd" ]]; then
+        wifi_networkd_reassociate "$iface" || return 1
+    else
+        $SUDO nmcli con down "$conname" >/dev/null 2>&1 || true
+        $SUDO nmcli --wait 25 con up "$conname" >/dev/null 2>&1 || return 1
+    fi
     while (( tries < 30 )); do
         ip4="$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4; exit}')"
         [[ -n "$ip4" ]] && break
         sleep 0.5; tries=$((tries+1))
     done
     [[ -z "$ip4" ]] && return 1
-    gw="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null | tr ',' '\n' | grep -E '(^|[[:space:]])routers = ' | sed -n 's/.*routers = \([0-9.]*\).*/\1/p' | head -1)"
-    [[ -z "$gw" ]] && gw="$($SUDO nmcli -g IP4.GATEWAY dev show "$iface" 2>/dev/null | head -1)"
+    gw="$(_lease_gateway "$iface")"
     [[ -z "$gw" ]] && return 1
     printf '%s\t%s' "$ip4" "$gw"
 }
 
-# Signal, BSSID, band and link rate of the in-use AP, as "rssi<TAB>bssid<TAB>band<TAB>
-# rate". nmcli SIGNAL is 0-100 link quality, NOT dBm (the same unit the WIFI-2 survey
-# reports). Both values come from the in-use (*) row; iw is not installed on every box.
-# RATE is the AP's advertised link rate, not the negotiated PHY rate.
+# The joined network's gateway. Routes-off means no default route to read it from: on
+# NM, ignore-auto-routes also empties IP4.GATEWAY, so it comes from the DHCP lease's
+# `routers` option (validated on the verification sensor); on networkd, from the lease
+# file. grep-gate to `routers` at a word boundary so a dhclient box's
+# `requested_routers = 1` option can't be captured as gw="1".
+_lease_gateway() {
+    local iface="$1" gw=""
+    if [[ "$(_wifi_backend 2>/dev/null)" == "networkd" ]]; then
+        wifi_networkd_lease "$iface" ROUTER
+        return 0
+    fi
+    gw="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null | tr ',' '\n' | grep -E '(^|[[:space:]])routers = ' | sed -n 's/.*routers = \([0-9.]*\).*/\1/p' | head -1)"
+    [[ -z "$gw" ]] && gw="$($SUDO nmcli -g IP4.GATEWAY dev show "$iface" 2>/dev/null | head -1)"
+    printf '%s' "$gw"
+}
+
+# The joined network's first DHCP-supplied resolver. `nmcli -g` joins MULTIPLE values
+# with " | " on one line, so a lease handing out two resolvers yields "10.0.0.1 |
+# 10.0.0.2" — passing that whole string as dig's @server silently fails and reads as
+# "this network's DNS is broken". Caught on the verification sensor: the guest SSID
+# has two resolvers and reported a false dns_ok=false. Take the FIRST server only.
+_lease_dns() {
+    local iface="$1" srv=""
+    if [[ "$(_wifi_backend 2>/dev/null)" == "networkd" ]]; then
+        wifi_networkd_lease "$iface" DNS
+        return 0
+    fi
+    srv="$($SUDO nmcli -g IP4.DNS dev show "$iface" 2>/dev/null \
+        | head -1 | tr '|' '\n' | head -1 | tr -d '[:space:]')"
+    [[ -z "$srv" ]] && srv="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null \
+        | tr ',' '\n' | grep -E '(^|[[:space:]])domain_name_servers = ' \
+        | sed -n 's/.*domain_name_servers = \([0-9. ]*\).*/\1/p' | head -1 | awk '{print $1}')"
+    printf '%s' "$srv"
+}
+
+# Signal, BSSID, band, link rate and signal unit of the in-use AP, as "rssi<TAB>bssid
+# <TAB>band<TAB>rate<TAB>unit". nmcli SIGNAL is 0-100 link quality, NOT dBm (the same
+# unit the WIFI-2 survey reports on NM boxes); both values come from the in-use (*) row,
+# and RATE is the AP's advertised link rate. On networkd the supplicant reports dBm and
+# the negotiated rate. iw is not installed on every box, so neither path needs it.
 _link_info() {
-    local iface="$1" rssi="" bssid="" band="" rx_rate="" apline freq
-    rssi="$($SUDO nmcli -t -f IN-USE,SIGNAL,SSID dev wifi list ifname "$iface" 2>/dev/null \
-            | awk -F: '/^\*/{print $2; exit}')"
-    apline="$($SUDO nmcli -t -f IN-USE,BSSID,FREQ,RATE dev wifi list ifname "$iface" 2>/dev/null \
-              | awk '/^\*/{print; exit}')"
-    if [[ -n "$apline" ]]; then
-        # terse mode escapes value-internal colons as '\:'; unescape, then pattern-pull
-        # each piece (MAC / "NNNN MHz" / "NNN Mbit/s") rather than split on ':'. sed, not
-        # ${apline//\\:/:}: that expansion left the "\:" in place on a bash 5.3 build.
-        apline="$(printf '%s' "$apline" | sed 's/[\\]:/:/g')"
-        bssid="$(printf '%s' "$apline" | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)"
-        freq="$(printf '%s' "$apline" | grep -oE '[0-9]{3,5} MHz' | grep -oE '^[0-9]+' | head -1)"
-        rx_rate="$(printf '%s' "$apline" | grep -oE '[0-9]+ Mbit/s' | grep -oE '^[0-9]+' | head -1)"
-        if [[ "$freq" =~ ^[0-9]+$ ]]; then
-            if (( freq < 2500 )); then band="2.4GHz"
-            elif (( freq < 5900 )); then band="5GHz"
-            else band="6GHz"; fi
+    local iface="$1" rssi="" bssid="" band="" rx_rate="" unit="quality" apline freq=""
+    if [[ "$(_wifi_backend 2>/dev/null)" == "networkd" ]]; then
+        unit="dbm"
+        apline="$(wifi_networkd_link "$iface")"
+        rssi="$(printf '%s' "$apline" | cut -f1)"; bssid="$(printf '%s' "$apline" | cut -f2)"
+        freq="$(printf '%s' "$apline" | cut -f3)"; rx_rate="$(printf '%s' "$apline" | cut -f4)"
+    else
+        rssi="$($SUDO nmcli -t -f IN-USE,SIGNAL,SSID dev wifi list ifname "$iface" 2>/dev/null \
+                | awk -F: '/^\*/{print $2; exit}')"
+        apline="$($SUDO nmcli -t -f IN-USE,BSSID,FREQ,RATE dev wifi list ifname "$iface" 2>/dev/null \
+                  | awk '/^\*/{print; exit}')"
+        if [[ -n "$apline" ]]; then
+            # terse mode escapes value-internal colons as '\:'; unescape, then pattern-pull
+            # each piece (MAC / "NNNN MHz" / "NNN Mbit/s") rather than split on ':'. sed, not
+            # ${apline//\\:/:}: that expansion left the "\:" in place on a bash 5.3 build.
+            apline="$(printf '%s' "$apline" | sed 's/[\\]:/:/g')"
+            bssid="$(printf '%s' "$apline" | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)"
+            freq="$(printf '%s' "$apline" | grep -oE '[0-9]{3,5} MHz' | grep -oE '^[0-9]+' | head -1)"
+            rx_rate="$(printf '%s' "$apline" | grep -oE '[0-9]+ Mbit/s' | grep -oE '^[0-9]+' | head -1)"
         fi
     fi
-    printf '%s\t%s\t%s\t%s' "$rssi" "$bssid" "$band" "$rx_rate"
+    if [[ "$freq" =~ ^[0-9]+$ ]]; then
+        if (( freq < 2500 )); then band="2.4GHz"
+        elif (( freq < 5900 )); then band="5GHz"
+        else band="6GHz"; fi
+    fi
+    printf '%s\t%s\t%s\t%s\t%s' "$rssi" "$bssid" "$band" "$rx_rate" "$unit"
 }
 
 # Probe ONE URL's load waterfall source-bound over the Wi-Fi (curl --interface), and
@@ -452,23 +498,18 @@ _run_profile() {
             sleep 0.5; tries=$((tries+1))
         done
         [[ -n "$ip4" ]] && dhcp_ms=$(( $(_now_ms) - d0 ))
-        # Gateway: ignore-auto-routes suppresses IP4.GATEWAY AND installs no default
-        # route, so the gateway comes from the DHCP lease's `routers` option (the
-        # only reliable source on a routes-off connection; validated on the verification sensor).
-        # grep-gate to `routers` at a word boundary so a dhclient box's
-        # `requested_routers = 1` option can't be captured as gw="1".
-        gw="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null | tr ',' '\n' | grep -E '(^|[[:space:]])routers = ' | sed -n 's/.*routers = \([0-9.]*\).*/\1/p' | head -1)"
-        [[ -z "$gw" ]] && gw="$($SUDO nmcli -g IP4.GATEWAY dev show "$iface" 2>/dev/null | head -1)"
+        gw="$(_lease_gateway "$iface")"
     fi
 
-    # 3. Signal quality, and which AP (BSSID), band and link rate the client got: "shoved
-    #    onto 2.4GHz at a low rate" is a real finding, and the BSSID ties the experience
-    #    to a specific AP. Signal is tagged signal_unit="quality" in the artifact.
+    # 3. Signal, and which AP (BSSID), band and link rate the client got: "shoved onto
+    #    2.4GHz at a low rate" is a real finding, and the BSSID ties the experience to a
+    #    specific AP. The artifact's signal_unit says quality (NM) or dbm (networkd).
     # cut, not `IFS=$'\t' read`: tab is IFS-whitespace, so read collapses an empty field.
-    local link rssi bssid band rx_rate
+    local link rssi bssid band rx_rate sig_unit
     link="$(_link_info "$iface")"
     rssi="$(printf '%s' "$link" | cut -f1)"; bssid="$(printf '%s' "$link" | cut -f2)"
     band="$(printf '%s' "$link" | cut -f3)"; rx_rate="$(printf '%s' "$link" | cut -f4)"
+    sig_unit="$(printf '%s' "$link" | cut -f5)"
 
     # 4. Battery (only if we got an IP). Probes traverse the joined net via the
     #    dedicated route table.
@@ -525,7 +566,7 @@ _run_profile() {
                 else
                     measure=false
                     _routing_teardown "$iface"
-                    $SUDO nmcli con down "$(_wifi_conname "$ssid")" >/dev/null 2>&1 || true
+                    wifi_leave "$ssid" >/dev/null 2>&1 || true
                 fi
             fi
         fi
@@ -548,16 +589,7 @@ _run_profile() {
             # battery exists to catch. Ask the DHCP-supplied resolver directly, bound to
             # the Wi-Fi source IP. `dns_via` records which method actually answered, so a
             # fallback can never be mistaken for a real test of the joined resolver.
-            # `nmcli -g` joins MULTIPLE values with " | " on one line, so a lease handing
-            # out two resolvers yields "10.0.0.1 | 10.0.0.2" — passing that whole string as
-            # dig's @server silently fails and reads as "this network's DNS is broken".
-            # Caught on the verification sensor: the guest SSID has two resolvers and reported a false
-            # dns_ok=false. Take the FIRST server only.
-            dns_srv="$($SUDO nmcli -g IP4.DNS dev show "$iface" 2>/dev/null \
-                | head -1 | tr '|' '\n' | head -1 | tr -d '[:space:]')"
-            [[ -z "$dns_srv" ]] && dns_srv="$($SUDO nmcli -g DHCP4.OPTION dev show "$iface" 2>/dev/null \
-                | tr ',' '\n' | grep -E '(^|[[:space:]])domain_name_servers = ' \
-                | sed -n 's/.*domain_name_servers = \([0-9. ]*\).*/\1/p' | head -1 | awk '{print $1}')"
+            dns_srv="$(_lease_dns "$iface")"
             if [[ -n "$dns_srv" ]] && command -v dig >/dev/null 2>&1; then
                 dns_via="dig"
                 [[ -n "$($SUDO dig +short +time=3 +tries=1 -b "$srcip" @"$dns_srv" example.com A 2>/dev/null)" ]] && dns_ok=true
@@ -633,7 +665,7 @@ _run_profile() {
     # 6. Echo the single result object (SSID stripped of control chars + " and \).
     printf '{"ssid":"%s","auth":"%s","associated":%s,"assoc_ms":%s,"dhcp_ms":%s,' \
         "$(printf '%s' "$ssid" | tr -d '\000-\037\042\134')" "${auth:-open}" "$associated" "$assoc_ms" "$dhcp_ms"
-    printf '"ip":"%s","gateway":"%s","signal":%s,"signal_unit":"quality",' "${ip4:-}" "${gw:-}" "${rssi:-null}"
+    printf '"ip":"%s","gateway":"%s","signal":%s,"signal_unit":"%s",' "${ip4:-}" "${gw:-}" "${rssi:-null}" "${sig_unit:-quality}"
     printf '"captive_portal":{"state":"%s","http_code":"%s","redirect_b64":"%s","auto_accepted":%s,"vendor":"%s","rejoined":%s},' \
         "$cap_state" "${cap_code:-}" "$cap_redir_b64" "$cap_accepted" "${cap_vendor:-}" "$cap_rejoined"
     printf '"internet":{"ping_ok":%s,"http_ok":%s,"rtt_ms":"%s","loss_pct":"%s"},' "$ping_ok" "$http_ok" "${rtt:-}" "${loss:-}"

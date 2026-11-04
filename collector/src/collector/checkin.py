@@ -2603,6 +2603,7 @@ def _interfaces() -> list[dict]:
     virtual/container NICs. Best-effort: [] on any failure."""
     try:
         from .discovery import interfaces as iface_mod
+        from .discovery import wifi_caps
 
         primary = iface_mod.primary_interface()
         out: list[dict] = []
@@ -2612,20 +2613,27 @@ def _interfaces() -> list[dict]:
             # From the kernel, not the name: a trunk sub-interface on a long parent
             # is named vlan<id> (lib/trunk.sh vlan_child_name), not <parent>.<id>.
             vlan, _ = iface_mod.vlan_of(st.name)
-            out.append(
-                {
-                    "name": st.name,
-                    "mac": st.mac,
-                    "cidr": st.ipv4_addrs[0] if st.ipv4_addrs else None,
-                    "up": bool(st.is_up),
-                    "vlan": vlan,
-                    "primary": st.name == primary,
-                    # A netdev is wireless iff it has an 802.11 phy. Lets the dashboard
-                    # surface the radio MAC (to authorize on MPSK / MAC-ACLs) + pick the
-                    # analysis radio for the Wi-Fi join config (WIFI-1 / WIFI-6).
-                    "wireless": Path(f"/sys/class/net/{st.name}/phy80211").exists(),
-                }
-            )
+            # A netdev is wireless iff it has an 802.11 phy. Lets the dashboard
+            # surface the radio MAC (to authorize on MPSK / MAC-ACLs) + pick the
+            # analysis radio for the Wi-Fi join config (WIFI-1 / WIFI-6).
+            wireless = Path(f"/sys/class/net/{st.name}/phy80211").exists()
+            entry: dict = {
+                "name": st.name,
+                "mac": st.mac,
+                "cidr": st.ipv4_addrs[0] if st.ipv4_addrs else None,
+                "up": bool(st.is_up),
+                "vlan": vlan,
+                "primary": st.name == primary,
+                "wireless": wireless,
+            }
+            if wireless:
+                # Bands / channels / monitor mode / regulatory domain (WIFI-1). Its
+                # own guard: a failed probe must not cost the interface list.
+                try:
+                    entry["wifi_caps"] = wifi_caps.probe(st.name)
+                except Exception:
+                    entry["wifi_caps"] = None
+            out.append(entry)
         return out
     except Exception:
         return []
