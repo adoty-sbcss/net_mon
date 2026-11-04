@@ -32,5 +32,5 @@ jobs:
               || { uname -r; apt-cache search mac80211 | head; apt-cache search "linux-modules-extra-.*azure" | tail -5; exit 1; }
           fi
           modinfo -F filename mac80211_hwsim
-      - name: Join open / PSK / PEAP and run the battery
+      - name: Join open / PSK / PEAP and run the battery (wired host inside the Wi-Fi subnet)
         run: sudo bash .github/scripts/wifi-hwsim.sh

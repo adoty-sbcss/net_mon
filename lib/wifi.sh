@@ -20,6 +20,14 @@
 # (0600 config under /run, so nothing survives a reboot) plus a runtime .network file
 # that takes DHCP but no gateway, routes or DNS from it — the same routes-off contract.
 #
+# Routes-off still leaves the address's own connected route, in the MAIN table, so a
+# destination inside the joined subnet that the box normally reaches over the wired
+# uplink (a resolver or server that happens to sit in that range) is diverted onto the
+# Wi-Fi. A caller that only needs the radio for its own source-bound probes (the
+# experience battery) passes a route table: the connected route then goes there instead
+# (NM ipv4.route-table and networkd [DHCPv4] RouteTable= both cover the prefix route),
+# and the main table gets nothing from the radio.
+#
 # Source AFTER common.sh, paths.sh, envfile.sh.
 
 [[ -n "${_NETMON_WIFI_SH:-}" ]] && return 0
@@ -43,6 +51,12 @@ _wifi_backend() {
     else
         printf 'networkd'
     fi
+}
+
+# A route table a join may put its connected route in: numeric, and not one of the
+# kernel's reserved tables (253 default, 254 main, 255 local).
+_wifi_table_ok() {
+    [[ "${1:-}" =~ ^[1-9][0-9]{0,8}$ ]] && (( $1 < 253 || $1 > 255 ))
 }
 
 # A stable NM connection-id / keyfile basename for an SSID (filesystem-safe, capped).
@@ -85,11 +99,12 @@ wifi_analysis_iface() {
 # PURE function: emit a NetworkManager keyfile (INI) for one network. No I/O, no
 # secrets-in-argv — unit-testable. The [ipv4] block is the safety contract: a joined
 # analysis network installs NO default route and ignores DHCP-pushed routes, so it
-# cannot become the box's uplink.
-#   args: iface ssid auth identity secret
+# cannot become the box's uplink. With a route table, its connected route goes there
+# too, so the main table gets nothing from the radio.
+#   args: iface ssid auth identity secret [route_table]
 #   auth: open | psk | peap | ttls   (peap/ttls => 802.1X username+password)
 wifi_keyfile_content() {
-    local iface="$1" ssid="$2" auth="$3" identity="${4:-}" secret="${5:-}" conname
+    local iface="$1" ssid="$2" auth="$3" identity="${4:-}" secret="${5:-}" table="${6:-}" conname
     conname="$(_wifi_conname "$ssid")"
     printf '[connection]\n'
     printf 'id=%s\n' "$conname"
@@ -130,6 +145,7 @@ wifi_keyfile_content() {
     printf 'method=auto\n'
     printf 'never-default=true\n'
     printf 'ignore-auto-routes=true\n'
+    [[ -n "$table" ]] && printf 'route-table=%s\n' "$table"
     printf 'may-fail=true\n\n'
     printf '[ipv6]\n'
     printf 'method=ignore\n'
@@ -139,9 +155,9 @@ wifi_keyfile_content() {
 # reloads NM, brings the connection up, and GUARDS the box's uplink: snapshots the
 # default route and reverts the join if the default route disappears. Mirrors
 # lib/trunk.sh _apply_vlan_nmcli. Returns 0 on a usable association.
-#   args: iface ssid auth [identity] [secret]
+#   args: iface ssid auth [identity] [secret] [route_table]
 _wifi_join_nm() {
-    local iface="$1" ssid="$2" auth="$3" identity="${4:-}" secret="${5:-}"
+    local iface="$1" ssid="$2" auth="$3" identity="${4:-}" secret="${5:-}" table="${6:-}"
     command -v nmcli >/dev/null 2>&1 || { warn "nmcli not found — cannot join Wi-Fi on this NM box."; return 1; }
     local conname keyfile before_default after_default tmp
     conname="$(_wifi_conname "$ssid")"
@@ -149,7 +165,7 @@ _wifi_join_nm() {
     before_default="$(ip route show default 2>/dev/null | head -1)"
 
     tmp="$(mktemp)"
-    wifi_keyfile_content "$iface" "$ssid" "$auth" "$identity" "$secret" > "$tmp"
+    wifi_keyfile_content "$iface" "$ssid" "$auth" "$identity" "$secret" "$table" > "$tmp"
     $SUDO install -m 600 -o root -g root "$tmp" "$keyfile"
     rm -f "$tmp"
     $SUDO nmcli con reload >/dev/null 2>&1 || true
@@ -265,10 +281,14 @@ wifi_wpa_conf_content() {
 # PURE function: the runtime .network file. The safety contract is the [DHCPv4] block:
 # a lease gives the radio an address and nothing else — no gateway, no routes (incl.
 # option 121), no DNS or search domains, no MTU — so it cannot become the box's uplink
-# or change how the box resolves names. (The address's own connected route is the one
-# route it does get, as on the NM path.) The box's hostname is not sent either.
+# or change how the box resolves names. The address's own connected route is the one
+# route it does get: in the main table, or in route_table when one is given (networkd
+# then adds the address without a kernel prefix route and installs that route in the
+# table itself — systemd 249 and 255 alike, whatever UseRoutes= says). The box's
+# hostname is not sent either.
+#   args: iface [route_table]
 wifi_networkd_unit_content() {
-    local iface="$1"
+    local iface="$1" table="${2:-}"
     printf '[Match]\nName=%s\n\n' "$iface"
     printf '[Link]\nRequiredForOnline=no\n\n'
     printf '[Network]\n'
@@ -287,6 +307,8 @@ wifi_networkd_unit_content() {
     printf 'UseHostname=no\n'
     printf 'UseMTU=no\n'
     printf 'SendHostname=no\n'
+    [[ -n "$table" ]] && printf 'RouteTable=%s\n' "$table"
+    return 0
 }
 
 # wpa_supplicant + networkctl present? Install wpasupplicant once if not (the same
@@ -407,9 +429,9 @@ _wifi_networkd_stop() {
 # _wifi_join_nm: 0600 secrets, no default route, revert if the uplink's default route
 # disappears. Waits up to 25 s to associate, then up to 15 s for the lease (NM's
 # `con up` covers both, so time-to-associate means the same on either backend).
-#   args: iface ssid auth [identity] [secret]
+#   args: iface ssid auth [identity] [secret] [route_table]
 _wifi_join_networkd() {
-    local iface="$1" ssid="$2" auth="$3" identity="${4:-}" secret="${5:-}"
+    local iface="$1" ssid="$2" auth="$3" identity="${4:-}" secret="${5:-}" table="${6:-}"
     local base before_default after_default tmp i netfile
     _wifi_iface_ok "$iface" || { warn "Wi-Fi join: bad interface name '${iface}'."; return 1; }
     # An explicitly configured iface skips wifi_analysis_iface's choice, so check here,
@@ -437,7 +459,7 @@ _wifi_join_networkd() {
     if ! { $SUDO install -m 600 -o root -g root "$tmp" "${base}.conf" \
             && printf '%s\n' "$iface" > "$tmp" \
             && $SUDO install -m 600 -o root -g root "$tmp" "${base}.iface" \
-            && wifi_networkd_unit_content "$iface" > "$tmp" \
+            && wifi_networkd_unit_content "$iface" "$table" > "$tmp" \
             && $SUDO install -d -m 755 "$NETMON_NETWORKD_RUN_DIR" \
             && $SUDO install -m 644 -o root -g root "$tmp" "$netfile"; }; then
         rm -f "$tmp"
@@ -538,12 +560,18 @@ wifi_networkd_link() {
 # ---------------------------------------------------------------------------------
 # Backend-aware public entry points
 # ---------------------------------------------------------------------------------
+# route_table (optional): keep the joined address's connected route out of the main
+# table (see the header). Without one, the join behaves as it always has.
+#   args: iface ssid auth [identity] [secret] [route_table]
 wifi_join() {
-    local iface="$1" ssid="$2" auth="$3" identity="${4:-}" secret="${5:-}"
+    local iface="$1" ssid="$2" auth="$3" identity="${4:-}" secret="${5:-}" table="${6:-}"
     if [[ -z "$iface" || -z "$ssid" ]]; then warn "wifi_join: need iface + ssid"; return 1; fi
+    if [[ -n "$table" ]] && ! _wifi_table_ok "$table"; then
+        warn "wifi_join: route table '${table}' is not usable — not joining."; return 1
+    fi
     case "$(_wifi_backend)" in
-        nm) _wifi_join_nm "$iface" "$ssid" "$auth" "$identity" "$secret" ;;
-        *)  _wifi_join_networkd "$iface" "$ssid" "$auth" "$identity" "$secret" ;;
+        nm) _wifi_join_nm "$iface" "$ssid" "$auth" "$identity" "$secret" "$table" ;;
+        *)  _wifi_join_networkd "$iface" "$ssid" "$auth" "$identity" "$secret" "$table" ;;
     esac
 }
 
