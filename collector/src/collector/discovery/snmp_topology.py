@@ -746,9 +746,10 @@ def _fold_synthetic_nodes(
 
     Returns the number of placeholder nodes folded away.
     """
+    # No early return when the crawl found no real node: a crawl of gear that never
+    # reports an LLDP chassis id (Meraki) is ALL placeholders, and it is exactly the
+    # crawl rule 4 below exists for. With no real nodes rules 1-3 simply match nothing.
     real_keys = [k for k in nodes if not _SYNTHETIC_KEY.match(k)]
-    if not real_keys:
-        return 0
 
     by_identity: dict[str, list[str]] = {}
     by_name: dict[str, list[str]] = {}
@@ -844,6 +845,8 @@ def _fold_synthetic_nodes(
             remap[key] = target
             fired[key] = rule
 
+    _fold_polled_twins(nodes, by_ip, remap, fired)
+
     if not remap:
         return 0
 
@@ -892,6 +895,69 @@ def _fold_synthetic_nodes(
     edges[:] = kept
 
     return len(remap)
+
+
+def _fold_polled_twins(
+    nodes: dict[str, dict[str, Any]],
+    real_by_ip: dict[str, list[str]],
+    remap: dict[str, str],
+    fired: dict[str, str],
+) -> None:
+    """Rule 4: a `cdp:` placeholder onto the `ip:` node this crawl POLLED at its address.
+
+    Gear that never reports an LLDP chassis id (Meraki, measured on prod 2026-11-04)
+    comes out of a crawl as two placeholders for one box: `ip:<addr>`, because SNMP at
+    <addr> answered with a sysName but no chassis id, and `cdp:<device-id>`, because a
+    neighbour's CDP cache named it and gave <addr> as its address. Rules 1-3 only fold
+    onto REAL nodes, so the pair survived every crawl and became two inventory rows.
+
+    The `ip:` key is minted in exactly one place — the crawl polled that address and
+    the box there answered — so the address is not hearsay on that side. Both
+    observations come from this one crawl, minutes apart, which is the same argument
+    rule 2 makes: the address cannot have changed hands in between.
+
+    Runs AFTER rules 1-3 so it never builds a chain: a target is an `ip:` node that no
+    earlier rule is folding away, and an `ip:` node is never a source here. Refuses:
+      - when any REAL node claims one of the placeholder's addresses. One owner means
+        rules 1-3 already decided; two means a shared virtual address (HSRP/VRRP),
+        which rule 2 refused on purpose and this must not route around;
+      - unless exactly one polled node and exactly one `cdp:` placeholder sit on the
+        address (a warm-spare pair or a stack can advertise one address from two MACs);
+      - when the placeholder also claims an address the polled node does not.
+    """
+    polled_by_ip: dict[str, list[str]] = {}
+    for k in nodes:
+        if not k.lower().startswith("ip:") or k in remap:
+            continue
+        addr = k.split(":", 1)[1].strip()
+        if _usable_mgmt_ip(addr):
+            polled_by_ip.setdefault(addr, []).append(k)
+    if not polled_by_ip:
+        return
+
+    def _usable(n: dict[str, Any]) -> set[str]:
+        return {ip for ip in (n.get("mgmt_ips") or []) if _usable_mgmt_ip(ip)}
+
+    cdp_keys = [k for k in nodes if k.lower().startswith("cdp:") and k not in remap]
+    cdp_by_ip: dict[str, list[str]] = {}
+    for k in cdp_keys:
+        for ip in _usable(nodes[k]):
+            cdp_by_ip.setdefault(ip, []).append(k)
+
+    for key in cdp_keys:
+        mine = _usable(nodes[key])
+        if not mine or any(real_by_ip.get(ip) for ip in mine):
+            continue
+        targets = {t for ip in mine for t in polled_by_ip.get(ip, [])}
+        if len(targets) != 1:
+            continue
+        target = next(iter(targets))
+        if not mine <= _usable(nodes[target]):
+            continue
+        if any(len(cdp_by_ip.get(ip, [])) != 1 for ip in mine):
+            continue
+        remap[key] = target
+        fired[key] = "polled_ip"
 
 
 def _normalize_chassis(raw: str | None) -> str | None:
