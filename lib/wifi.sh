@@ -192,10 +192,19 @@ _wifi_leave_nm() {
 # A netdev name we are willing to put in a file name and a [Match] line.
 _wifi_iface_ok() { [[ "${1:-}" =~ ^[A-Za-z0-9_.-]{1,15}$ ]]; }
 
-# Does this interface carry the box's default route? (Never reconfigure the uplink.)
+# Does this interface carry a default route, IPv4 or IPv6, in any table? (Never
+# reconfigure the uplink, even when it was named explicitly.)
 _wifi_is_uplink() {
-    [[ -n "$(ip route show default dev "$1" 2>/dev/null)" ]]
+    [[ -n "$(ip -4 route show default dev "$1" table all 2>/dev/null)$(ip -6 route show default dev "$1" table all 2>/dev/null)" ]]
 }
+
+_wifi_is_radio() { [[ -e "/sys/class/net/${1}/phy80211" ]]; }
+
+# networkctl only while networkd is already running: the call is D-Bus-activated, so
+# on a box where networkd is enabled but stopped it would START networkd, which would
+# then manage every link any .network file matches.
+_wifi_networkd_running() { systemctl is-active --quiet systemd-networkd 2>/dev/null; }
+_wifi_networkd_reload() { _wifi_networkd_running && $SUDO networkctl reload >/dev/null 2>&1; }
 
 # Lower-case hex of a string, no separators. wpa_supplicant reads an unquoted string
 # value as hex, so SSID / identity / password reach it with no quoting to get wrong.
@@ -220,8 +229,13 @@ wifi_wpa_conf_content() {
             # A raw 64-hex PSK goes in bare; a passphrase must be 8-63 printable ASCII
             # (802.11i), quoted. wpa_supplicant takes everything up to the LAST quote, so
             # a quote inside the passphrase is fine; a newline is not, and is refused here.
+            # So is a '#' anywhere after a quote: the config reader pairs quotes from the
+            # first one and reads a '#' outside a pair as a comment, which would cut the
+            # passphrase short and join with the wrong key.
             if [[ "$secret" =~ ^[0-9A-Fa-f]{64}$ ]]; then
                 printf '\tpsk=%s\n' "$secret"
+            elif [[ "$secret" == *\"*#* ]]; then
+                return 1
             elif [[ "$secret" =~ ^[\ -~]{8,63}$ ]]; then
                 printf '\tpsk="%s"\n' "$secret"
             else
@@ -247,8 +261,9 @@ wifi_wpa_conf_content() {
 
 # PURE function: the runtime .network file. The safety contract is the [DHCPv4] block:
 # a lease gives the radio an address and nothing else — no gateway, no routes (incl.
-# option 121), no DNS or search domains — so it cannot become the box's uplink or
-# change how the box resolves names.
+# option 121), no DNS or search domains, no MTU — so it cannot become the box's uplink
+# or change how the box resolves names. (The address's own connected route is the one
+# route it does get, as on the NM path.) The box's hostname is not sent either.
 wifi_networkd_unit_content() {
     local iface="$1"
     printf '[Match]\nName=%s\n\n' "$iface"
@@ -267,6 +282,8 @@ wifi_networkd_unit_content() {
     printf 'UseDomains=no\n'
     printf 'UseNTP=no\n'
     printf 'UseHostname=no\n'
+    printf 'UseMTU=no\n'
+    printf 'SendHostname=no\n'
 }
 
 # wpa_supplicant + networkctl present? Install wpasupplicant once if not (the same
@@ -274,6 +291,9 @@ wifi_networkd_unit_content() {
 _wifi_networkd_tools() {
     if ! command -v networkctl >/dev/null 2>&1; then
         warn "networkctl not found — cannot join Wi-Fi on this box."; return 1
+    fi
+    if ! _wifi_networkd_running; then
+        warn "neither NetworkManager nor systemd-networkd is running — not joining Wi-Fi."; return 1
     fi
     if ! command -v wpa_supplicant >/dev/null 2>&1 || ! command -v wpa_cli >/dev/null 2>&1; then
         warn "wpa_supplicant not found; attempting one-time install"
@@ -318,25 +338,42 @@ _wifi_wpa_wait_completed() {
     return 1
 }
 
-# Stop one connection's supplicant and remove its files. Only signals the pid if it
-# still names a wpa_supplicant (a stale pidfile must not kill some unrelated process).
-#   args: base (run-dir path without extension)
+# Is <pid> OUR supplicant for this connection (its command line names our config)?
+# A stale pidfile must not kill some unrelated process, nor the box's own supplicant.
+_wifi_pid_is_ours() {
+    local pid="$1" conf="$2"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    tr '\0' '\n' < "/proc/${pid}/cmdline" 2>/dev/null | grep -qxF -- "$conf"
+}
+
+# Stop one connection's supplicant and remove its files. First through our own control
+# socket (only our instance listens there, and it needs no pidfile), then by signal to
+# the recorded pid if that is still ours.
+#   args: base (run-dir path without extension) [iface, if the .iface record is missing]
 _wifi_networkd_stop() {
     local base="$1" iface pid i
     iface="$($SUDO cat "${base}.iface" 2>/dev/null || true)"
+    [[ -z "$iface" ]] && iface="${2:-}"
     pid="$($SUDO cat "${base}.pid" 2>/dev/null || true)"
-    if [[ "$pid" =~ ^[0-9]+$ ]] && [[ "$(cat "/proc/${pid}/comm" 2>/dev/null)" == "wpa_supplicant" ]]; then
-        $SUDO kill "$pid" 2>/dev/null || true
+    if _wifi_iface_ok "$iface"; then
+        _wifi_wpa_cli -i "$iface" terminate >/dev/null || true
         for (( i = 0; i < 10; i++ )); do
-            [[ -e "/proc/${pid}" ]] || break
+            _wifi_pid_is_ours "$pid" "${base}.conf" || break
             sleep 0.3
         done
-        [[ -e "/proc/${pid}" ]] && $SUDO kill -9 "$pid" 2>/dev/null
+    fi
+    if _wifi_pid_is_ours "$pid" "${base}.conf"; then
+        $SUDO kill "$pid" 2>/dev/null || true
+        for (( i = 0; i < 10; i++ )); do
+            _wifi_pid_is_ours "$pid" "${base}.conf" || break
+            sleep 0.3
+        done
+        _wifi_pid_is_ours "$pid" "${base}.conf" && $SUDO kill -9 "$pid" 2>/dev/null
     fi
     $SUDO rm -f "${base}.conf" "${base}.pid" "${base}.iface" 2>/dev/null || true
     if _wifi_iface_ok "$iface"; then
         $SUDO rm -f "$(_wifi_networkd_file "$iface")" 2>/dev/null || true
-        $SUDO networkctl reload >/dev/null 2>&1 || true
+        _wifi_networkd_reload || true
         # Carrier loss already drops the lease; this catches a networkd that kept it.
         # Never on the uplink (an explicitly configured iface could be one).
         _wifi_is_uplink "$iface" || $SUDO ip -4 addr flush dev "$iface" scope global 2>/dev/null || true
@@ -350,43 +387,66 @@ _wifi_networkd_stop() {
 #   args: iface ssid auth [identity] [secret]
 _wifi_join_networkd() {
     local iface="$1" ssid="$2" auth="$3" identity="${4:-}" secret="${5:-}"
-    local base before_default after_default tmp i
+    local base before_default after_default tmp i netfile
     _wifi_iface_ok "$iface" || { warn "Wi-Fi join: bad interface name '${iface}'."; return 1; }
+    # An explicitly configured iface skips wifi_analysis_iface's choice, so check here,
+    # before anything is written: a radio, and not the uplink.
+    _wifi_is_radio "$iface" || { warn "${iface} is not a Wi-Fi radio — not joining."; return 1; }
+    if _wifi_is_uplink "$iface"; then
+        warn "${iface} carries a default route (the uplink) — not joining."; return 1
+    fi
     _wifi_networkd_tools || return 1
     if _wifi_networkd_radio_owned "$iface"; then
         warn "${iface} is driven by this box's own Wi-Fi config — not using it as an analysis radio."; return 1
     fi
     base="${NETMON_WPA_RUN_DIR}/$(_wifi_conname "$ssid")"
+    netfile="$(_wifi_networkd_file "$iface")"
     before_default="$(ip route show default 2>/dev/null | head -1)"
 
     $SUDO install -d -m 700 -o root -g root "$NETMON_WPA_RUN_DIR" || return 1
-    tmp="$(mktemp)"
+    tmp="$(mktemp)" || return 1
     if ! wifi_wpa_conf_content "$ssid" "$auth" "$identity" "$secret" > "$tmp"; then
         rm -f "$tmp"
-        warn "Wi-Fi join: ${auth} credentials for ${ssid} are not usable (a passphrase must be 8-63 printable characters; 802.1X needs a username and password)."
+        warn "Wi-Fi join: ${auth} credentials for ${ssid} are not usable (a passphrase must be 8-63 printable characters, with no '#' after a quote; 802.1X needs a username and password)."
         return 1
     fi
-    $SUDO install -m 600 -o root -g root "$tmp" "${base}.conf"
-    printf '%s\n' "$iface" > "$tmp"
-    $SUDO install -m 600 -o root -g root "$tmp" "${base}.iface"
-    wifi_networkd_unit_content "$iface" > "$tmp"
-    $SUDO install -d -m 755 "$NETMON_NETWORKD_RUN_DIR"
-    $SUDO install -m 644 -o root -g root "$tmp" "$(_wifi_networkd_file "$iface")"
+    # Every step must land; any failure undoes what was written and joins nothing.
+    if ! { $SUDO install -m 600 -o root -g root "$tmp" "${base}.conf" \
+            && printf '%s\n' "$iface" > "$tmp" \
+            && $SUDO install -m 600 -o root -g root "$tmp" "${base}.iface" \
+            && wifi_networkd_unit_content "$iface" > "$tmp" \
+            && $SUDO install -d -m 755 "$NETMON_NETWORKD_RUN_DIR" \
+            && $SUDO install -m 644 -o root -g root "$tmp" "$netfile"; }; then
+        rm -f "$tmp"
+        warn "Wi-Fi join: could not write the join files — not joining ${ssid}."
+        _wifi_networkd_stop "$base" "$iface"; return 1
+    fi
     rm -f "$tmp"
     # reload picks up the new file; reconfigure applies it to a link that had none.
-    if ! $SUDO networkctl reload >/dev/null 2>&1; then
+    if ! _wifi_networkd_reload; then
         warn "networkctl reload failed — not joining ${ssid}."
-        _wifi_networkd_stop "$base"; return 1
+        _wifi_networkd_stop "$base" "$iface"; return 1
     fi
     $SUDO networkctl reconfigure "$iface" >/dev/null 2>&1 || true
+    # Associate only once networkd has put OUR file (the routes-off one) on the link;
+    # anything else matching it (a netplan stanza, a catch-all) could take a gateway.
+    for (( i = 0; i < 20; i++ )); do
+        networkctl status "$iface" --no-pager 2>/dev/null | grep -qF "Network File: ${netfile}" && break
+        sleep 0.5
+    done
+    if ! networkctl status "$iface" --no-pager 2>/dev/null | grep -qF "Network File: ${netfile}"; then
+        warn "networkd did not apply the routes-off config to ${iface} — not joining ${ssid}."
+        _wifi_networkd_stop "$base" "$iface"; return 1
+    fi
+    if command -v rfkill >/dev/null 2>&1; then $SUDO rfkill unblock wifi 2>/dev/null || true; fi
     $SUDO ip link set dev "$iface" up 2>/dev/null || true
     if ! $SUDO wpa_supplicant -B -i "$iface" -c "${base}.conf" -P "${base}.pid" -D nl80211 >/dev/null 2>&1; then
         warn "wpa_supplicant would not start on ${iface}."
-        _wifi_networkd_stop "$base"; return 1
+        _wifi_networkd_stop "$base" "$iface"; return 1
     fi
     if ! _wifi_wpa_wait_completed "$iface" 50; then
         warn "Wi-Fi join did not associate (${ssid}) — auth/range. Leaving it clean."
-        _wifi_networkd_stop "$base"; return 1
+        _wifi_networkd_stop "$base" "$iface"; return 1
     fi
     for (( i = 0; i < 30; i++ )); do
         [[ -n "$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null)" ]] && break
@@ -396,7 +456,7 @@ _wifi_join_networkd() {
     after_default="$(ip route show default 2>/dev/null | head -1)"
     if [[ -n "$before_default" && -z "$after_default" ]] || _wifi_is_uplink "$iface"; then
         warn "default route changed after Wi-Fi join — REVERTING (${ssid})."
-        _wifi_networkd_stop "$base"; return 1
+        _wifi_networkd_stop "$base" "$iface"; return 1
     fi
     ok "joined ${ssid} on ${iface} (routes-off; uplink untouched)"
     return 0
@@ -414,7 +474,7 @@ _wifi_leave_all_networkd() {
     # A .network file whose run-dir record is already gone (killed mid-join).
     if compgen -G "${NETMON_NETWORKD_RUN_DIR}/05-netmon-wifi-*.network" >/dev/null; then
         $SUDO rm -f "${NETMON_NETWORKD_RUN_DIR}"/05-netmon-wifi-*.network 2>/dev/null || true
-        $SUDO networkctl reload >/dev/null 2>&1 || true
+        _wifi_networkd_reload || true
     fi
 }
 

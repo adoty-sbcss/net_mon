@@ -2603,7 +2603,6 @@ def _interfaces() -> list[dict]:
     virtual/container NICs. Best-effort: [] on any failure."""
     try:
         from .discovery import interfaces as iface_mod
-        from .discovery import wifi_caps
 
         primary = iface_mod.primary_interface()
         out: list[dict] = []
@@ -2630,6 +2629,8 @@ def _interfaces() -> list[dict]:
                 # Bands / channels / monitor mode / regulatory domain (WIFI-1). Its
                 # own guard: a failed probe must not cost the interface list.
                 try:
+                    from .discovery import wifi_caps
+
                     entry["wifi_caps"] = wifi_caps.probe(st.name)
                 except Exception:
                     entry["wifi_caps"] = None

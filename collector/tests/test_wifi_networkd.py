@@ -61,7 +61,14 @@ def test_raw_64_hex_psk_goes_in_bare() -> None:
     assert rc == 0 and f"\tpsk={key}\n" in conf
 
 
-@pytest.mark.parametrize("secret", ["short", "x" * 64, "line\nbreak123", "tab\there123", "cafécafé"])
+def test_a_hash_without_an_earlier_quote_stays_in_the_passphrase() -> None:
+    rc, conf = _call("wifi_wpa_conf_content", "Net", "psk", "", "ab#cdefgh")
+    assert rc == 0 and '\tpsk="ab#cdefgh"\n' in conf
+
+
+# 'abcdefgh"#xyz' would be read as psk="abcdefgh" followed by a comment: a wrong key.
+@pytest.mark.parametrize("secret", ["short", "x" * 64, "line\nbreak123", "tab\there123", "cafécafé",
+                                    'abcdefgh"#xyz', 'a"bcdefgh#'])
 def test_unusable_passphrases_are_refused(secret: str) -> None:
     assert _call("wifi_wpa_conf_content", "Net", "psk", "", secret)[0] == 1
 
@@ -90,6 +97,6 @@ def test_network_unit_takes_an_address_and_nothing_else() -> None:
     rc, unit = _call("wifi_networkd_unit_content", "wlo1")
     assert rc == 0
     assert "[Match]\nName=wlo1\n" in unit and "DHCP=ipv4\n" in unit
-    for line in ("UseGateway=no", "UseRoutes=no", "UseDNS=no", "UseDomains=no",
+    for line in ("UseGateway=no", "UseRoutes=no", "UseDNS=no", "UseDomains=no", "UseMTU=no", "SendHostname=no",
                  "RequiredForOnline=no", "DNSDefaultRoute=no", "IPv6AcceptRA=no"):
         assert f"{line}\n" in unit, line

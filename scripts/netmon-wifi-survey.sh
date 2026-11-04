@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # scripts/netmon-wifi-survey.sh — host-side, backend-aware Wi-Fi RF/AP survey (WIFI-2).
 #
-# Why host-side: the collector container ships neither `iw` nor `nmcli`, and on a
+# Why host-side: the collector container has no `nmcli` (its `iw` is only for the
+# read-only capability probe at check-in), and on a
 # NetworkManager-managed box NM OWNS the radio — having the container issue its
 # own scans would contend with NM. (The network backend, networkd vs NM, is the
 # exact thing that breaks wireless/VLAN features — see lib/trunk.sh _vlan_backend.)

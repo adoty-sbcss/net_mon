@@ -63,17 +63,25 @@ for lib in common.sh paths.sh envfile.sh wifi.sh; do
     . "$REPO_DIR/lib/$lib"
 done
 check "backend is networkd" test "$(_wifi_backend)" = networkd
-DEFAULT_BEFORE="$(ip route show default)"
-DNS_BEFORE="$(resolvectl dns 2>/dev/null | grep -v "$STA" || true)"
+# The uplink, compared on its own: its default route and its resolvers. A resolvectl
+# that errors is a failed check, not an empty answer that happens to differ.
+UPLINK="$(ip route show default | awk '{print $5; exit}')"
+uplink_state() {
+    ip route show default dev "$UPLINK"
+    resolvectl dns "$UPLINK" || echo "RESOLVECTL-ERROR"
+}
+UPLINK_BEFORE="$(uplink_state)"
+echo "uplink: $UPLINK"; echo "$UPLINK_BEFORE"
 uplink_untouched() {
-    local d n
-    d="$(ip route show default)"; n="$(resolvectl dns 2>/dev/null | grep -v "$STA" || true)"
-    if [[ "$d" == "$DEFAULT_BEFORE" && "$n" == "$DNS_BEFORE" && -z "$(ip route show default dev "$STA")" ]]; then
+    local now
+    now="$(uplink_state)"
+    if [[ "$now" == "$UPLINK_BEFORE" && -z "$(ip route show default dev "$STA")" ]]; then
         return 0
     fi
-    printf 'default before: %s\ndefault now:    %s\n' "$DEFAULT_BEFORE" "$d"
-    diff <(printf '%s\n' "$DNS_BEFORE") <(printf '%s\n' "$n") || true
+    diff <(printf '%s\n' "$UPLINK_BEFORE") <(printf '%s\n' "$now") || true
     ip route show default dev "$STA" || true
+    networkctl status "$STA" --no-pager || true
+    journalctl -u systemd-networkd --since -5min --no-pager | tail -40 || true
     return 1
 }
 nothing_left() {
@@ -103,6 +111,10 @@ check "leave cleans up everything" nothing_left
 check "wrong PSK does not associate" bash -c "! (for l in common.sh paths.sh envfile.sh wifi.sh; do . '$REPO_DIR/lib/'\$l; done; wifi_join '$STA' 'NetmonTest \"PSK\"' psk '' 'wrong passphrase')"
 check "a failed join leaves nothing behind" nothing_left
 check "unusable passphrase refused before touching the radio" bash -c "! (for l in common.sh paths.sh envfile.sh wifi.sh; do . '$REPO_DIR/lib/'\$l; done; wifi_join '$STA' 'NetmonTest \"PSK\"' psk '' \$'two\\nlines!!')"
+LIBS="for l in common.sh paths.sh envfile.sh wifi.sh; do . '$REPO_DIR/lib/'\$l; done"
+check "the uplink, named explicitly, is refused" bash -c "! ($LIBS; wifi_join '$UPLINK' 'NetmonTest Open' open)"
+check "a non-radio is refused" bash -c "! ($LIBS; wifi_join lo 'NetmonTest Open' open)"
+check "nothing written for a refused interface" bash -c "! compgen -G '/run/systemd/network/05-netmon-wifi-*' >/dev/null"
 check "uplink untouched after failures" uplink_untouched
 
 # --- the real battery over all three networks -------------------------------------
