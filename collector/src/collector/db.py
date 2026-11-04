@@ -732,9 +732,13 @@ def insert_topology(
                         # (existing jsonb column — no migration). Empty when none collected.
                         # PERF-3: the resolved uplink's octet-counter sample rides
                         # alongside as `uplink` (present only on spine-crawled switches).
+                        # INV-8: a polled box's own bridge MAC (only when it gave no LLDP
+                        # chassis id) — what fold rule 4 matched a CDP device-id against,
+                        # kept so the bundle shows why a pair did or did not fold.
                         json.dumps({
                             "interfaces": n.get("interfaces") or {},
                             "uplink": n.get("uplink"),
+                            **({"bridge_mac": n["bridge_mac"]} if n.get("bridge_mac") else {}),
                         }),
                     ),
                 )

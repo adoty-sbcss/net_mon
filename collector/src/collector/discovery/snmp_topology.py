@@ -124,6 +124,7 @@ CDP_CACHE_COLS = {
 DOT1D_TPFDB_PORT       = "1.3.6.1.2.1.17.4.3.1.2"   # dot1dTpFdbPort: MAC-octet suffix -> bridge port
 DOT1D_BASEPORT_IFINDEX = "1.3.6.1.2.1.17.1.4.1.2"   # dot1dBasePortIfIndex: bridgePort -> ifIndex
 DOT1D_STP_ROOT_PORT    = "1.3.6.1.2.1.17.2.7.0"     # dot1dStpRootPort: bridge port toward the STP root
+DOT1D_BASE_BRIDGE_ADDRESS = "1.3.6.1.2.1.17.1.1.0"  # dot1dBaseBridgeAddress: the bridge's own MAC
 
 # CORE-2: per-interface health (MAP-4) + STP port roles (MAP-3). Collected once
 # per POLLED node and stored on the node's `interfaces` map (ifIndex -> health).
@@ -365,10 +366,14 @@ def crawl(
         local_chassis = _normalize_chassis(_snmp_get(ip, community, LLDP_LOC_CHASSIS_ID))
         sys_name = _strip_quotes(_snmp_get(ip, community, SYS_NAME))
         sys_desc = _strip_quotes(_snmp_get(ip, community, SYS_DESCR))
+        bridge_mac: str | None = None
         if not local_chassis:
             # LLDP not enabled here; still record the node keyed by IP so
             # any edges discovered from elsewhere have somewhere to land.
             local_chassis = f"ip:{ip}"
+            # The box's OWN MAC, from the box itself. Fold rule 4 needs it to tell
+            # this box apart from a neighbour that merely advertises its address.
+            bridge_mac = _unicast_mac(_snmp_get(ip, community, DOT1D_BASE_BRIDGE_ADDRESS))
 
         local_caps = _decode_lldp_caps(_snmp_get(ip, community, LLDP_LOC_SYS_CAP_ENABLED))
         node = nodes.setdefault(local_chassis, {
@@ -380,6 +385,8 @@ def crawl(
             "source":             "snmp",
             "capabilities":       local_caps,
         })
+        if bridge_mac and not node.get("bridge_mac"):
+            node["bridge_mac"] = bridge_mac
         if ip not in node["mgmt_ips"]:
             node["mgmt_ips"].append(ip)
         # Fill caps if the node was first seen as an LLDP remote (no local poll).
@@ -746,9 +753,10 @@ def _fold_synthetic_nodes(
 
     Returns the number of placeholder nodes folded away.
     """
+    # No early return when the crawl found no real node: a crawl of gear that never
+    # reports an LLDP chassis id (Meraki) is ALL placeholders, and it is exactly the
+    # crawl rule 4 below exists for. With no real nodes rules 1-3 simply match nothing.
     real_keys = [k for k in nodes if not _SYNTHETIC_KEY.match(k)]
-    if not real_keys:
-        return 0
 
     by_identity: dict[str, list[str]] = {}
     by_name: dict[str, list[str]] = {}
@@ -844,6 +852,8 @@ def _fold_synthetic_nodes(
             remap[key] = target
             fired[key] = rule
 
+    _fold_polled_twins(nodes, by_ip, remap, fired)
+
     if not remap:
         return 0
 
@@ -894,6 +904,79 @@ def _fold_synthetic_nodes(
     return len(remap)
 
 
+def _fold_polled_twins(
+    nodes: dict[str, dict[str, Any]],
+    real_by_ip: dict[str, list[str]],
+    remap: dict[str, str],
+    fired: dict[str, str],
+) -> None:
+    """Rule 4: a `cdp:` placeholder onto the `ip:` node this crawl POLLED at its address.
+
+    Gear that never reports an LLDP chassis id (Meraki, measured on prod 2026-11-04)
+    comes out of a crawl as two placeholders for one box: `ip:<addr>`, because SNMP at
+    <addr> answered with a sysName but no chassis id, and `cdp:<device-id>`, because a
+    neighbour's CDP cache named it and gave <addr> as its address. Rules 1-3 only fold
+    onto REAL nodes, so the pair survived every crawl and became two inventory rows.
+
+    An address is not identity: a neighbour's CDP entry only CLAIMS one, and a phone,
+    a misconfigured box or a hostile one can claim the address of a box we polled.
+    So the fold also needs the polled box to say who it is: when it gave no LLDP
+    chassis id the crawl reads its bridge MAC (dot1dBaseBridgeAddress) from the box
+    itself, and the CDP device-id must BE that MAC (gear of this kind uses its MAC as
+    its CDP device-id). No bridge MAC, or a different one, and the pair is left alone —
+    the dashboard offers it to a person instead.
+
+    Runs AFTER rules 1-3 so it never builds a chain: a target is an `ip:` node that no
+    earlier rule is folding away, and an `ip:` node is never a source here. Refuses:
+      - when any REAL node claims one of the placeholder's addresses. One owner means
+        rules 1-3 already decided; two means a shared virtual address (HSRP/VRRP),
+        which rule 2 refused on purpose and this must not route around;
+      - unless exactly one polled node and exactly one `cdp:` placeholder sit on the
+        address (a warm-spare pair or a stack can advertise one address from two MACs);
+      - when the placeholder also claims an address the polled node does not;
+      - unless the placeholder's device-id is the polled box's own bridge MAC.
+    """
+    polled_by_ip: dict[str, list[str]] = {}
+    for k in nodes:
+        if not k.lower().startswith("ip:") or k in remap:
+            continue
+        addr = k.split(":", 1)[1].strip()
+        if _usable_mgmt_ip(addr):
+            polled_by_ip.setdefault(addr, []).append(k)
+    if not polled_by_ip:
+        return
+
+    def _usable(n: dict[str, Any]) -> set[str]:
+        return {ip for ip in (n.get("mgmt_ips") or []) if _usable_mgmt_ip(ip)}
+
+    # EVERY `cdp:` claimant counts against an address, including one an earlier rule
+    # already folded elsewhere: that claim is still a second box saying it lives here.
+    cdp_by_ip: dict[str, list[str]] = {}
+    for k in nodes:
+        if k.lower().startswith("cdp:"):
+            for ip in _usable(nodes[k]):
+                cdp_by_ip.setdefault(ip, []).append(k)
+
+    for key in [k for k in nodes if k.lower().startswith("cdp:") and k not in remap]:
+        mine = _usable(nodes[key])
+        if not mine or any(real_by_ip.get(ip) for ip in mine):
+            continue
+        targets = {t for ip in mine for t in polled_by_ip.get(ip, [])}
+        if len(targets) != 1:
+            continue
+        target = next(iter(targets))
+        if not mine <= _usable(nodes[target]):
+            continue
+        if any(len(cdp_by_ip.get(ip, [])) != 1 for ip in mine):
+            continue
+        bridge = nodes[target].get("bridge_mac")
+        device_id = key.split(":", 1)[1]
+        if not bridge or _identity_key(device_id) != _identity_key(bridge):
+            continue
+        remap[key] = target
+        fired[key] = "polled_ip"
+
+
 def _normalize_chassis(raw: str | None) -> str | None:
     """Best-effort: present chassis IDs as canonical colon-separated MAC
     when they look like 6 bytes; otherwise the trimmed string."""
@@ -914,6 +997,21 @@ def _normalize_chassis(raw: str | None) -> str | None:
     if len(cleaned) == 12 and all(c in "0123456789abcdefABCDEF" for c in cleaned):
         return ":".join(cleaned[i:i + 2].lower() for i in range(0, 12, 2))
     return v
+
+
+def _unicast_mac(raw: str | None) -> str | None:
+    """A MAC we can treat as one box's identity, canonical colon form, else None.
+
+    Refuses the all-zero / all-ones placeholders some agents return for an unset
+    bridge address, and multicast (low bit of the first octet) — none of those name
+    one device.
+    """
+    mac = _normalize_chassis(raw)
+    if not mac or not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
+        return None
+    if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff") or int(mac[:2], 16) & 1:
+        return None
+    return mac
 
 
 def _normalize_cdp_address(raw: str | None) -> str | None:

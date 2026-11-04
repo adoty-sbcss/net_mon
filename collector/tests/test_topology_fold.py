@@ -8,7 +8,7 @@ which is the kind of outlier a hand-typed fixture smooths away.
 Charter, same as the dashboard matcher: a WRONG fold is worse than a duplicate. Every
 "folds" test is paired with a near-miss that must NOT fold.
 """
-from collector.discovery.snmp_topology import _fold_synthetic_nodes, _identity_key
+from collector.discovery.snmp_topology import _fold_synthetic_nodes, _identity_key, _unicast_mac
 
 
 def node(chassis, *, name=None, descr=None, ips=None, caps=None, source="snmp"):
@@ -243,10 +243,192 @@ def test_a_real_address_still_folds_when_junk_is_also_present():
     assert set(nodes) == {"aa:bb:cc:00:00:01"}
 
 
-def test_a_crawl_with_no_real_nodes_folds_nothing():
+def test_a_lone_placeholder_with_nothing_to_fold_onto_is_kept():
     nodes = {"cdp:a-switch": node("cdp:a-switch", name="a-switch", source="cdp")}
     assert _fold_synthetic_nodes(nodes, []) == 0
     assert len(nodes) == 1
+
+
+# ---------------------------------------------------------------- rule 4: polled twins
+#
+# Shape copied from prod (2026-11-04, Meraki gear, no LLDP chassis id anywhere): the
+# box answers SNMP at its address with a sysName -> `ip:<addr>`; a neighbour's CDP
+# cache names it by its MAC without separators and gives the same address ->
+# `cdp:<12 hex>`. Addresses and names here are generic.
+
+
+def polled(addr, name, bridge=None):
+    n = node(f"ip:{addr}", name=name, ips=[addr])
+    if bridge:
+        n["bridge_mac"] = bridge
+    return n
+
+
+def cdp(device_id, *ips, caps=None):
+    return node(f"cdp:{device_id}", name=device_id, ips=list(ips), source="cdp", caps=caps)
+
+
+def test_polled_twin_folds_in_an_all_placeholder_crawl():
+    """The crawl has NO real node at all — it used to return before looking."""
+    nodes = {
+        "ip:10.20.254.10": polled("10.20.254.10", "bldg-mdf-sw1", bridge="a8:46:9d:00:00:01"),
+        "cdp:a8469d000001": cdp("a8469d000001", "10.20.254.10"),
+    }
+    assert _fold_synthetic_nodes(nodes, []) == 1
+    assert set(nodes) == {"ip:10.20.254.10"}
+    # the polled node keeps the sysName it answered with
+    assert nodes["ip:10.20.254.10"]["system_name"] == "bldg-mdf-sw1"
+
+
+def test_polled_twin_edges_repoint_to_the_polled_node():
+    nodes = {
+        "ip:10.20.254.10": polled("10.20.254.10", "bldg-mdf-sw1", bridge="a8:46:9d:00:00:01"),
+        "ip:10.20.254.11": polled("10.20.254.11", "bldg-idf-sw2"),
+        "cdp:a8469d000001": cdp("a8469d000001", "10.20.254.10"),
+    }
+    edges = [edge("ip:10.20.254.11", "cdp:a8469d000001", via="cdp")]
+    assert _fold_synthetic_nodes(nodes, edges) == 1
+    assert edges[0]["remote_chassis_id"] == "ip:10.20.254.10"
+
+
+def test_polled_twin_fills_caps_the_polled_node_lacks():
+    """Deliberate: fill-only, same as a real keeper. The polled node usually has no
+    LLDP caps, so the neighbour's CDP caps are the only ones there are."""
+    nodes = {
+        "ip:10.20.254.10": polled("10.20.254.10", "bldg-mdf-sw1", bridge="a8:46:9d:00:00:01"),
+        "cdp:a8469d000001": cdp("a8469d000001", "10.20.254.10", caps=["switch"]),
+    }
+    _fold_synthetic_nodes(nodes, [])
+    assert nodes["ip:10.20.254.10"]["capabilities"] == ["switch"]
+
+
+def test_polled_twin_never_folds_when_a_real_node_claims_the_address():
+    """One real owner: rule 2 already folds BOTH placeholders onto it, not onto each other."""
+    nodes = {
+        "aa:bb:cc:00:00:01": node("aa:bb:cc:00:00:01", name="core", ips=["10.20.254.10"]),
+        "ip:10.20.254.10": polled("10.20.254.10", "core"),
+        "cdp:a8469d000001": cdp("a8469d000001", "10.20.254.10"),
+    }
+    assert _fold_synthetic_nodes(nodes, []) == 2
+    assert set(nodes) == {"aa:bb:cc:00:00:01"}
+
+
+def test_polled_twin_never_routes_around_a_shared_virtual_address():
+    """Two real owners (HSRP/VRRP): rule 2 refuses, and rule 4 must refuse too."""
+    nodes = {
+        "aa:bb:cc:00:00:01": node("aa:bb:cc:00:00:01", name="rtr-a", ips=["10.20.0.1"]),
+        "aa:bb:cc:00:00:02": node("aa:bb:cc:00:00:02", name="rtr-b", ips=["10.20.0.1"]),
+        "ip:10.20.0.1": polled("10.20.0.1", "gateway-vip", bridge="a8:46:9d:00:00:01"),
+        "cdp:a8469d000001": cdp("a8469d000001", "10.20.0.1"),
+    }
+    assert _fold_synthetic_nodes(nodes, []) == 0
+    assert "cdp:a8469d000001" in nodes and "ip:10.20.0.1" in nodes
+
+
+def test_two_cdp_placeholders_on_one_polled_address_never_fold():
+    """A warm-spare pair or a stack can advertise one address from two MACs."""
+    nodes = {
+        "ip:10.20.254.1": polled("10.20.254.1", "edge-fw", bridge="0c:7b:c8:00:00:01"),
+        "cdp:0c7bc8000001": cdp("0c7bc8000001", "10.20.254.1"),
+        "cdp:0c7bc8000002": cdp("0c7bc8000002", "10.20.254.1"),
+    }
+    assert _fold_synthetic_nodes(nodes, []) == 0
+    assert len(nodes) == 3
+
+
+def test_polled_twin_never_folds_when_the_placeholder_claims_another_address():
+    nodes = {
+        "ip:10.20.254.10": polled("10.20.254.10", "bldg-mdf-sw1", bridge="a8:46:9d:00:00:01"),
+        "cdp:a8469d000001": cdp("a8469d000001", "10.20.254.10", "10.20.254.99"),
+    }
+    assert _fold_synthetic_nodes(nodes, []) == 0
+    assert len(nodes) == 2
+
+
+def test_polled_twin_never_folds_on_a_junk_address():
+    nodes = {
+        "ip:0.0.0.0": polled("0.0.0.0", "unset", bridge="a8:46:9d:00:00:01"),
+        "cdp:a8469d000001": cdp("a8469d000001", "0.0.0.0"),
+    }
+    assert _fold_synthetic_nodes(nodes, []) == 0
+
+
+def test_a_polled_node_is_never_folded_onto_a_cdp_placeholder():
+    nodes = {
+        "ip:10.20.254.10": polled("10.20.254.10", "bldg-mdf-sw1", bridge="a8:46:9d:00:00:01"),
+        "cdp:a8469d000001": cdp("a8469d000001", "10.20.254.10"),
+    }
+    _fold_synthetic_nodes(nodes, [])
+    assert "ip:10.20.254.10" in nodes and "cdp:a8469d000001" not in nodes
+
+
+def test_polled_twin_never_folds_a_neighbour_that_only_claims_the_address():
+    """An address is a claim, not identity. A phone, a misconfigured box or a hostile
+    one advertising the polled box's address under its OWN device-id must stay a
+    separate node — and must not lend the polled box its capabilities."""
+    nodes = {
+        "ip:10.20.254.10": polled("10.20.254.10", "victim-switch", bridge="a8:46:9d:00:00:01"),
+        "cdp:other-switch": cdp("other-switch", "10.20.254.10", caps=["telephone"]),
+    }
+    assert _fold_synthetic_nodes(nodes, []) == 0
+    assert set(nodes) == {"ip:10.20.254.10", "cdp:other-switch"}
+    assert not nodes["ip:10.20.254.10"]["capabilities"]
+
+
+def test_polled_twin_never_folds_without_the_boxs_own_mac():
+    """A polled box that did not answer dot1dBaseBridgeAddress gives no identity of
+    its own, so the pair is left for a person."""
+    nodes = {
+        "ip:10.20.254.10": polled("10.20.254.10", "bldg-mdf-sw1"),
+        "cdp:a8469d000001": cdp("a8469d000001", "10.20.254.10"),
+    }
+    assert _fold_synthetic_nodes(nodes, []) == 0
+
+
+def test_polled_twin_folds_with_the_mac_in_another_spelling():
+    nodes = {
+        "ip:10.20.254.10": polled("10.20.254.10", "bldg-mdf-sw1", bridge="a8:46:9d:00:00:01"),
+        "cdp:A8 46 9D 00 00 01": cdp("A8 46 9D 00 00 01", "10.20.254.10"),
+    }
+    assert _fold_synthetic_nodes(nodes, []) == 1
+
+
+def test_a_claimant_folded_elsewhere_still_counts_against_the_address():
+    """Codex F2. The first claimant is folded onto a real node by rule 1 (its id is
+    that node's chassis id, and the real node reported no address). It still told us
+    it lives at the polled address, so a second claimant there is ambiguous."""
+    nodes = {
+        "aa:bb:cc:00:00:01": node("aa:bb:cc:00:00:01", name="core"),
+        "ip:10.20.254.10": polled("10.20.254.10", "polled-switch", bridge="a8:46:9d:00:00:01"),
+        "cdp:aabbcc000001": cdp("aabbcc000001", "10.20.254.10"),
+        "cdp:a8469d000001": cdp("a8469d000001", "10.20.254.10"),
+    }
+    _fold_synthetic_nodes(nodes, [])
+    assert "cdp:a8469d000001" in nodes
+
+
+def test_unicast_mac_accepts_a_box_mac_and_refuses_placeholders():
+    assert _unicast_mac("A8 46 9D 32 4A EC") == "a8:46:9d:32:4a:ec"
+    assert _unicast_mac('"0x0C7BC8A01547"') == "0c:7b:c8:a0:15:47"
+    assert _unicast_mac("00 00 00 00 00 00") is None
+    assert _unicast_mac("FF FF FF FF FF FF") is None
+    assert _unicast_mac("01 00 5E 00 00 01") is None  # multicast
+    assert _unicast_mac(None) is None
+    assert _unicast_mac("No Such Object available on this agent at this OID") is None
+
+
+def test_polled_twin_never_targets_a_polled_node_that_is_itself_folded():
+    """No chains. `ip:X` folds onto a real node by rule 1 (its sysName spells the real
+    chassis id, and the real node reported no address), so rule 4 must not aim the
+    `cdp:` placeholder at `ip:X` — the apply loop would look up a key it had popped."""
+    nodes = {
+        "a8:46:9d:00:00:07": node("a8:46:9d:00:00:07", name="bldg-mdf-sw7"),
+        "ip:10.20.254.7": polled("10.20.254.7", "a8469d000007", bridge="f8:9e:28:00:00:07"),
+        "cdp:f89e28000007": cdp("f89e28000007", "10.20.254.7"),
+    }
+    assert _fold_synthetic_nodes(nodes, []) == 1
+    assert "ip:10.20.254.7" not in nodes
+    assert "cdp:f89e28000007" in nodes
 
 
 # ---------------------------------------------------------------- edges
