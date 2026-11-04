@@ -468,7 +468,7 @@ def test_main_distinguishes_busy_from_unopenable() -> None:
 
 @pytest.mark.parametrize("cidr,net", [("10.6.0.89/22", "10.6.0.0/22"), ("192.168.71.57/24", "192.168.71.0/24"),
                                       ("10.0.0.5/32", "10.0.0.5/32"), ("010.1.1.1/8", "10.0.0.0/8"),
-                                      ("172.16.5.4/12", "172.16.0.0/12")])
+                                      ("172.16.5.4/12", "172.16.0.0/12"), ("10.6.0.89/08", "10.0.0.0/8")])
 def test_ip4_net_masks_the_host_bits(cidr: str, net: str) -> None:
     out, _ = _run_fn("_ip4_net", "", f'_ip4_net "{cidr}"')
     assert out == net
@@ -499,7 +499,8 @@ def _route_fn(name: str, call: str, main_route: str, uplink: bool = False,
         main = Path(d) / "main"
         if main_route:
             main.write_text(main_route + "\n", encoding="utf-8", newline="\n")
-        stubs = _ROUTE_STUBS + _shipped_fn("_ip4_net") + _shipped_fn("_main_table_clear")
+        stubs = (_ROUTE_STUBS + _shipped_fn("_ip4_net") + _shipped_fn("_main_table_clear")
+                 + _shipped_fn("_routing_teardown"))
         return _run_fn(name, stubs, call, MAIN=main.as_posix(), UPLINK="1" if uplink else "0",
                        DEL_OK="1" if del_ok else "0")
 
@@ -514,7 +515,8 @@ def test_routing_setup_moves_the_joined_subnet_out_of_main() -> None:
     deleted = calls.index("ip -4 route del 10.6.0.0/22 dev wlan0 scope link table main")
     prefix = calls.index("ip route replace 10.6.0.0/22 dev wlan0 src 10.6.0.89 scope link table 51")
     default = calls.index("ip route replace default via 10.6.3.254 dev wlan0 onlink table 51")
-    assert deleted < prefix < default  # the main table is cleared before anything is installed
+    flushed = calls.index("ip route flush table 51")
+    assert flushed < deleted < prefix < default  # leftovers gone, main cleared, then install
     # nothing is ever added to the main table
     assert not [c for c in calls if ("replace" in c or " add " in c) and "table 51" not in c and "rule" not in c]
 
@@ -522,13 +524,20 @@ def test_routing_setup_moves_the_joined_subnet_out_of_main() -> None:
 def test_routing_setup_with_a_clean_main_table_deletes_nothing() -> None:
     out, calls = _route_fn("_routing_setup", '_routing_setup wlan0 10.6.0.89 10.6.3.254 10.6.0.89/22 2>&1; echo "rc=$?"',
                            "")
-    assert out.endswith("rc=0\n") and not [c for c in calls if " del " in c]
+    assert out.endswith("rc=0\n") and not [c for c in calls if c.startswith("ip -4 route del")]
     assert "ip route replace 10.6.0.0/22 dev wlan0 src 10.6.0.89 scope link table 51" in calls
 
 
 def test_main_table_clear_never_touches_an_uplink() -> None:
     out, calls = _route_fn("_main_table_clear", '_main_table_clear wlan0; echo "rc=$?"', _KERNEL_ROUTE, uplink=True)
-    assert out == "rc=1\n" and not [c for c in calls if c.startswith("ip ")]
+    assert out == "rc=2\n" and not [c for c in calls if c.startswith("ip ")]
+
+
+def test_routing_setup_names_the_uplink_guard_instead_of_an_empty_leftover() -> None:
+    out, calls = _route_fn("_routing_setup", '_routing_setup wlan0 10.6.0.89 10.6.3.254 10.6.0.89/22 2>&1; echo "rc=$?"',
+                           _KERNEL_ROUTE, uplink=True)
+    assert "routing: wlan0 carries a default route — main table left alone\n" in out
+    assert "still routes" not in out and not [c for c in calls if c.startswith("ip -4 route del")]
 
 
 def test_main_table_clear_leaves_a_default_alone_and_says_so() -> None:
@@ -541,7 +550,7 @@ def test_a_route_that_will_not_go_is_reported_and_probing_still_proceeds() -> No
     out, calls = _route_fn("_routing_setup", '_routing_setup wlan0 10.6.0.89 10.6.3.254 10.6.0.89/22 2>&1; echo "rc=$?"',
                            _KERNEL_ROUTE, del_ok=False)
     assert out.endswith("rc=0\n") and f"routing: main table still routes via wlan0: {_KERNEL_ROUTE};" in out
-    assert len([c for c in calls if " del " in c]) == 1  # one attempt, no spinning
+    assert len([c for c in calls if c.startswith("ip -4 route del")]) == 1  # one attempt, no spinning
 
 
 def test_every_battery_join_and_routing_setup_uses_the_policy_table() -> None:

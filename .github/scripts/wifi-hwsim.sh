@@ -18,6 +18,8 @@ FAILS=0
 pass() { printf 'PASS %s\n' "$*"; }
 fail() { printf 'FAIL %s\n' "$*"; FAILS=$((FAILS + 1)); }
 check() { local what="$1"; shift; if "$@"; then pass "$what"; else fail "$what"; fi; }
+# eventually <tries> <cmd...>: retry every 0.5 s (networkd applies routes after the lease).
+eventually() { local n="$1"; shift; while (( n-- > 0 )); do "$@" && return 0; sleep 0.5; done; "$@"; }
 
 systemctl is-active --quiet systemd-networkd || { echo "runner is not a networkd box"; exit 2; }
 if systemctl is-active --quiet NetworkManager; then echo "NetworkManager is running; this test wants networkd"; exit 2; fi
@@ -57,6 +59,11 @@ ap 0 "NetmonTest Open" 71 ""
 ap 1 'NetmonTest "PSK"' 72 $'wpa=2\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\nwpa_passphrase=correct horse "battery"'
 ap 2 "NetmonTest PEAP" 73 "$(printf 'wpa=2\nwpa_key_mgmt=WPA-EAP\nrsn_pairwise=CCMP\nieee8021x=1\neap_server=1\neap_user_file=%s\nca_cert=%s\nserver_cert=%s\nprivate_key=%s' \
     "$WORK/eap_users" "$WORK/server.crt" "$WORK/server.crt" "$WORK/server.key")"
+# An address OFF every AP subnet, answered inside the AP namespace: reaching it from a
+# Wi-Fi source address proves a probe really went out the radio via the battery's
+# default route in table 51 (nothing else routes it).
+ip netns exec "$NS" ip link set lo up
+ip netns exec "$NS" ip addr add 10.71.0.1/32 dev lo
 sleep 3
 
 # --- a wired host inside the open AP's subnet ------------------------------------
@@ -149,12 +156,11 @@ check "leave cleans up everything" nothing_left
 check "join open with route table 51" wifi_join "$STA" "NetmonTest Open" open "" "" 51
 check "lease address on the open AP's subnet (table join)" bash -c "ip -4 -o addr show dev $STA | grep -q 'inet 192.168.71.'"
 ip -4 route show table all dev "$STA" | grep -v '^local \|^broadcast ' || true
-check "networkd put the joined subnet in table 51" bash -c "ip -4 route show table 51 dev $STA | grep -q '^192.168.71.0/24 '"
+check "networkd put the joined subnet in table 51" eventually 20 bash -c "ip -4 route show table 51 dev $STA | grep -q '^192.168.71.0/24 '"
 check "main table has nothing via the radio" main_clear
 check "wired host stays wired while joined" wired_untouched
 check "reassociate (table join)" wifi_networkd_reassociate "$STA"
-sleep 3
-check "lease back in table 51 after reassociate" bash -c "ip -4 route show table 51 dev $STA | grep -q '^192.168.71.0/24 '"
+check "lease back in table 51 after reassociate" eventually 30 bash -c "ip -4 route show table 51 dev $STA | grep -q '^192.168.71.0/24 '"
 check "main table still clear after reassociate" main_clear
 wifi_leave "NetmonTest Open" || true
 check "table join leave cleans up everything" nothing_left
@@ -196,16 +202,26 @@ json.dump([
 PY
 chmod 600 "$STATE/wifi-profiles.json"
 # Sample the wired host's path for as long as the battery runs: one line per sample,
-# "<joined-71> <wired-dev> <wired-ping> <main-table routes via the radio>".
+# "<joined-71> <wired-dev> <wired-ping> <wifi-ping> <main-table routes via the radio>".
+# wifi-ping: while the battery's policy routing is up on the open AP, a ping from the
+# Wi-Fi address to the AP's gateway (on-link, table 51 prefix) and to 10.71.0.1 (off
+# every subnet, table 51 default) both answer; "-" when there was nothing to try.
 # A failed read is recorded as a failing sample, never allowed to end the watcher (set -e).
 watch_wired() {
-    local joined dev ping main
+    local joined dev ping wifi main wip
     while [[ ! -e "$STATE/battery-done" ]]; do
-        joined=0; ip -4 -o addr show dev "$STA" | grep -q 'inet 192.168.71.' && joined=1
+        wip="$(ip -4 -o addr show dev "$STA" | grep -oE 'inet 192\.168\.71\.[0-9]+' | cut -d' ' -f2)" || wip=""
+        joined=0; [[ -n "$wip" ]] && joined=1
         dev="$(wired_dev)" || dev=""
         ping=0; wired_reachable && ping=1
+        wifi=-
+        if [[ -n "$wip" ]] && ip rule show | grep -qE "^5100:[[:space:]]+from ${wip}[[:space:]]"; then
+            wifi=0
+            ping -c 1 -W 1 -I "$wip" 192.168.71.1 >/dev/null 2>&1 \
+                && ping -c 1 -W 1 -I "$wip" 10.71.0.1 >/dev/null 2>&1 && wifi=1
+        fi
         main="$(ip -4 route show table main dev "$STA" | tr ' \n' '_;')" || main="read-error"
-        printf '%s %s %s %s\n' "$joined" "${dev:-none}" "$ping" "${main:-clear}"
+        printf '%s %s %s %s %s\n' "$joined" "${dev:-none}" "$ping" "$wifi" "${main:-clear}"
         sleep 0.3
     done
 }
@@ -228,6 +244,9 @@ check "main table never routed via the radio during the battery" \
     bash -c "! grep -qv ' clear\$' '$STATE/wired-watch.log'"
 check "wired host stayed on the wired link, reachable, during the battery" \
     bash -c "! grep -qv '^[01] vwired 1 ' '$STATE/wired-watch.log'"
+check "probes from the Wi-Fi address crossed the radio during the battery" \
+    test "$(grep -c '^1 [^ ]* [01] 1 ' "$STATE/wired-watch.log")" -ge 1
+# One _routing_setup per network: no captive portal here, so no rejoin (which sets up twice).
 check "battery reported a clear main table for each network" \
     test "$(grep -c '^routing: main table has no route via ' "$STATE/battery.err")" -eq 3
 python3 - "$STATE/wifi_experience.json" <<'PY' || FAILS=$((FAILS + 1))

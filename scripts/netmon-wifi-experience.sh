@@ -102,7 +102,8 @@ _routing_teardown() {
 # An address with its prefix length as its network: 10.6.0.89/22 -> 10.6.0.0/22.
 _ip4_net() {
     local len="${1#*/}" n m
-    [[ "${1:-}" == */* && "$len" =~ ^[0-9]{1,2}$ ]] && (( len >= 1 && len <= 32 )) || return 1
+    [[ "${1:-}" == */* && "$len" =~ ^[0-9]{1,2}$ ]] && (( 10#$len >= 1 && 10#$len <= 32 )) || return 1
+    len=$(( 10#$len ))
     [[ "${1%/*}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
     for n in "${BASH_REMATCH[@]:1}"; do (( 10#$n <= 255 )) || return 1; done
     n=$(( (10#${BASH_REMATCH[1]} << 24) | (10#${BASH_REMATCH[2]} << 16) | (10#${BASH_REMATCH[3]} << 8) | 10#${BASH_REMATCH[4]} ))
@@ -112,12 +113,13 @@ _ip4_net() {
 }
 
 # Nothing in the main table via the analysis radio. The join already puts its connected
-# route in RT_TABLE; this catches a backend that left it in main anyway (systemd 249
-# falls back to a kernel prefix route when the kernel refuses one in another table).
-# Connected (scope link) routes only — never a default — and never on an uplink.
+# route in RT_TABLE; this catches a backend that left it in main anyway (one that did
+# not honour the table). Connected (scope link) routes only — never a default — and
+# never on an uplink. 0 = main is clear, 1 = something stayed, 2 = the radio carries a
+# default route somewhere, so nothing was touched.
 _main_table_clear() {
     local iface="$1" dst i
-    _wifi_is_uplink "$iface" && return 1
+    _wifi_is_uplink "$iface" && return 2
     for (( i = 0; i < 8; i++ )); do
         dst="$(ip -4 route show table main dev "$iface" scope link 2>/dev/null | awk '$1 != "default" {print $1; exit}')"
         [[ -z "$dst" ]] && break
@@ -135,15 +137,19 @@ _main_table_clear() {
 # box's real default route is untouched.
 #   args: iface wifi-ip gateway [wifi-ip/prefixlen]
 _routing_setup() {
-    local iface="$1" ip="$2" gw="$3" net=""
+    local iface="$1" ip="$2" gw="$3" net="" rc=0
     [[ -z "$ip" || -z "$gw" ]] && return 1
-    # First, while a default route via the radio can only mean it is an uplink.
-    if _main_table_clear "$iface"; then
-        printf 'routing: main table has no route via %s\n' "$iface" >&2
-    else
-        printf 'routing: main table still routes via %s: %s\n' "$iface" \
-            "$(ip -4 route show table main dev "$iface" 2>/dev/null | tr '\n' ';')" >&2
-    fi
+    # Start from nothing: a run killed past its trap (SIGKILL) can leave our default
+    # in RT_TABLE, which would read below as the radio being an uplink.
+    _routing_teardown "$iface"
+    # Then, while a default route via the radio can only mean it is an uplink.
+    _main_table_clear "$iface" || rc=$?
+    case "$rc" in
+        0) printf 'routing: main table has no route via %s\n' "$iface" >&2 ;;
+        2) printf 'routing: %s carries a default route — main table left alone\n' "$iface" >&2 ;;
+        *) printf 'routing: main table still routes via %s: %s\n' "$iface" \
+               "$(ip -4 route show table main dev "$iface" 2>/dev/null | tr '\n' ';')" >&2 ;;
+    esac
     if net="$(_ip4_net "${4:-}")"; then
         $SUDO ip route replace "$net" dev "$iface" src "$ip" scope link table "$RT_TABLE" 2>/dev/null || return 1
     fi
