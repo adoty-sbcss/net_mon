@@ -66,9 +66,15 @@ check "backend is networkd" test "$(_wifi_backend)" = networkd
 DEFAULT_BEFORE="$(ip route show default)"
 DNS_BEFORE="$(resolvectl dns 2>/dev/null | grep -v "$STA" || true)"
 uplink_untouched() {
-    [[ "$(ip route show default)" == "$DEFAULT_BEFORE" ]] \
-        && [[ "$(resolvectl dns 2>/dev/null | grep -v "$STA" || true)" == "$DNS_BEFORE" ]] \
-        && [[ -z "$(ip route show default dev "$STA")" ]]
+    local d n
+    d="$(ip route show default)"; n="$(resolvectl dns 2>/dev/null | grep -v "$STA" || true)"
+    if [[ "$d" == "$DEFAULT_BEFORE" && "$n" == "$DNS_BEFORE" && -z "$(ip route show default dev "$STA")" ]]; then
+        return 0
+    fi
+    printf 'default before: %s\ndefault now:    %s\n' "$DEFAULT_BEFORE" "$d"
+    diff <(printf '%s\n' "$DNS_BEFORE") <(printf '%s\n' "$n") || true
+    ip route show default dev "$STA" || true
+    return 1
 }
 nothing_left() {
     [[ -z "$(pgrep -a wpa_supplicant | grep -- "-i *$STA" || true)" ]] \
