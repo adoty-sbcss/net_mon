@@ -416,3 +416,40 @@ def test_pinned_session_ignores_environment_proxies(monkeypatch: pytest.MonkeyPa
     assert s.trust_env is False
     settings = s.merge_environment_settings("https://gm/wapi", {}, None, None, None)
     assert not settings.get("proxies")
+
+
+# ---- review fixes (DHCP-7 round 2) -------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [None, "", "zzzz", "ab" * 31, 42])
+def test_invalid_value_in_pin_file_fails_closed(fake: dict[str, Any], bad: Any) -> None:
+    ib.PINS_FILE.write_text(json.dumps({"10.0.0.5:443": bad}))
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    assert out["code"] == "pin_store_failed" and fake["pinned_with"] is None
+
+
+def test_malformed_pushed_pin_fails_closed(fake: dict[str, Any]) -> None:
+    out = dh._collect_one({**TARGET, "tls_fingerprint": "abcd"}, winrm_timeout=10)
+    assert out["code"] == "pin_store_failed" and fake["pinned_with"] is None
+
+
+def test_a_read_that_hangs_past_the_deadline_is_abandoned(
+    fake: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+    import time as _t
+
+    release = threading.Event()
+
+    class _Slow(_FakeSession):
+        def get(self, *a: Any, **k: Any) -> _Resp:
+            release.wait(5)  # a trickling server: no timeout fires inside the read
+            return super().get(*a, **k)
+
+    fake["session"] = _Slow(GRID)
+    monkeypatch.setattr(ib, "_MAX_TARGET_SECONDS", 0.3)
+    t0 = _t.monotonic()
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    release.set()
+    assert out["code"] == "timeout" and _t.monotonic() - t0 < 3
+    assert fake["session"].closed

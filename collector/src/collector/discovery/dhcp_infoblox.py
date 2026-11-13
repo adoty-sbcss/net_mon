@@ -74,6 +74,7 @@ import ipaddress
 import json
 import os
 import ssl
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -154,7 +155,15 @@ def _load_pins() -> dict[str, str]:
         raise _PinStoreError(f"could not read {PINS_FILE}: {exc}") from exc
     if not isinstance(data, dict):
         raise _PinStoreError(f"{PINS_FILE} is not a JSON object")
-    return {str(k): _norm_fp(v) for k, v in data.items()}
+    pins: dict[str, str] = {}
+    for k, v in data.items():
+        fp = _norm_fp(v) if isinstance(v, str) else ""
+        # Anything but a full SHA-256 is damage, not "no pin": reading it as empty
+        # would trust whatever answers next.
+        if len(fp) != 64:
+            raise _PinStoreError(f"{PINS_FILE} holds an invalid pin for {k!r}")
+        pins[str(k)] = fp
+    return pins
 
 
 def _save_pin(key: str, fp: str) -> None:
@@ -240,10 +249,12 @@ class _Wapi:
             if r.status_code == 403:
                 raise _WapiError("access_denied", f"HTTP 403 on {obj}")
             if r.status_code >= 300:
-                # WAPI's error body names the object/field; it goes to the local log only.
-                raise _WapiError("probe_failed", f"HTTP {r.status_code} on {obj}: {r.text[:300]}")
+                # WAPI's error body names the object/field; it goes to the local log
+                # only, and only its first bytes (one bounded read, not r.text).
+                head = next(r.iter_content(512), b"")
+                raise _WapiError("probe_failed", f"HTTP {r.status_code} on {obj}: {head[:300]!r}")
             body = bytearray()
-            for chunk in r.iter_content(64 * 1024):
+            for chunk in r.iter_content(16 * 1024):
                 body.extend(chunk)
                 if len(body) > _MAX_RESPONSE_BYTES:
                     raise _WapiError("response_too_large", f"over {_MAX_RESPONSE_BYTES} bytes from {obj}")
@@ -577,6 +588,8 @@ def collect_one(
 
     try:
         pushed = _norm_fp(target.get("tls_fingerprint"))
+        if pushed and len(pushed) != 64:
+            raise _PinStoreError("the pushed tls_fingerprint is not a SHA-256")
         expected = pushed or _load_pins().get(pin_key, "")
     except _PinStoreError as exc:
         return _fail(base, "pin_store_failed", transport="wapi", detail=str(exc))
@@ -606,21 +619,43 @@ def collect_one(
     session = _pinned_session(fp, user, password)
     host = f"[{api_host}]" if ":" in api_host else api_host
     wapi = _Wapi(session, f"https://{host}:{port}/wapi/{WAPI_VERSION}", timeout, deadline)
+    # The deadline checks inside _Wapi run between reads; a server trickling bytes
+    # can hold one read open far longer. So the reads run in a worker and this
+    # target ends at the deadline whatever they are doing: the worker's session is
+    # closed and its result, if it ever comes, is dropped. Every read still has its
+    # own socket timeout, so the worker itself always finishes.
+    box: dict[str, Any] = {}
+
+    def _work() -> None:
+        try:
+            box["report"] = collect_wapi(wapi, server_ip)
+        except BaseException as exc:  # noqa: BLE001 — handed back to the caller
+            box["error"] = exc
+
+    worker = threading.Thread(target=_work, name="dhcp-infoblox", daemon=True)
+    worker.start()
+    worker.join(max(0.0, deadline - time.monotonic()) + 1.0)
     try:
-        report = collect_wapi(wapi, server_ip)
-    except _WapiError as exc:
-        entry = _fail(base, exc.code, transport="wapi", detail=exc.detail, secret=password)
-        if exc.code == "cert_changed":
-            entry["tls_fingerprint_seen"] = _safe_observed(api_host, port, timeout)
-        return entry
-    except Exception as exc:  # noqa: BLE001 — never crash the pass
-        return _fail(base, "collect_failed", transport="wapi", detail=str(exc), secret=password)
+        if worker.is_alive():
+            return _fail(base, "timeout", transport="wapi",
+                         detail="time budget used up mid-read; abandoned")
+        exc = box.get("error")
+        if isinstance(exc, _WapiError):
+            entry = _fail(base, exc.code, transport="wapi", detail=exc.detail, secret=password)
+            if exc.code == "cert_changed":
+                left = deadline - time.monotonic()
+                entry["tls_fingerprint_seen"] = (
+                    _safe_observed(api_host, port, min(timeout, left)) if left > 0 else None
+                )
+            return entry
+        if exc is not None:
+            return _fail(base, "collect_failed", transport="wapi", detail=str(exc), secret=password)
+        return {**_ok(base, "wapi", box["report"]), "tls_fingerprint": fp}
     finally:
         try:
             session.close()
         except Exception:  # noqa: BLE001
             pass
-    return {**_ok(base, "wapi", report), "tls_fingerprint": fp}
 
 
 def _safe_observed(host: str, port: int, timeout: float) -> str | None:
