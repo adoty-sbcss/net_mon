@@ -46,16 +46,41 @@ class _Result:
 def _fake_winrm(monkeypatch, *, result=None, raises=None) -> None:
     mod = types.ModuleType("winrm")
 
+    exc_mod = types.ModuleType("winrm.exceptions")
+
+    class WinRMOperationTimeoutError(Exception):
+        pass
+
+    exc_mod.WinRMOperationTimeoutError = WinRMOperationTimeoutError  # type: ignore[attr-defined]
+
+    class Protocol:
+        def open_shell(self):
+            return "s"
+
+        def run_command(self, *a, **k):
+            return "c"
+
+        def send_command_input(self, *a, **k):
+            pass
+
+        def get_command_output_raw(self, *a):
+            return result.std_out, result.std_err, result.status_code, True
+
+        def cleanup_command(self, *a):
+            pass
+
+        def close_shell(self, *a):
+            pass
+
     class Session:
         def __init__(self, endpoint, auth=None, **kwargs):
             if raises is not None:
                 raise raises
-
-        def run_ps(self, script):
-            return result
+            self.protocol = Protocol()
 
     mod.Session = Session  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "winrm", mod)
+    monkeypatch.setitem(sys.modules, "winrm.exceptions", exc_mod)
 
 
 def _fake_rpc(monkeypatch, exc: Exception) -> None:
@@ -90,12 +115,14 @@ def _winrm_exception(monkeypatch):
 
 def _winrm_stderr(monkeypatch):
     monkeypatch.setattr(dh, "_detect_transport", lambda e, t: "ntlm")
+    monkeypatch.setattr(dh, "_rpc_fallback", lambda *a, **k: None)
     _fake_winrm(monkeypatch, result=_Result(std_err=LEAKY.encode(), status_code=1))
     return TARGET
 
 
 def _ps_reported(monkeypatch):
     monkeypatch.setattr(dh, "_detect_transport", lambda e, t: "ntlm")
+    monkeypatch.setattr(dh, "_rpc_fallback", lambda *a, **k: None)
     _fake_winrm(monkeypatch, result=_Result(std_out=json.dumps({"ok": False, "error": LEAKY}).encode()))
     return TARGET
 

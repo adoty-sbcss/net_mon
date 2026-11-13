@@ -23,8 +23,9 @@ dependencies = [
     # Windows DhcpServer PowerShell module remotely. The [kerberos] extra adds
     # Kerberos auth (DHCP-8) for AD servers with NTLM disabled — compiled against
     # libkrb5 in the image; the NTLM path still needs no krb5. Imported only when a
-    # DHCP target is actually collected (feature off by default).
-    "pywinrm[kerberos]>=0.4",
+    # DHCP target is actually collected (feature off by default). 0.5 for
+    # Protocol.get_command_output_raw, which the stdin probe runner drives.
+    "pywinrm[kerberos]>=0.5",
     # MS-DHCPM RPC client for the WinRM/WMI fallback (DHCP-9): reads DHCP scopes /
     # options straight from the DHCP service over its own RPC interface, which
     # authorizes on the DHCP Users group ALONE (no WinRM, no WMI, no admin) — the

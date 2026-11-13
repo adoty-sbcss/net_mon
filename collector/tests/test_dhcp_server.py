@@ -7,6 +7,7 @@ output shaped the way a real Windows DHCP server returns it.
 """
 from __future__ import annotations
 
+import base64
 import json
 import sys
 import types
@@ -73,10 +74,58 @@ class _FakeResult:
         self.status_code = status_code
 
 
-def _install_fake_winrm(monkeypatch, *, result=None, raises=None, capture=None):
+class _OperationTimeout(Exception):
+    """Stands in for winrm.exceptions.WinRMOperationTimeoutError."""
+
+
+class _FakeProtocol:
+    """The slice of winrm.protocol.Protocol the collector drives: one shell, one
+    command, its stdin, then Receive until done. Records what was sent."""
+
+    def __init__(self, result, capture, receives):
+        self.result, self.capture, self.receives = result, capture, receives
+        self.calls: list[str] = []
+
+    def open_shell(self):
+        self.calls.append("open_shell")
+        return "shell-1"
+
+    def run_command(self, shell_id, command, arguments=(), console_mode_stdin=True, skip_cmd_shell=False):
+        self.calls.append("run_command")
+        if self.capture is not None:
+            self.capture["command"] = command
+            self.capture["arguments"] = list(arguments)
+            self.capture["console_mode_stdin"] = console_mode_stdin
+        return "cmd-1"
+
+    def send_command_input(self, shell_id, command_id, stdin_input, end=False):
+        self.calls.append("send_command_input")
+        if self.capture is not None:
+            self.capture["stdin"] = stdin_input
+            self.capture["stdin_end"] = end
+            self.capture["script"] = base64.b64decode(stdin_input).decode("utf-8")
+
+    def get_command_output_raw(self, shell_id, command_id):
+        self.calls.append("receive")
+        if self.receives is not None:
+            return self.receives(self)
+        r = self.result
+        return r.std_out, r.std_err, r.status_code, True
+
+    def cleanup_command(self, shell_id, command_id):
+        self.calls.append("cleanup_command")
+
+    def close_shell(self, shell_id):
+        self.calls.append("close_shell")
+
+
+def _install_fake_winrm(monkeypatch, *, result=None, raises=None, capture=None, receives=None):
     """Register a fake `winrm` module so `import winrm` inside the collector
-    resolves to it. Optionally capture the Session ctor args / run_ps script."""
+    resolves to it. Optionally capture the Session ctor args, the command line and
+    the script sent on stdin. `receives(protocol)` overrides each Receive."""
     mod = types.ModuleType("winrm")
+    exc_mod = types.ModuleType("winrm.exceptions")
+    exc_mod.WinRMOperationTimeoutError = _OperationTimeout  # type: ignore[attr-defined]
 
     class Session:
         def __init__(self, endpoint, auth=None, **kwargs):
@@ -86,14 +135,17 @@ def _install_fake_winrm(monkeypatch, *, result=None, raises=None, capture=None):
                 capture["kwargs"] = kwargs
             if raises is not None:
                 raise raises
-
-        def run_ps(self, script):
+            self.protocol = _FakeProtocol(result, capture, receives)
             if capture is not None:
-                capture["script"] = script
-            return result
+                capture["protocol"] = self.protocol
+
+        def run_ps(self, script):  # pragma: no cover — must never be used again
+            raise AssertionError("run_ps puts the whole probe on one command line")
 
     mod.Session = Session  # type: ignore[attr-defined]
+    mod.exceptions = exc_mod  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "winrm", mod)
+    monkeypatch.setitem(sys.modules, "winrm.exceptions", exc_mod)
 
 
 def test_unsupported_server_type():
@@ -183,6 +235,7 @@ def test_fqdn_endpoint_on_kerberos_path(monkeypatch):
 
 
 def test_ps_reported_error(monkeypatch):
+    monkeypatch.setattr(dh, "_rpc_fallback", lambda *a, **k: None)  # no real RPC attempt
     _install_fake_winrm(
         monkeypatch,
         result=_FakeResult(std_out=json.dumps({"ok": False, "error": (
@@ -197,6 +250,7 @@ def test_ps_reported_error(monkeypatch):
 
 
 def test_nonzero_status_scrubs_password(monkeypatch):
+    monkeypatch.setattr(dh, "_rpc_fallback", lambda *a, **k: None)  # no real RPC attempt
     _install_fake_winrm(monkeypatch, result=_FakeResult(std_err=b"auth failed for p@ss", status_code=1))
     out = dh._collect_one(
         {"server_ip": "10.0.0.10", "server_type": "windows", "winrm_password": "p@ss"},
@@ -209,6 +263,7 @@ def test_nonzero_status_scrubs_password(monkeypatch):
 
 
 def test_connection_error(monkeypatch):
+    monkeypatch.setattr(dh, "_rpc_fallback", lambda *a, **k: None)  # no real RPC attempt
     _install_fake_winrm(monkeypatch, raises=OSError("no route to host"))
     out = dh._collect_one({"server_ip": "10.0.0.10", "server_type": "windows"}, winrm_timeout=30)
     assert out["status"] == "error"
@@ -453,3 +508,139 @@ def test_rpc_kinit_auth_failure_skips_ntlm(monkeypatch):
     assert out["transport"] == "rpc"
     assert out["code"] == "auth_failed"
     assert called["n"] == 0  # NTLM attempt skipped
+
+
+# ---------------------------------------------------------------------------
+# The probe rides stdin, not the command line (DHCP02: "The command line is too
+# long." — cmd.exe's 8191-character limit, which the encoded probe passed).
+# ---------------------------------------------------------------------------
+
+_CMD_EXE_LIMIT = 8191
+_WINDOWS_ONLY = {"server_ip": "10.0.0.10", "server_type": "windows", "transport": "ntlm"}
+
+
+def test_probe_is_sent_on_stdin_and_command_line_stays_short(monkeypatch):
+    cap: dict = {}
+    _install_fake_winrm(monkeypatch, result=_FakeResult(std_out=json.dumps(_SAMPLE).encode()), capture=cap)
+    out = dh._collect_one(dict(_WINDOWS_ONLY), winrm_timeout=30)
+    assert out["status"] == "ok"
+    command_line = " ".join([cap["command"], *cap["arguments"]])
+    assert len(command_line) < 2000 < _CMD_EXE_LIMIT
+    # The bootstrap is what runs, and the probe arrives whole on stdin, which is closed.
+    encoded = cap["arguments"][cap["arguments"].index("-EncodedCommand") + 1]
+    assert base64.b64decode(encoded).decode("utf-16-le") == dh._PS_BOOTSTRAP
+    assert cap["script"] == dh._PS_PROBE
+    assert cap["stdin_end"] is True
+    assert cap["console_mode_stdin"] is False
+    # ASCII on the wire, so the server's console code page cannot alter it.
+    assert isinstance(cap["stdin"], bytes) and cap["stdin"].isascii()
+    assert cap["protocol"].calls[-2:] == ["cleanup_command", "close_shell"]
+
+
+def test_the_old_one_line_form_would_not_fit():
+    # Guards the premise: if the probe ever shrank back under the limit this test
+    # says so, but the stdin path stays correct either way.
+    one_line = "powershell -encodedcommand " + base64.b64encode(dh._PS_PROBE.encode("utf-16-le")).decode()
+    assert len(one_line) > _CMD_EXE_LIMIT
+
+
+def test_probe_waits_through_operation_timeouts(monkeypatch):
+    cap: dict = {}
+    seen = {"n": 0}
+
+    def receives(proto):
+        seen["n"] += 1
+        if seen["n"] < 3:
+            raise _OperationTimeout()
+        return json.dumps(_SAMPLE).encode(), b"", 0, True
+
+    _install_fake_winrm(monkeypatch, result=None, capture=cap, receives=receives)
+    out = dh._collect_one(dict(_WINDOWS_ONLY), winrm_timeout=30)
+    assert out["status"] == "ok"
+    assert seen["n"] == 3
+
+
+def test_probe_output_arriving_in_chunks_is_joined(monkeypatch):
+    body = json.dumps(_SAMPLE).encode()
+    parts = [body[: len(body) // 2], body[len(body) // 2:]]
+
+    def receives(proto):
+        chunk = parts.pop(0)
+        return chunk, b"", (0 if not parts else -1), not parts
+
+    _install_fake_winrm(monkeypatch, result=None, receives=receives)
+    out = dh._collect_one(dict(_WINDOWS_ONLY), winrm_timeout=30)
+    assert out["status"] == "ok"
+    assert len(out["scopes"]) == 2
+
+
+def test_probe_stops_at_the_deadline_and_terminates_the_command(monkeypatch):
+    cap: dict = {}
+
+    def receives(proto):
+        raise _OperationTimeout()  # the server never finishes
+
+    _install_fake_winrm(monkeypatch, result=None, capture=cap, receives=receives)
+    clock = {"t": 1000.0}
+
+    def fake_monotonic():
+        clock["t"] += 10.0
+        return clock["t"]
+
+    monkeypatch.setattr(dh.time, "monotonic", fake_monotonic)
+    out = dh._collect_one(dict(_WINDOWS_ONLY), winrm_timeout=30, deadline=1050.0)
+    assert out["status"] == "error"
+    assert out["code"] == "timeout"
+    assert cap["protocol"].calls[-2:] == ["cleanup_command", "close_shell"]
+
+
+def test_probe_output_over_the_cap_is_too_large(monkeypatch):
+    monkeypatch.setattr(dh, "_MAX_OUTPUT_BYTES", 100)
+
+    def receives(proto):
+        return b"x" * 80, b"", -1, False  # never done; grows past the cap
+
+    _install_fake_winrm(monkeypatch, result=None, receives=receives)
+    out = dh._collect_one(dict(_WINDOWS_ONLY), winrm_timeout=30)
+    assert out["status"] == "error"
+    assert out["code"] == "response_too_large"
+
+
+def test_auto_falls_back_to_rpc_when_the_probe_exits_non_zero(monkeypatch):
+    # The DHCP02 shape: WinRM signed in, the shell refused to run the probe.
+    _install_fake_winrm(monkeypatch, result=_FakeResult(std_err=b"The command line is too long.", status_code=1))
+    state, fb = _fallback_spy()
+    monkeypatch.setattr(dh, "_rpc_fallback", fb)
+    out = dh._collect_one({"server_ip": "10.0.0.10", "server_type": "windows"}, winrm_timeout=30)
+    assert state["calls"] == 1
+    assert out["status"] == "ok" and out["transport"] == "rpc"
+
+
+def test_pinned_transport_keeps_the_probe_failure(monkeypatch):
+    _install_fake_winrm(monkeypatch, result=_FakeResult(std_err=b"The command line is too long.", status_code=1))
+    state, fb = _fallback_spy()
+    monkeypatch.setattr(dh, "_rpc_fallback", fb)
+    out = dh._collect_one(dict(_WINDOWS_ONLY), winrm_timeout=30)
+    assert state["calls"] == 0
+    assert out["code"] == "probe_failed"
+
+
+def test_auto_falls_back_when_the_probe_reports_access_denied(monkeypatch):
+    _install_fake_winrm(monkeypatch, result=_FakeResult(std_out=json.dumps(
+        {"ok": False, "error": "Failed to get statistics for server. Access is denied."}).encode()))
+    state, fb = _fallback_spy()
+    monkeypatch.setattr(dh, "_rpc_fallback", fb)
+    out = dh._collect_one({"server_ip": "10.0.0.10", "server_type": "windows"}, winrm_timeout=30)
+    assert state["calls"] == 1
+    assert out["transport"] == "rpc"
+
+
+def test_probe_credential_rejection_does_not_fall_back(monkeypatch):
+    # Text that reads as a rejected credential never buys another AD logon (SEC-8).
+    _install_fake_winrm(monkeypatch, result=_FakeResult(
+        std_err=b"The user name or password is incorrect. 0xC000006D", status_code=1))
+    state, fb = _fallback_spy()
+    monkeypatch.setattr(dh, "_rpc_fallback", fb)
+    out = dh._collect_one({"server_ip": "10.0.0.10", "server_type": "windows"}, winrm_timeout=30)
+    assert state["calls"] == 0
+    assert out["code"] == "auth_failed"

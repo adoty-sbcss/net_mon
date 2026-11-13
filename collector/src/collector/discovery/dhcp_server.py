@@ -59,6 +59,7 @@ Output (written to INTEL_FILE, shipped box-global in the hourly bundle as
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import time
@@ -304,6 +305,86 @@ try {
 }
 """
 
+# How the probe reaches the server. pywinrm's Session.run_ps puts the WHOLE script
+# on one command line (`powershell -encodedcommand <base64 of UTF-16LE>`), and the
+# WinRM shell runs that through cmd.exe, whose limit is 8191 characters. The probe
+# outgrew it when reservations were added (it encodes to ~11,300), so every server
+# where WinRM sign-in succeeds answered "The command line is too long." before
+# PowerShell started — reported as probe_failed. So the command line carries only
+# this short bootstrap, and the probe rides the command's stdin (the same split
+# Ansible's WinRM connection uses). On the wire it is base64 of UTF-8: plain ASCII,
+# so the server's console code page can't alter it, and FromBase64String skips the
+# line breaks. `$input` is powershell.exe's redirected stdin. The exit code is set
+# explicitly: 1 only when the bootstrap itself fails (its reason on stderr), else 0
+# and the probe's own JSON reports the outcome, as it did on the command line.
+_PS_BOOTSTRAP = (
+    "try { $probe = [Text.Encoding]::UTF8.GetString("
+    "[Convert]::FromBase64String(($input | Out-String)));"
+    " & ([scriptblock]::Create($probe)) }"
+    " catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }; exit 0"
+)
+
+
+class _ProbeTooLarge(Exception):
+    """The server's reply passed _MAX_OUTPUT_BYTES; reading stopped there."""
+
+
+def _run_ps_via_stdin(session: Any, script: str, *, deadline: float) -> tuple[bytes, bytes, int]:
+    """Run `script` on the server and return (stdout, stderr, exit code).
+
+    Unlike Session.run_ps this keeps the command line short (see _PS_BOOTSTRAP) and
+    stops waiting at `deadline` (time.monotonic()): pywinrm's own output loop
+    retries forever while the command runs, which would let one slow server hold
+    the poll tick past the pass budget. Raises TimeoutError at the deadline and
+    _ProbeTooLarge past the output cap; the command is terminated and the shell
+    closed either way."""
+    from winrm.exceptions import WinRMOperationTimeoutError
+
+    proto = session.protocol
+    bootstrap = base64.b64encode(_PS_BOOTSTRAP.encode("utf-16-le")).decode("ascii")
+    payload = base64.encodebytes(script.encode("utf-8"))
+    shell_id = proto.open_shell()
+    try:
+        command_id = proto.run_command(
+            shell_id, "powershell.exe",
+            ["-NoProfile", "-NonInteractive", "-EncodedCommand", bootstrap],
+            console_mode_stdin=False,
+        )
+        try:
+            proto.send_command_input(shell_id, command_id, payload, end=True)
+            out: list[bytes] = []
+            err: list[bytes] = []
+            size = 0
+            while True:
+                if time.monotonic() > deadline:
+                    raise TimeoutError("timed out waiting for the DHCP probe to finish")
+                try:
+                    stdout, stderr, code, done = proto.get_command_output_raw(shell_id, command_id)
+                except WinRMOperationTimeoutError:
+                    continue  # still running; WinRM's long-poll came back empty
+                out.append(stdout)
+                err.append(stderr)
+                size += len(stdout) + len(stderr)
+                if size > _MAX_OUTPUT_BYTES:
+                    raise _ProbeTooLarge()
+                if done:
+                    break
+        finally:
+            try:
+                proto.cleanup_command(shell_id, command_id)  # terminates it if still running
+            except Exception:  # noqa: BLE001 — best effort; keep the real outcome
+                pass
+    finally:
+        try:
+            proto.close_shell(shell_id)
+        except Exception:  # noqa: BLE001
+            pass
+    std_err = b"".join(err)
+    clean = getattr(session, "_clean_error_msg", None)
+    if std_err and callable(clean):
+        std_err = clean(std_err)  # CLIXML error stream -> readable text, as run_ps does
+    return b"".join(out), std_err, int(code)
+
 
 # ---------------------------------------------------------------------------
 # Per-target collection
@@ -393,8 +474,11 @@ def _collect_one(
             operation_timeout_sec=max(5, winrm_timeout - 5),
             read_timeout_sec=winrm_timeout,
         )
-        result = session.run_ps(_PS_PROBE)
-    except Exception as exc:  # connection / auth / transport error
+        probe_deadline = deadline if deadline is not None else time.monotonic() + 120
+        std_out, std_err, status_code = _run_ps_via_stdin(session, _PS_PROBE, deadline=probe_deadline)
+    except _ProbeTooLarge:
+        return _fail(base, "response_too_large", transport=transport)
+    except Exception as exc:  # connection / auth / transport error / deadline
         # On auto, a TRANSPORT failure is not fatal — fall back to RPC. This catches
         # the Kerberos-by-IP case (pywinrm's gssapi needs an FQDN SPN, so an IP target
         # fails at authGSSClientStep; impacket's RPC does Kerberos-by-IP fine) as well
@@ -419,12 +503,19 @@ def _collect_one(
         if ccache:
             _cleanup_ccache(ccache)
 
-    if getattr(result, "status_code", 1) != 0:
-        detail = (result.std_err or b"").decode("utf-8", "replace") or "winrm returned non-zero"
+    if status_code != 0:
+        detail = std_err.decode("utf-8", "replace") or "winrm returned non-zero"
+        # The shell ran but the probe did not. On auto that is a WinRM-side failure
+        # like any other, so try RPC — unless the text is a credential rejection,
+        # which RPC would only repeat as one more failed AD logon.
+        if auto_transport and not _is_auth_failure(detail):
+            fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout)
+            if fb:
+                return fb
         return _fail(base, _classify(detail, "probe_failed"), transport=transport,
                      detail=detail, secret=password)
 
-    raw = result.std_out or b""
+    raw = std_out
     if len(raw) > _MAX_OUTPUT_BYTES:
         return _fail(base, "response_too_large", transport=transport)
     try:
@@ -436,10 +527,11 @@ def _collect_one(
     if not parsed.get("ok"):
         err = _short(str(parsed.get("error") or "DhcpServer probe failed"))
         # Hardened boxes let the WinRM shell in but block non-admin WMI/DCOM
-        # ("Cannot connect to CIM server. Access denied"). The DHCP service's own
-        # RPC has no WMI gate — auto-fall back to it, but only when the operator
-        # left transport on auto (a pinned transport gets the raw WinRM error).
-        if auto_transport and _is_wmi_denied(err):
+        # ("Cannot connect to CIM server. Access denied", or a cmdlet's own
+        # "Access is denied"). The DHCP service's own RPC has no WMI gate and
+        # authorizes on DHCP Users alone, so on auto any non-credential probe
+        # failure tries it (a pinned transport gets the raw WinRM error).
+        if auto_transport and not _is_auth_failure(err):
             fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout)
             if fb:
                 return fb
@@ -452,12 +544,6 @@ def _collect_one(
     # known report fields, and never over the sensor's own). `transport` records
     # which auth actually worked, for the dashboard status line.
     return _ok(base, transport, parsed)
-
-
-def _is_wmi_denied(err: str) -> bool:
-    """True for the hardened-box signature where the WinRM shell ran but the
-    DhcpServer cmdlets couldn't reach WMI/DCOM as a non-admin."""
-    return "cannot connect to cim server" in (err or "").lower()
 
 
 # Credential-rejection signatures (F-COL-9). An AUTHENTICATION failure means every
