@@ -315,14 +315,22 @@ try {
 # Ansible's WinRM connection uses). On the wire it is base64 of UTF-8: plain ASCII,
 # so the server's console code page can't alter it, and FromBase64String skips the
 # line breaks. `$input` is powershell.exe's redirected stdin. The exit code is set
-# explicitly: 1 only when the bootstrap itself fails (its reason on stderr), else 0
-# and the probe's own JSON reports the outcome, as it did on the command line.
+# explicitly: 1 only when the bootstrap itself fails (its reason on stderr through
+# the Write-Error cmdlet, which no language mode blocks), else 0 and the probe's own
+# JSON reports the outcome, as it did on the command line.
 _PS_BOOTSTRAP = (
     "try { $probe = [Text.Encoding]::UTF8.GetString("
     "[Convert]::FromBase64String(($input | Out-String)));"
     " & ([scriptblock]::Create($probe)) }"
-    " catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }; exit 0"
+    ' catch { Write-Error -Message "$_" -ErrorAction Continue; exit 1 }; exit 0'
 )
+
+# How long one server's WinRM probe may run, in units of the WinRM timeout. The
+# probe reads every scope's leases and reservations; on a few hundred scopes that
+# is far longer than one request, but a server that runs past this cap would keep
+# every server after it in the pass from being read (they are reported "skipped",
+# and the dashboard then shows them with no scopes).
+_PROBE_TIMEOUT_FACTOR = 2
 
 
 class _ProbeTooLarge(Exception):
@@ -333,9 +341,12 @@ def _run_ps_via_stdin(session: Any, script: str, *, deadline: float) -> tuple[by
     """Run `script` on the server and return (stdout, stderr, exit code).
 
     Unlike Session.run_ps this keeps the command line short (see _PS_BOOTSTRAP) and
-    stops waiting at `deadline` (time.monotonic()): pywinrm's own output loop
-    retries forever while the command runs, which would let one slow server hold
-    the poll tick past the pass budget. Raises TimeoutError at the deadline and
+    stops waiting once `deadline` (time.monotonic()) has passed: pywinrm's own output
+    loop retries forever while the command runs. At least one Receive always happens,
+    so a late start still reads a fast reply. Each Receive can block for the
+    operation timeout, and terminating the command and closing the shell are
+    requests of their own, so the deadline is a point after which no new wait
+    starts, not a hard stop. Raises TimeoutError past the deadline and
     _ProbeTooLarge past the output cap; the command is terminated and the shell
     closed either way."""
     from winrm.exceptions import WinRMOperationTimeoutError
@@ -343,7 +354,9 @@ def _run_ps_via_stdin(session: Any, script: str, *, deadline: float) -> tuple[by
     proto = session.protocol
     bootstrap = base64.b64encode(_PS_BOOTSTRAP.encode("utf-16-le")).decode("ascii")
     payload = base64.encodebytes(script.encode("utf-8"))
-    shell_id = proto.open_shell()
+    # UTF-8 console, as Ansible opens it, so non-ASCII scope and reservation names
+    # reach the UTF-8 decode below intact instead of through code page 437.
+    shell_id = proto.open_shell(codepage=65001)
     try:
         command_id = proto.run_command(
             shell_id, "powershell.exe",
@@ -351,17 +364,24 @@ def _run_ps_via_stdin(session: Any, script: str, *, deadline: float) -> tuple[by
             console_mode_stdin=False,
         )
         try:
-            proto.send_command_input(shell_id, command_id, payload, end=True)
+            try:
+                proto.send_command_input(shell_id, command_id, payload, end=True)
+            except WinRMOperationTimeoutError:
+                # A busy server can time the Send out yet still take the input
+                # (Ansible's WinRM connection carries on the same way); the Receive
+                # loop below finds out either way.
+                pass
             out: list[bytes] = []
             err: list[bytes] = []
             size = 0
             while True:
-                if time.monotonic() > deadline:
-                    raise TimeoutError("timed out waiting for the DHCP probe to finish")
                 try:
                     stdout, stderr, code, done = proto.get_command_output_raw(shell_id, command_id)
                 except WinRMOperationTimeoutError:
-                    continue  # still running; WinRM's long-poll came back empty
+                    # Still running; WinRM's long-poll came back empty.
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("timed out waiting for the DHCP probe to finish") from None
+                    continue
                 out.append(stdout)
                 err.append(stderr)
                 size += len(stdout) + len(stderr)
@@ -369,6 +389,8 @@ def _run_ps_via_stdin(session: Any, script: str, *, deadline: float) -> tuple[by
                     raise _ProbeTooLarge()
                 if done:
                     break
+                if time.monotonic() > deadline:
+                    raise TimeoutError("timed out waiting for the DHCP probe to finish")
         finally:
             try:
                 proto.cleanup_command(shell_id, command_id)  # terminates it if still running
@@ -459,7 +481,8 @@ def _collect_one(
             # Only a NON-credential kinit failure (no realm, clock skew, KDC down)
             # is worth falling back for.
             if auto_transport and not _is_auth_failure(reason):
-                fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout)
+                fb = _fallback_to_rpc(base, reason, ip=ip, user=user, password=password,
+                                      winrm_timeout=winrm_timeout, deadline=deadline)
                 if fb:
                     return fb
             return _fail(base, _classify(reason, "kerberos_failed"), transport="kerberos",
@@ -474,7 +497,10 @@ def _collect_one(
             operation_timeout_sec=max(5, winrm_timeout - 5),
             read_timeout_sec=winrm_timeout,
         )
-        probe_deadline = deadline if deadline is not None else time.monotonic() + 120
+        # This server's own cap, inside what is left of the pass.
+        probe_deadline = time.monotonic() + _PROBE_TIMEOUT_FACTOR * winrm_timeout
+        if deadline is not None:
+            probe_deadline = min(probe_deadline, deadline)
         std_out, std_err, status_code = _run_ps_via_stdin(session, _PS_PROBE, deadline=probe_deadline)
     except _ProbeTooLarge:
         return _fail(base, "response_too_large", transport=transport)
@@ -491,12 +517,12 @@ def _collect_one(
         # rejects the same credential, so falling back just burns another AD logon
         # (~3/cycle trips lockout). Fail fast on an auth failure; keep the fallback
         # only for genuine transport errors.
-        auth_failed = _is_auth_failure(f"{type(exc).__name__}: {exc}")
-        if auto_transport and not auth_failed:
-            fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout)
+        detail = f"{type(exc).__name__}: {exc}"
+        if auto_transport and not _is_auth_failure(detail):
+            fb = _fallback_to_rpc(base, detail, ip=ip, user=user, password=password,
+                                  winrm_timeout=winrm_timeout, deadline=deadline)
             if fb:
                 return fb
-        detail = f"{type(exc).__name__}: {exc}"
         return _fail(base, _classify(detail, "collect_failed"), transport=transport,
                      detail=detail, secret=password)
     finally:
@@ -509,7 +535,8 @@ def _collect_one(
         # like any other, so try RPC — unless the text is a credential rejection,
         # which RPC would only repeat as one more failed AD logon.
         if auto_transport and not _is_auth_failure(detail):
-            fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout)
+            fb = _fallback_to_rpc(base, detail, ip=ip, user=user, password=password,
+                                  winrm_timeout=winrm_timeout, deadline=deadline)
             if fb:
                 return fb
         return _fail(base, _classify(detail, "probe_failed"), transport=transport,
@@ -524,15 +551,22 @@ def _collect_one(
         return _fail(base, "response_unparseable", transport=transport,
                      detail=f"unparseable server response: {exc}", secret=password)
 
+    if not isinstance(parsed, dict):
+        # A bare list or string would otherwise raise below and lose the whole pass.
+        return _fail(base, "response_unparseable", transport=transport,
+                     detail=f"server response is a JSON {type(parsed).__name__}, not an object")
+
     if not parsed.get("ok"):
-        err = _short(str(parsed.get("error") or "DhcpServer probe failed"))
+        # The whole message is tested; _fail shortens it for the log.
+        err = str(parsed.get("error") or "DhcpServer probe failed")
         # Hardened boxes let the WinRM shell in but block non-admin WMI/DCOM
         # ("Cannot connect to CIM server. Access denied", or a cmdlet's own
         # "Access is denied"). The DHCP service's own RPC has no WMI gate and
         # authorizes on DHCP Users alone, so on auto any non-credential probe
         # failure tries it (a pinned transport gets the raw WinRM error).
         if auto_transport and not _is_auth_failure(err):
-            fb = _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout)
+            fb = _fallback_to_rpc(base, err, ip=ip, user=user, password=password,
+                                  winrm_timeout=winrm_timeout, deadline=deadline)
             if fb:
                 return fb
         # `err` is the server's own exception message — server-authored text, so
@@ -566,6 +600,9 @@ _AUTH_FAILURE_SIGNS: tuple[str, ...] = (
     # must still fall back to RPC.
     "preauth",
     "password incorrect",
+    # Windows ERROR_LOGON_FAILURE, as a server-side command reports it.
+    "the user name or password is incorrect",
+    "unknown user name or bad password",
     "password has expired",
     # NTLM / impacket (NTSTATUS on a bad or unusable credential).
     "status_logon_failure",         # 0xC000006D bad username/password
@@ -590,6 +627,24 @@ def _is_auth_failure(text: str) -> bool:
     back. See _AUTH_FAILURE_SIGNS for the exclusions."""
     low = (text or "").lower()
     return any(sign in low for sign in _AUTH_FAILURE_SIGNS)
+
+
+def _fallback_to_rpc(
+    base: dict[str, Any], reason: str, *, ip: str, user: str, password: str,
+    winrm_timeout: int, deadline: float | None,
+) -> dict[str, Any] | None:
+    """Auto mode's step from a failed WinRM attempt to RPC. Logs why WinRM failed
+    first (a successful fallback otherwise leaves no trace of it, which is how a
+    WinRM failure on every server went unseen) and does not start once the pass
+    budget is spent."""
+    code = _classify(reason, "probe_failed")
+    if deadline is not None and time.monotonic() >= deadline:
+        log.warning("dhcp intel winrm failed; pass budget spent, rpc not tried",
+                    server=ip, code=code, detail=_short(_scrub(reason, password)))
+        return None
+    log.info("dhcp intel winrm failed; trying rpc",
+             server=ip, code=code, detail=_short(_scrub(reason, password)))
+    return _rpc_fallback(base, ip=ip, user=user, password=password, winrm_timeout=winrm_timeout)
 
 
 def _rpc_fallback(

@@ -54,7 +54,7 @@ def _fake_winrm(monkeypatch, *, result=None, raises=None) -> None:
     exc_mod.WinRMOperationTimeoutError = WinRMOperationTimeoutError  # type: ignore[attr-defined]
 
     class Protocol:
-        def open_shell(self):
+        def open_shell(self, **_k):
             return "s"
 
         def run_command(self, *a, **k):
