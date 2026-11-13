@@ -521,14 +521,14 @@ def collect_wapi(wapi: _Wapi, server_ip: str) -> dict[str, Any]:
         if leases_known:
             for fa in sorted(resv, key=lambda x: _ip_key(str(x.get("ipv4addr")))):
                 ip = str(fa.get("ipv4addr") or "")
-                le = lease_by_addr.get((view, ip))
+                held = lease_by_addr.get((view, ip))
                 reservations.append({
                     "ip": ip,
                     "mac": _mac(fa.get("mac")) if fa.get("match_client") in (None, "MAC_ADDRESS") else "",
                     "name": str(fa.get("name") or ""),
-                    "active": le is not None,
-                    "client_mac": _mac(le.get("hardware")) if le else "",
-                    "lease_expiry": _iso(le.get("ends")) if le else None,
+                    "active": held is not None,
+                    "client_mac": _mac(held.get("hardware")) if held else "",
+                    "lease_expiry": _iso(held.get("ends")) if held else None,
                     "bad_address": False,
                 })
         scopes.append({
@@ -673,17 +673,17 @@ def collect_one(
         if worker.is_alive():
             return _fail(base, "timeout", transport="wapi",
                          detail="time budget used up mid-read; abandoned")
-        exc = box.get("error")
-        if isinstance(exc, _WapiError):
-            entry = _fail(base, exc.code, transport="wapi", detail=exc.detail, secret=password)
-            if exc.code == "cert_changed":
+        err = box.get("error")
+        if isinstance(err, _WapiError):
+            entry = _fail(base, err.code, transport="wapi", detail=err.detail, secret=password)
+            if err.code == "cert_changed":
                 left = deadline - time.monotonic()
                 entry["tls_fingerprint_seen"] = (
                     _safe_observed(api_host, port, min(timeout, left)) if left > 0 else None
                 )
             return entry
-        if exc is not None:
-            return _fail(base, "collect_failed", transport="wapi", detail=str(exc), secret=password)
+        if err is not None:
+            return _fail(base, "collect_failed", transport="wapi", detail=str(err), secret=password)
         return {**_ok(base, "wapi", box["report"]), "tls_fingerprint": fp}
     finally:
         try:
