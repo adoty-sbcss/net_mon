@@ -105,6 +105,11 @@ _ERROR_TEXT: dict[str, str] = {
     "member_not_found": (
         "The Infoblox grid answered, but this address is not one of its DHCP members."
     ),
+    "service_disabled": "The Infoblox member's DHCP service is turned off.",
+    "pin_store_failed": (
+        "The sensor could not read or save its record of trusted certificates, so it "
+        "did not connect."
+    ),
     "cert_changed": (
         "The server's certificate changed since it was first trusted. Check the new "
         "fingerprint, then trust it in Settings."
@@ -123,7 +128,8 @@ _ERROR_TEXT: dict[str, str] = {
         "Use the RPC transport, or grant the account WMI access."
     ),
     "access_denied": (
-        "Signed in, but access was denied. Check the account is in the DHCP Users group."
+        "Signed in, but access was denied. Check the account's read permission (on "
+        "Windows: membership of the DHCP Users group)."
     ),
     "timeout": "The server did not answer in time.",
     "tls_failed": "The TLS connection to the server could not be established.",
@@ -304,7 +310,9 @@ try {
 # ---------------------------------------------------------------------------
 
 
-def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any]:
+def _collect_one(
+    target: dict[str, Any], *, winrm_timeout: int, deadline: float | None = None,
+) -> dict[str, Any]:
     """Query one DHCP server. Never raises — returns a status dict either way."""
     ip = str(target.get("server_ip") or "").strip()
     # Optional per-target FQDN (pushed from the dashboard). Kerberos can't derive an
@@ -320,7 +328,7 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
     if server_type == "infoblox":
         # DHCP-7: REST (WAPI) to the Grid Master, not WinRM to the server.
         from . import dhcp_infoblox
-        return dhcp_infoblox.collect_one(target, base, timeout=winrm_timeout)
+        return dhcp_infoblox.collect_one(target, base, timeout=winrm_timeout, deadline=deadline)
     if server_type != "windows":
         return {**base, "status": "unsupported", "code": "unsupported_server_type",
                 "error": _ERROR_TEXT["unsupported_server_type"]}
@@ -575,7 +583,8 @@ def collect_all(
                 "error": "time budget exhausted",
             })
             continue
-        entry = _collect_one(target, winrm_timeout=winrm_timeout)
+        entry = _collect_one(target, winrm_timeout=winrm_timeout,
+                             deadline=start + time_budget)
         if entry.get("status") == "ok":
             log.info("dhcp intel collected", server=entry["server_ip"],
                      scopes=len(entry.get("scopes") or []))

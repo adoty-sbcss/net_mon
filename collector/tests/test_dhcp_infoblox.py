@@ -78,6 +78,12 @@ class _Resp:
     def json(self) -> Any:
         return self._body
 
+    def iter_content(self, n: int) -> Any:
+        yield self.content
+
+    def close(self) -> None:
+        pass
+
 
 class _FakeSession:
     def __init__(self, grid: dict[str, Any], status: int = 200, page: int = 1000) -> None:
@@ -87,8 +93,11 @@ class _FakeSession:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.closed = False
         self._cursor: dict[str, tuple[str, int]] = {}
+        self._views: dict[str, str] = {}
 
-    def get(self, url: str, params: dict[str, Any], timeout: int) -> _Resp:
+    def get(self, url: str, params: dict[str, Any], timeout: float,
+            allow_redirects: bool = True, stream: bool = False) -> _Resp:
+        assert allow_redirects is False
         obj = url.rsplit("/", 1)[1]
         self.calls.append((obj, dict(params)))
         if self.status != 200:
@@ -106,6 +115,12 @@ class _FakeSession:
                 return _Resp(200, self.grid.get(key, []))
             start = 0
         rows = self.grid.get(key, [])
+        view = params.get("network_view")
+        if view is not None and start == 0:
+            self._views[key] = view
+        view = self._views.get(key) if view is None else view
+        if view is not None:
+            rows = [x for x in rows if x.get("network_view", "default") == view]
         chunk = rows[start:start + self.page]
         body: dict[str, Any] = {"result": chunk}
         if start + self.page < len(rows):
@@ -265,3 +280,139 @@ def test_options_parsing() -> None:
         {"id": 6, "name": None, "value": ["1.1.1.1", "8.8.8.8"]},
     ]
     assert ib._norm_fp("AB:cd:EF") == "abcdef"
+
+
+# ---- review fixes (DHCP-7 round 1) -------------------------------------------
+
+
+def _grid(**over: Any) -> dict[str, Any]:
+    g = json.loads(json.dumps(GRID))
+    g.update(over)
+    return g
+
+
+def test_same_cidr_in_another_view_never_leaks_in(fake: dict[str, Any]) -> None:
+    g = _grid()
+    # Another view reuses 10.1.0.0/24 with its own comment, router, reservation, lease.
+    g["network"].append({"network": "10.1.0.0/24", "network_view": "guest", "comment": "OTHER VIEW",
+                         "options": [{"num": 3, "value": "192.0.2.1", "use_option": True}]})
+    g["fixedaddress"].append({"ipv4addr": "10.1.0.60", "mac": "aa:bb:cc:00:00:60",
+                              "network": "10.1.0.0/24", "network_view": "guest"})
+    g["lease:ACTIVE"].append({"address": "10.1.0.51", "hardware": "aa:bb:cc:99:99:99",
+                              "network_view": "guest"})
+    fake["session"] = _FakeSession(g)
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    s1 = _scope(out, "10.1.0.0")
+    assert s1["name"] == "Lincoln ES staff"
+    assert {o["id"]: o["value"] for o in s1["options"]} == {3: ["10.1.0.1"]}
+    assert {r["ip"] for r in s1["reservations"]} == {"10.1.0.50", "10.1.0.51"}
+    assert next(r for r in s1["reservations"] if r["ip"] == "10.1.0.51")["client_mac"] == "aa:bb:cc:00:00:02"
+    for obj in ("network", "fixedaddress", "lease"):
+        assert all(p.get("network_view") == "default" for o, p in fake["session"].calls
+                   if o == obj and "_page_id" not in p)
+
+
+def test_member_serving_two_views_keeps_scopes_apart(fake: dict[str, Any]) -> None:
+    g = _grid()
+    g["range"].append({"network": "10.1.0.0/24", "network_view": "guest", "start_addr": "10.1.0.10",
+                       "end_addr": "10.1.0.20", "member": {"ipv4addr": "10.0.0.20"},
+                       "dynamic_hosts": 1, "total_hosts": 11})
+    g["network"].append({"network": "10.1.0.0/24", "network_view": "guest", "comment": "Guest"})
+    fake["session"] = _FakeSession(g)
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    ids = {s["scope_id"]: s for s in out["scopes"]}
+    assert ids["10.1.0.0 (default)"]["addresses_in_use"] == 92
+    assert ids["10.1.0.0 (guest)"]["addresses_in_use"] == 1
+    assert ids["10.1.0.0 (guest)"]["name"] == "Guest"
+
+
+def test_range_options_apply_and_disagreement_is_visible(fake: dict[str, Any]) -> None:
+    g = _grid()
+    g["range"][0]["options"] = [{"num": 6, "value": "10.1.0.53", "use_option": True}]
+    g["range"].append({"network": "10.1.0.0/24", "start_addr": "10.1.0.200", "end_addr": "10.1.0.210",
+                       "member": {"ipv4addr": "10.0.0.20"}, "dynamic_hosts": 0, "total_hosts": 11,
+                       "options": [{"num": 6, "value": "10.1.0.54", "use_option": True}]})
+    g["range"][1]["options"] = [{"num": 3, "value": "10.2.0.1", "use_option": True}]
+    fake["session"] = _FakeSession(g)
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    o1 = {o["id"]: o for o in _scope(out, "10.1.0.0")["options"]}
+    assert o1[6]["value"] == ["10.1.0.53", "10.1.0.54"] and "varies" in o1[6]["name"]
+    assert {o["id"]: o["value"] for o in _scope(out, "10.2.0.0")["options"]} == {3: ["10.2.0.1"]}
+
+
+def test_grid_default_lease_time_counts_and_vendor_options_do_not(fake: dict[str, Any]) -> None:
+    g = _grid()
+    g["member:dhcpproperties"][0]["options"] = [
+        {"num": 3, "value": "203.0.113.9", "vendor_class": "MSFT", "use_option": True},
+    ]
+    fake["session"] = _FakeSession(g)
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    so = {o["id"]: o["value"] for o in out["server_options"]}
+    assert so == {15: ["example.org"], 51: ["43200"]}
+    assert _scope(out, "10.2.0.0")["lease_duration_sec"] == 43200
+
+
+def test_dhcp_service_off_is_an_error(fake: dict[str, Any]) -> None:
+    g = _grid()
+    g["member:dhcpproperties"][0]["enable_dhcp"] = False
+    fake["session"] = _FakeSession(g)
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    assert out["status"] == "error" and out["code"] == "service_disabled"
+
+
+def test_no_lease_records_means_unknown_not_unused(fake: dict[str, Any]) -> None:
+    fake["session"] = _FakeSession(_grid(**{"lease:ACTIVE": [], "lease:STATIC": []}))
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    s1 = _scope(out, "10.1.0.0")
+    assert s1["reservations"] == [] and s1["reserved"] == 2
+    assert out["server_stats"]["reservation_leases"] == "unavailable"
+
+
+def test_active_lease_beats_static_record(fake: dict[str, Any]) -> None:
+    g = _grid()
+    g["lease:STATIC"].append({"address": "10.1.0.50", "hardware": "aa:bb:cc:00:00:01"})
+    fake["session"] = _FakeSession(g)
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    r = next(x for x in _scope(out, "10.1.0.0")["reservations"] if x["ip"] == "10.1.0.50")
+    assert r["client_mac"] == "aa:bb:cc:00:00:99"
+    assert r["lease_expiry"] == "2025-11-13T00:00:00+00:00"
+
+
+def test_corrupt_pin_file_fails_closed(fake: dict[str, Any]) -> None:
+    ib.PINS_FILE.write_text("{not json")
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    assert out["code"] == "pin_store_failed" and fake["pinned_with"] is None
+
+
+def test_unsavable_first_use_pin_fails_closed(fake: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    def nope(key: str, fp: str) -> None:
+        raise ib._PinStoreError("disk full")
+
+    monkeypatch.setattr(ib, "_save_pin", nope)
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    assert out["code"] == "pin_store_failed" and fake["pinned_with"] is None
+    # ...but with the dashboard's pin pushed, the pin is known: collection goes on.
+    out = dh._collect_one({**TARGET, "tls_fingerprint": FP}, winrm_timeout=10)
+    assert out["status"] == "ok"
+
+
+def test_deadline_stops_paging(fake: dict[str, Any]) -> None:
+    fake["session"] = _FakeSession(GRID, page=1)
+    out = ib.collect_one(TARGET, {"server_ip": "10.0.0.20", "label": None, "server_type": "infoblox"},
+                         timeout=10, deadline=__import__("time").monotonic() - 1)
+    assert out["code"] == "timeout"
+
+
+def test_exception_text_with_401_is_not_a_rejected_password() -> None:
+    detail = "HTTPSConnectionPool(host='gm', port=443): Read timed out. (url=/wapi/v2.7/lease?_page_id=789401abc)"
+    assert ib._classify_net(detail, "unreachable") == "timeout"
+    assert ib._classify_net("Max retries exceeded ... _page_id=x401", "unreachable") == "unreachable"
+
+
+def test_pinned_session_ignores_environment_proxies(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("requests")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    s = ib._pinned_session(FP, "u", "p")
+    assert s.trust_env is False
+    settings = s.merge_environment_settings("https://gm/wapi", {}, None, None, None)
+    assert not settings.get("proxies")

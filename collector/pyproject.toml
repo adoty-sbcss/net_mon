@@ -31,6 +31,10 @@ dependencies = [
     # answer for hardened boxes. Kerberos reuses the krb5 already in the image.
     # Imported lazily (dhcp_rpc.py) only when the rpc transport is actually used.
     "impacket>=0.11",
+    # HTTPS client for the Infoblox WAPI collector (DHCP-7). Already present through
+    # pywinrm; declared because dhcp_infoblox.py uses it directly (certificate-pinned
+    # session). Imported lazily, only when an Infoblox target is collected.
+    "requests>=2.31",
     # Multi-vendor network-device CLI over SSH for device config backup (NCM-1):
     # fetch running/startup configs from switches/routers (Cisco/Aruba/Juniper/
     # Ubiquiti/Netgear/Extreme). Rides paramiko (already a dep). Imported lazily
