@@ -73,6 +73,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import ssl
 import threading
 import time
@@ -99,6 +100,11 @@ _MAX_PAGES = 100
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 # One Infoblox target never runs longer than this, whatever budget is left.
 _MAX_TARGET_SECONDS = 90.0
+
+# The read worker per endpoint ("host:port"). A worker abandoned at the deadline
+# keeps its slot until it ends, so at most one is ever outstanding per endpoint.
+_WORKERS: dict[str, threading.Thread] = {}
+_WORKERS_LOCK = threading.Lock()
 
 
 class _WapiError(Exception):
@@ -136,6 +142,18 @@ def _norm_fp(fp: Any) -> str:
     return "".join(ch for ch in str(fp or "").lower() if ch in "0123456789abcdef")
 
 
+_FP_SYNTAX = re.compile(r"^[0-9A-Fa-f:\s-]+$")
+
+
+def _strict_fp(v: Any) -> str | None:
+    """A full SHA-256 in hex (separators allowed), normalized — else None. Used for
+    every SUPPLIED pin, so junk can never normalize to "" and read as "no pin"."""
+    if not isinstance(v, str) or not _FP_SYNTAX.match(v):
+        return None
+    fp = _norm_fp(v)
+    return fp if len(fp) == 64 else None
+
+
 def _observed_fingerprint(host: str, port: int, timeout: float) -> str:
     """SHA-256 of the certificate the server presents right now (no trust check —
     this is only ever compared against a pin or recorded as one)."""
@@ -157,10 +175,10 @@ def _load_pins() -> dict[str, str]:
         raise _PinStoreError(f"{PINS_FILE} is not a JSON object")
     pins: dict[str, str] = {}
     for k, v in data.items():
-        fp = _norm_fp(v) if isinstance(v, str) else ""
+        fp = _strict_fp(v)
         # Anything but a full SHA-256 is damage, not "no pin": reading it as empty
         # would trust whatever answers next.
-        if len(fp) != 64:
+        if fp is None:
             raise _PinStoreError(f"{PINS_FILE} holds an invalid pin for {k!r}")
         pins[str(k)] = fp
     return pins
@@ -587,9 +605,15 @@ def collect_one(
         return _fail(base, "dependency_missing", transport="wapi", detail=f"requests: {exc}")
 
     try:
-        pushed = _norm_fp(target.get("tls_fingerprint"))
-        if pushed and len(pushed) != 64:
-            raise _PinStoreError("the pushed tls_fingerprint is not a SHA-256")
+        raw_pin = target.get("tls_fingerprint")
+        pushed = ""
+        # Absent (None/missing/"") means the dashboard has no pin yet; ANY other value
+        # must be a full SHA-256, or the target is refused.
+        if raw_pin not in (None, ""):
+            strict = _strict_fp(raw_pin)
+            if strict is None:
+                raise _PinStoreError("the pushed tls_fingerprint is not a SHA-256")
+            pushed = strict
         expected = pushed or _load_pins().get(pin_key, "")
     except _PinStoreError as exc:
         return _fail(base, "pin_store_failed", transport="wapi", detail=str(exc))
@@ -625,6 +649,14 @@ def collect_one(
     # closed and its result, if it ever comes, is dropped. Every read still has its
     # own socket timeout, so the worker itself always finishes.
     box: dict[str, Any] = {}
+    with _WORKERS_LOCK:
+        prev = _WORKERS.get(pin_key)
+        if prev is not None and prev.is_alive():
+            # A read abandoned on an earlier pass is still stuck on this endpoint:
+            # never stack a second one behind it.
+            session.close()
+            return _fail(base, "timeout", transport="wapi",
+                         detail="an earlier read of this endpoint is still running")
 
     def _work() -> None:
         try:
@@ -633,6 +665,8 @@ def collect_one(
             box["error"] = exc
 
     worker = threading.Thread(target=_work, name="dhcp-infoblox", daemon=True)
+    with _WORKERS_LOCK:
+        _WORKERS[pin_key] = worker
     worker.start()
     worker.join(max(0.0, deadline - time.monotonic()) + 1.0)
     try:

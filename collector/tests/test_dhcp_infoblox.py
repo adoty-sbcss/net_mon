@@ -453,3 +453,46 @@ def test_a_read_that_hangs_past_the_deadline_is_abandoned(
     release.set()
     assert out["code"] == "timeout" and _t.monotonic() - t0 < 3
     assert fake["session"].closed
+
+
+# ---- review fixes (DHCP-7 round 3) -------------------------------------------
+
+
+@pytest.mark.parametrize("bad", ["zzzz", "---", "  ", 42, ["ab"], "ab" * 31, "g" * 64])
+def test_any_supplied_invalid_pushed_pin_fails_closed(fake: dict[str, Any], bad: Any) -> None:
+    out = dh._collect_one({**TARGET, "tls_fingerprint": bad}, winrm_timeout=10)
+    assert out["code"] == "pin_store_failed" and fake["pinned_with"] is None
+
+
+def test_absent_pushed_pin_is_first_use(fake: dict[str, Any]) -> None:
+    for none in (None, ""):
+        out = dh._collect_one({**TARGET, "tls_fingerprint": none}, winrm_timeout=10)
+        assert out["status"] == "ok"
+
+
+def test_only_one_abandoned_read_per_endpoint(
+    fake: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    release = threading.Event()
+    started = []
+
+    class _Stuck(_FakeSession):
+        def get(self, *a: Any, **k: Any) -> _Resp:
+            started.append(1)
+            release.wait(10)
+            return super().get(*a, **k)
+
+    fake["session"] = _Stuck(GRID)
+    monkeypatch.setattr(ib, "_MAX_TARGET_SECONDS", 0.2)
+    try:
+        first = dh._collect_one(TARGET, winrm_timeout=10)
+        second = dh._collect_one(TARGET, winrm_timeout=10)
+        third = dh._collect_one(TARGET, winrm_timeout=10)
+        assert first["code"] == second["code"] == third["code"] == "timeout"
+        assert len(started) == 1  # passes 2 and 3 started no new read
+        alive = [t for t in threading.enumerate() if t.name == "dhcp-infoblox" and t.is_alive()]
+        assert len(alive) == 1
+    finally:
+        release.set()
