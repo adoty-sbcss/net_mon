@@ -1,0 +1,267 @@
+"""Unit tests for the Infoblox (WAPI) DHCP collector (DHCP-7).
+
+No network: the certificate read and the HTTP session are the two chokepoints,
+both faked. The fake WAPI answers from a small grid: one member (10.0.0.20,
+"ibx-m1") serving two networks — one directly, one through a failover
+association with a second member — plus a network served by someone else.
+"""
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import pytest
+
+from collector.discovery import dhcp_infoblox as ib
+from collector.discovery import dhcp_server as dh
+
+FP = "ab" * 32
+OTHER_FP = "cd" * 32
+
+GRID: dict[str, Any] = {
+    "member:dhcpproperties": [{
+        "host_name": "ibx-m1.example.org", "ipv4addr": "10.0.0.20", "enable_dhcp": True,
+        "options": [
+            {"name": "domain-name-servers", "num": 6, "value": "10.0.0.53,10.0.0.54", "use_option": True},
+            {"name": "dhcp-lease-time", "num": 51, "value": "28800", "use_option": True},
+        ],
+    }],
+    "grid:dhcpproperties": [{
+        "options": [
+            {"name": "domain-name", "num": 15, "value": "example.org", "use_option": True},
+            {"name": "dhcp-lease-time", "num": 51, "value": "43200", "use_option": False},
+        ],
+    }],
+    "dhcpfailover": [
+        {"name": "m1-m2", "primary": "ibx-m1.example.org", "secondary": "ibx-m2.example.org",
+         "primary_state": "PARTNER_DOWN", "secondary_state": "COMMUNICATIONS_INTERRUPTED"},
+        {"name": "x-y", "primary": "x", "secondary": "y",
+         "primary_state": "NORMAL", "secondary_state": "NORMAL"},
+    ],
+    "range": [
+        {"network": "10.1.0.0/24", "start_addr": "10.1.0.100", "end_addr": "10.1.0.199",
+         "member": {"ipv4addr": "10.0.0.20", "name": "ibx-m1.example.org"},
+         "dynamic_hosts": 92, "total_hosts": 100, "disable": False},
+        {"network": "10.2.0.0/23", "start_addr": "10.2.0.10", "end_addr": "10.2.1.250",
+         "failover_association": "m1-m2", "dynamic_hosts": 50, "total_hosts": 500, "disable": False},
+        {"network": "10.9.0.0/24", "start_addr": "10.9.0.10", "end_addr": "10.9.0.20",
+         "member": {"ipv4addr": "10.0.0.99"}, "dynamic_hosts": 1, "total_hosts": 11},
+    ],
+    "network": [
+        {"network": "10.1.0.0/24", "comment": "Lincoln ES staff", "disable": False,
+         "options": [{"name": "routers", "num": 3, "value": "10.1.0.1", "use_option": True}]},
+        {"network": "10.2.0.0/23", "comment": "", "disable": False, "options": []},
+        {"network": "10.9.0.0/24", "comment": "not ours", "options": []},
+    ],
+    "fixedaddress": [
+        {"ipv4addr": "10.1.0.50", "mac": "AA:BB:CC:00:00:01", "name": "printer", "network": "10.1.0.0/24"},
+        {"ipv4addr": "10.1.0.51", "mac": "aa:bb:cc:00:00:02", "name": "copier", "network": "10.1.0.0/24"},
+        {"ipv4addr": "10.9.0.5", "mac": "aa:bb:cc:00:00:09", "network": "10.9.0.0/24"},
+    ],
+    "lease:ACTIVE": [
+        {"address": "10.1.0.50", "hardware": "aa:bb:cc:00:00:99", "binding_state": "ACTIVE",
+         "ends": 1762992000},
+    ],
+    "lease:STATIC": [
+        {"address": "10.1.0.51", "hardware": "aa:bb:cc:00:00:02", "binding_state": "STATIC"},
+    ],
+}
+
+
+class _Resp:
+    def __init__(self, status: int, body: Any) -> None:
+        self.status_code = status
+        self._body = body
+        self.text = json.dumps(body)
+        self.content = self.text.encode()
+
+    def json(self) -> Any:
+        return self._body
+
+
+class _FakeSession:
+    def __init__(self, grid: dict[str, Any], status: int = 200, page: int = 1000) -> None:
+        self.grid = grid
+        self.status = status
+        self.page = page
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.closed = False
+        self._cursor: dict[str, tuple[str, int]] = {}
+
+    def get(self, url: str, params: dict[str, Any], timeout: int) -> _Resp:
+        obj = url.rsplit("/", 1)[1]
+        self.calls.append((obj, dict(params)))
+        if self.status != 200:
+            return _Resp(self.status, {"Error": "nope"})
+        if "_page_id" in params:
+            key, start = self._cursor.pop(params["_page_id"])
+        else:
+            key = obj
+            if obj == "member:dhcpproperties":
+                rows = [m for m in self.grid[obj] if m["ipv4addr"] == params.get("ipv4addr")]
+                return _Resp(200, rows)
+            if obj == "lease":
+                key = f"lease:{params['binding_state']}"
+            if "_paging" not in params:
+                return _Resp(200, self.grid.get(key, []))
+            start = 0
+        rows = self.grid.get(key, [])
+        chunk = rows[start:start + self.page]
+        body: dict[str, Any] = {"result": chunk}
+        if start + self.page < len(rows):
+            pid = f"p{len(self.calls)}"
+            self._cursor[pid] = (key, start + self.page)
+            body["next_page_id"] = pid
+        return _Resp(200, body)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def fake(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> dict[str, Any]:
+    state: dict[str, Any] = {"observed": FP, "session": _FakeSession(GRID), "pinned_with": None}
+    monkeypatch.setattr(ib, "PINS_FILE", tmp_path / "pins.json")
+    monkeypatch.setattr(ib, "_observed_fingerprint", lambda h, p, t: state["observed"])
+
+    def _session(fp: str, user: str, password: str) -> _FakeSession:
+        state["pinned_with"] = (fp, user, password)
+        return state["session"]
+
+    monkeypatch.setattr(ib, "_pinned_session", _session)
+    return state
+
+
+TARGET = {"server_ip": "10.0.0.20", "server_type": "infoblox", "api_host": "10.0.0.5",
+          "api_user": "netmon-ro", "api_password": "s3cret!", "label": "Grid"}
+
+
+def _scope(out: dict[str, Any], sid: str) -> dict[str, Any]:
+    return next(s for s in out["scopes"] if s["scope_id"] == sid)
+
+
+def test_happy_path_shapes_like_windows(fake: dict[str, Any]) -> None:
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    assert out["status"] == "ok" and out["transport"] == "wapi"
+    assert out["server_ip"] == "10.0.0.20" and out["api_host"] == "10.0.0.5"
+    assert out["server_type"] == "infoblox" and out["label"] == "Grid"
+    assert out["hostname"] == "ibx-m1.example.org"
+    assert out["tls_fingerprint"] == FP
+    # Only the member's two networks; 10.9.0.0 belongs to another member.
+    assert [s["scope_id"] for s in out["scopes"]] == ["10.1.0.0", "10.2.0.0"]
+    s1 = _scope(out, "10.1.0.0")
+    assert (s1["addresses_in_use"], s1["addresses_free"], s1["percentage_in_use"]) == (92, 8, 92.0)
+    assert s1["subnet_mask"] == "255.255.255.0" and s1["name"] == "Lincoln ES staff"
+    assert s1["state"] == "Active" and s1["lease_duration_sec"] == 28800
+    assert {o["id"]: o["value"] for o in s1["options"]} == {3: ["10.1.0.1"]}
+    assert _scope(out, "10.2.0.0")["subnet_mask"] == "255.255.254.0"
+    # Server options: grid's domain-name + member's DNS and lease time; the grid's
+    # use_option=False lease time is a placeholder and must not win.
+    so = {o["id"]: o["value"] for o in out["server_options"]}
+    assert so == {6: ["10.0.0.53", "10.0.0.54"], 15: ["example.org"], 51: ["28800"]}
+    assert out["server_stats"]["total_addresses"] == 600
+    assert out["server_stats"]["addresses_in_use"] == 142
+    assert out["failover"] == [{"name": "m1-m2", "partner": "ibx-m2.example.org", "mode": None,
+                                "state": "PARTNER_DOWN", "scope_ids": ["10.2.0.0"]}]
+
+
+def test_reservations_conflict_and_active(fake: dict[str, Any]) -> None:
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    resv = {r["ip"]: r for r in _scope(out, "10.1.0.0")["reservations"]}
+    assert set(resv) == {"10.1.0.50", "10.1.0.51"}
+    assert resv["10.1.0.50"]["mac"] == "aa:bb:cc:00:00:01"  # canonical lowercase
+    assert resv["10.1.0.50"]["active"] and resv["10.1.0.50"]["client_mac"] == "aa:bb:cc:00:00:99"
+    assert resv["10.1.0.51"]["active"] and resv["10.1.0.51"]["client_mac"] == "aa:bb:cc:00:00:02"
+    assert _scope(out, "10.1.0.0")["reserved"] == 2
+    assert out["server_stats"]["reservation_leases"] == "complete"
+
+
+def test_paging_follows_next_page_id(fake: dict[str, Any]) -> None:
+    fake["session"] = _FakeSession(GRID, page=1)
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    assert [s["scope_id"] for s in out["scopes"]] == ["10.1.0.0", "10.2.0.0"]
+    follow = [p for o, p in fake["session"].calls if "_page_id" in p]
+    assert follow and all(set(p) == {"_page_id"} for p in follow)
+
+
+def test_truncated_leases_drop_reservations_not_mark_unused(
+    fake: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grid = {**GRID, "lease:ACTIVE": GRID["lease:ACTIVE"] * 3}
+    fake["session"] = _FakeSession(grid, page=1)
+    monkeypatch.setattr(ib, "_MAX_PAGES", 2)
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    s1 = _scope(out, "10.1.0.0")
+    assert s1["reservations"] == [] and s1["reserved"] == 2
+    assert out["server_stats"]["reservation_leases"] == "partial"
+
+
+def test_first_use_pins_locally_then_enforces(fake: dict[str, Any]) -> None:
+    assert dh._collect_one(TARGET, winrm_timeout=10)["status"] == "ok"
+    assert json.loads(ib.PINS_FILE.read_text()) == {"10.0.0.5:443": FP}
+    assert fake["pinned_with"] == (FP, "netmon-ro", "s3cret!")
+    fake["observed"] = OTHER_FP
+    fake["pinned_with"] = None
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    assert out["status"] == "error" and out["code"] == "cert_changed"
+    assert out["tls_fingerprint_seen"] == OTHER_FP
+    assert fake["pinned_with"] is None  # credentials never sent to the new cert
+
+
+def test_dashboard_pin_wins_over_local(fake: dict[str, Any]) -> None:
+    ib._save_pin("10.0.0.5:443", FP)
+    fake["observed"] = OTHER_FP
+    out = dh._collect_one({**TARGET, "tls_fingerprint": OTHER_FP.upper()}, winrm_timeout=10)
+    assert out["status"] == "ok" and out["tls_fingerprint"] == OTHER_FP
+    assert json.loads(ib.PINS_FILE.read_text())["10.0.0.5:443"] == OTHER_FP
+
+
+def test_dashboard_pin_mismatch_is_cert_changed(fake: dict[str, Any]) -> None:
+    out = dh._collect_one({**TARGET, "tls_fingerprint": "AB:" * 31 + "CD"}, winrm_timeout=10)
+    assert out["code"] == "cert_changed" and out["tls_fingerprint_seen"] == FP
+
+
+@pytest.mark.parametrize(("status", "code"), [(401, "auth_failed"), (403, "access_denied"),
+                                               (500, "probe_failed")])
+def test_http_errors_map_to_codes_without_raw_text(
+    fake: dict[str, Any], status: int, code: str,
+) -> None:
+    fake["session"] = _FakeSession(GRID, status=status)
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    assert out["status"] == "error" and out["code"] == code
+    assert out["error"] == dh._ERROR_TEXT[code]
+    assert "s3cret" not in json.dumps(out) and "netmon-ro" not in json.dumps(out)
+    assert fake["session"].closed
+
+
+def test_unknown_member(fake: dict[str, Any]) -> None:
+    out = dh._collect_one({**TARGET, "server_ip": "10.0.0.77"}, winrm_timeout=10)
+    assert out["code"] == "member_not_found"
+
+
+def test_unreachable_cert_read(fake: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(h: str, p: int, t: int) -> str:
+        raise ConnectionRefusedError("[Errno 111] Connection refused")
+
+    monkeypatch.setattr(ib, "_observed_fingerprint", boom)
+    out = dh._collect_one(TARGET, winrm_timeout=10)
+    assert out["code"] == "unreachable" and fake["pinned_with"] is None
+
+
+def test_api_host_defaults_to_server_ip(fake: dict[str, Any]) -> None:
+    t = {k: v for k, v in TARGET.items() if k != "api_host"}
+    out = dh._collect_one(t, winrm_timeout=10)
+    assert out["api_host"] == "10.0.0.20"
+    assert "10.0.0.20:443" in json.loads(ib.PINS_FILE.read_text())
+
+
+def test_options_parsing() -> None:
+    raw = [{"num": 3, "value": "10.0.0.1", "use_option": True},
+           {"num": "6", "value": " 1.1.1.1 , 8.8.8.8 "},
+           {"num": 66, "value": "x", "use_option": False},
+           {"name": "bad"}, "junk"]
+    assert ib._options(raw) == [
+        {"id": 3, "name": None, "value": ["10.0.0.1"]},
+        {"id": 6, "name": None, "value": ["1.1.1.1", "8.8.8.8"]},
+    ]
+    assert ib._norm_fp("AB:cd:EF") == "abcdef"

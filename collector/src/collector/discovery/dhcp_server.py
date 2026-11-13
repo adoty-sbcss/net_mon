@@ -15,9 +15,9 @@ PowerShell module to pull the server's own truth —
     on a big scope surfaces,
   * server-wide statistics + authorization/domain-join status.
 
-Only **Windows** servers are supported in v1 (the K-12 reality); the target
-carries a `server_type` so other backends (Infoblox/Kea) can slot in later
-(DHCP-7) without changing the bundle contract.
+Windows servers are collected here; `server_type: "infoblox"` targets are handed
+to ``dhcp_infoblox.py`` (DHCP-7), which reads the grid's REST API and emits the
+same entry shape. Other backends (Kea, BlueCat) would slot in the same way.
 
 Why WinRM/PowerShell and not SNMP/WMI: Windows DHCP exposes *nothing* useful
 about scopes/utilization/options over standard SNMP MIBs, and the legacy WMI
@@ -99,7 +99,16 @@ _MAX_OUTPUT_BYTES = 8 * 1024 * 1024
 # scrubbed) to the sensor's own log, which stays on the box.
 _ERROR_TEXT: dict[str, str] = {
     "no_server_ip": "No server address is configured for this target.",
-    "unsupported_server_type": "This server type is not supported yet (Windows DHCP only).",
+    "unsupported_server_type": (
+        "This server type is not supported yet (Windows DHCP and Infoblox only)."
+    ),
+    "member_not_found": (
+        "The Infoblox grid answered, but this address is not one of its DHCP members."
+    ),
+    "cert_changed": (
+        "The server's certificate changed since it was first trusted. Check the new "
+        "fingerprint, then trust it in Settings."
+    ),
     "dependency_missing": "The sensor is missing a component this transport needs.",
     "auth_failed": (
         "Sign-in was rejected: the password is wrong or expired, or the account is "
@@ -308,6 +317,10 @@ def _collect_one(target: dict[str, Any], *, winrm_timeout: int) -> dict[str, Any
 
     if not ip:
         return _fail(base, "no_server_ip")
+    if server_type == "infoblox":
+        # DHCP-7: REST (WAPI) to the Grid Master, not WinRM to the server.
+        from . import dhcp_infoblox
+        return dhcp_infoblox.collect_one(target, base, timeout=winrm_timeout)
     if server_type != "windows":
         return {**base, "status": "unsupported", "code": "unsupported_server_type",
                 "error": _ERROR_TEXT["unsupported_server_type"]}
