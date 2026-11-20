@@ -5,7 +5,7 @@ name: Build & publish collector image
 # building the Dockerfile locally behind school egress filtering.
 #
 # Image: ghcr.io/adoty-sbcss/netmon-collector
-#   :canary/:stable — compatibility aliases for the latest CI-passing main image
+#   :canary/:stable — compatibility aliases, moved only to the CURRENT tip of main
 #   :<git-sha>      — immutable tag used by every sensor update channel
 #
 # ONE-TIME after the first successful run: make the GHCR package PUBLIC
@@ -23,50 +23,100 @@ permissions:
   contents: read
   packages: write
 
+# No concurrency group on purpose: GitHub replaces a PENDING run in a group, so a
+# queued publish for the newest commit could be dropped and that commit would get
+# no image (auto-update needs one for every main commit). Alias ordering is
+# handled by moving the aliases in a final step that re-checks main's tip.
+
 env:
   IMAGE: ghcr.io/adoty-sbcss/netmon-collector
   COMMIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
   build:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    # Publish only what landed on THIS repository's main. A workflow_run fires for
+    # every completed CI run, and its `branches: [main]` filter matches the HEAD
+    # branch NAME, so a pull request from a fork whose branch is called `main`
+    # would pass it. CI runs on pull_request too, so without the event and
+    # head-repository checks a fork's code could be built with this job's
+    # packages:write token and pushed as :stable, which every fresh install pulls.
+    # A manual dispatch publishes main only, for the same reason. This `if` is a
+    # coarse filter (string comparison here ignores case); the step below checks
+    # the ref exactly and that the commit is still on main.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ env.COMMIT_SHA }}
+          fetch-depth: 0
+
+      # A re-run of an old successful CI run carries its old SHA and passes the job
+      # `if`. Refuse a commit that is no longer on main (force-pushed away). Every
+      # main commit gets its immutable :<sha> image; the aliases move last.
+      - name: Confirm the commit is on main
+        id: main
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ] && [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::manual publish runs from refs/heads/main only (got $GITHUB_REF)"; exit 1
+          fi
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          tip=$(git rev-parse refs/remotes/origin/main)
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" "$tip"; then
+            echo "::error::$COMMIT_SHA is not on main; not publishing"; exit 1
+          fi
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & push (linux/amd64 — field boxes are all x86-64)
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: ./collector
           file: ./collector/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: |
-            ${{ env.IMAGE }}:canary
-            ${{ env.IMAGE }}:stable
-            ${{ env.IMAGE }}:${{ env.COMMIT_SHA }}
+          tags: ${{ env.IMAGE }}:${{ env.COMMIT_SHA }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # A refused cache write must not fail a run whose image already pushed.
+          cache-to: type=gha,mode=max,ignore-error=true
           provenance: false
 
-      - name: Summary
+      # Re-check right before moving the aliases, so the window in which an older
+      # build could move them back is seconds, not the length of a build.
+      - name: Move :canary/:stable if this is still main's tip
+        id: aliases
         run: |
-          echo "Pushed:" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`${IMAGE}:canary\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`${IMAGE}:stable\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`${IMAGE}:${COMMIT_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          tip=$(git rev-parse refs/remotes/origin/main)
+          if [ "$COMMIT_SHA" = "$tip" ]; then
+            docker buildx imagetools create -t "$IMAGE:canary" -t "$IMAGE:stable" "$IMAGE:$COMMIT_SHA"
+            echo "result=moved to $COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=kept (main has moved on to $tip)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summary
+        env:
+          ALIASES: ${{ steps.aliases.outputs.result }}
+        run: |
+          echo "Pushed: \`${IMAGE}:${COMMIT_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Aliases :canary/:stable: $ALIASES" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "If this is the first run, make the package PUBLIC in GHCR package settings." >> "$GITHUB_STEP_SUMMARY"
