@@ -5,7 +5,7 @@ name: Build & publish collector image
 # building the Dockerfile locally behind school egress filtering.
 #
 # Image: ghcr.io/adoty-sbcss/netmon-collector
-#   :canary/:stable — compatibility aliases for the latest CI-passing main image
+#   :canary/:stable — compatibility aliases, moved only to the CURRENT tip of main
 #   :<git-sha>      — immutable tag used by every sensor update channel
 #
 # ONE-TIME after the first successful run: make the GHCR package PUBLIC
@@ -23,6 +23,13 @@ permissions:
   contents: read
   packages: write
 
+# One publish at a time, so an older build cannot finish last and leave the
+# aliases on older code. (A queued run replaces an older queued one; each still
+# re-checks that its commit is main's tip before moving an alias.)
+concurrency:
+  group: publish-collector
+  cancel-in-progress: false
+
 env:
   IMAGE: ghcr.io/adoty-sbcss/netmon-collector
   COMMIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -35,7 +42,9 @@ jobs:
     # would pass it. CI runs on pull_request too, so without the event and
     # head-repository checks a fork's code could be built with this job's
     # packages:write token and pushed as :stable, which every fresh install pulls.
-    # A manual dispatch publishes main only, for the same reason.
+    # A manual dispatch publishes main only, for the same reason. This `if` is a
+    # coarse filter (string comparison here ignores case); the step below checks
+    # the ref exactly and that the commit is still on main.
     if: >-
       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'workflow_run' &&
@@ -49,6 +58,32 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ env.COMMIT_SHA }}
+          fetch-depth: 0
+
+      # A re-run of an old successful CI run carries its old SHA and passes the job
+      # `if`. Refuse a commit that is no longer on main (force-pushed away), and
+      # move :canary/:stable only when the commit IS main's tip right now. Every
+      # main commit still gets its immutable :<sha> image.
+      - name: Confirm the commit is on main
+        id: main
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ] && [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::manual publish runs from refs/heads/main only (got $GITHUB_REF)"; exit 1
+          fi
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          tip=$(git rev-parse refs/remotes/origin/main)
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" "$tip"; then
+            echo "::error::$COMMIT_SHA is not on main; not publishing"; exit 1
+          fi
+          {
+            echo "tags<<TAGS"
+            echo "$IMAGE:$COMMIT_SHA"
+            if [ "$COMMIT_SHA" = "$tip" ]; then echo "$IMAGE:canary"; echo "$IMAGE:stable"; fi
+            echo "TAGS"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$COMMIT_SHA" = "$tip" ]; then echo "aliases=moved" >> "$GITHUB_OUTPUT"; else echo "aliases=kept (main has moved on to $tip)" >> "$GITHUB_OUTPUT"; fi
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -67,19 +102,19 @@ jobs:
           file: ./collector/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: |
-            ${{ env.IMAGE }}:canary
-            ${{ env.IMAGE }}:stable
-            ${{ env.IMAGE }}:${{ env.COMMIT_SHA }}
+          tags: ${{ steps.main.outputs.tags }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # A refused cache write must not fail a run whose image already pushed.
+          cache-to: type=gha,mode=max,ignore-error=true
           provenance: false
 
       - name: Summary
+        env:
+          TAGS: ${{ steps.main.outputs.tags }}
+          ALIASES: ${{ steps.main.outputs.aliases }}
         run: |
           echo "Pushed:" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`${IMAGE}:canary\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`${IMAGE}:stable\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- \`${IMAGE}:${COMMIT_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          while read -r t; do [ -n "$t" ] && echo "- \`$t\`"; done <<< "$TAGS" >> "$GITHUB_STEP_SUMMARY"
+          echo "Aliases: $ALIASES" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "If this is the first run, make the package PUBLIC in GHCR package settings." >> "$GITHUB_STEP_SUMMARY"
