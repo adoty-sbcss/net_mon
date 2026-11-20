@@ -13,6 +13,11 @@ on:
   pull_request:
     branches: [main]
 
+# Read-only token: CI only checks code. Pull requests (including forks) run
+# this workflow, so it must never hold write scopes.
+permissions:
+  contents: read
+
 # Cancel an in-progress run if the same ref gets a newer push.
 concurrency:
   group: ci-${{ github.ref }}
@@ -23,9 +28,9 @@ jobs:
     name: Collector (Python)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.12"
           cache: pip
@@ -91,7 +96,7 @@ jobs:
     name: Shell scripts (bash -n)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Syntax-check every shell script
         # bash -n is the shell equivalent of py_compile: it catches syntax
